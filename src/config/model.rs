@@ -869,6 +869,36 @@ pub struct Http {
     pub servers: Vec<Arc<ServerConf>>,
 }
 
+/// One `server { }` inside a `stream` block: a listener and where its bytes go.
+#[derive(Debug)]
+pub struct StreamServer {
+    pub listens: Vec<ListenSpec>,
+    pub target: ProxyTarget,
+    pub connect_timeout: Duration,
+    /// `proxy_timeout` — how long a connection may sit **idle** before it is
+    /// closed. Measured between reads, not from the start, so a long-lived but
+    /// busy connection is never cut off.
+    pub timeout: Duration,
+    pub raw_line: u32,
+}
+
+/// A bound stream listener and the server behind it.
+#[derive(Debug)]
+pub struct StreamListener {
+    pub addr: ListenAddr,
+    pub backlog: i32,
+    pub reuseport: bool,
+    pub ipv6_only: bool,
+    pub server: Arc<StreamServer>,
+}
+
+/// The `stream { }` block: layer 4 proxying, no HTTP parsing at all.
+#[derive(Debug)]
+pub struct StreamConf {
+    pub listeners: Vec<Arc<StreamListener>>,
+    pub upstreams: HashMap<Box<str>, Arc<Upstream>>,
+}
+
 #[derive(Debug)]
 pub struct Config {
     pub worker_processes: WorkerProcesses,
@@ -880,6 +910,7 @@ pub struct Config {
     pub user: Option<(Box<str>, Option<Box<str>>)>,
     pub prefix: PathBuf,
     pub http: Option<Http>,
+    pub stream: Option<StreamConf>,
     /// Directives we parsed but do not implement, kept so `-t` can report them.
     pub unsupported: Vec<String>,
 }

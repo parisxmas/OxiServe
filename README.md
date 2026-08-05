@@ -119,8 +119,14 @@ ejection and automatic recovery), `backup` failover, weighted round-robin, real
 `keepalive` pool that probes a connection for liveness before reusing it.
 Health is shared across workers; the pool is per worker.
 
-> **Still missing for a true HAProxy replacement:** active health checks,
-> `stream` (L4 TCP/UDP), cookie-based sticky sessions, a stats endpoint.
+**Layer 4 (`stream`)** — TCP proxying with no HTTP parsing, so it fronts
+PostgreSQL, Redis, MQTT or anything else with a TCP protocol. Shares upstream
+selection, passive health and `least_conn` with the HTTP proxy; `proxy_timeout`
+is an *idle* timeout, so a long-lived session is never severed for being long.
+`listen unix:` works here too.
+
+> **Still missing for a true HAProxy replacement:** active health checks, UDP
+> in `stream`, `ssl_preread`, cookie-based sticky sessions, a stats endpoint.
 > Scope and order: [ADR-0001](docs/decisions/0001-load-balancer-scope.md).
 
 **TLS** — rustls, `ssl_certificate` / `ssl_certificate_key`, SNI across servers
@@ -160,7 +166,7 @@ regex captures `$1`–`$9`.
 - **`limit_conn`** connection limiting (`limit_req` is implemented).
 - **`auth_basic`**, `auth_request`.
 - **Unix domain sockets** in `listen`.
-- **`stream` and `mail`** blocks.
+- **`mail`** block; **UDP** and `ssl_preread` inside `stream`.
 - **PCRE-only regex** — lookaround and backreferences are rejected with a clear
   error rather than silently mismatching (Rust's `regex` has neither).
 

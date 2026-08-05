@@ -24,6 +24,7 @@ pub mod log;
 pub mod msgpack;
 pub mod proxy;
 pub mod reply;
+pub mod stream;
 pub mod transport;
 pub mod upstream;
 
@@ -45,11 +46,27 @@ static CONN_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Binds every configured listener and runs workers until shutdown.
 pub fn run(config: Config) -> io::Result<()> {
-    let Some(http) = config.http else {
-        eprintln!("oxiserve: no http block in configuration, nothing to serve");
-        return Ok(());
+    let stream_conf = config.stream.map(Arc::new);
+    let http = match config.http {
+        Some(h) => Arc::new(h),
+        None if stream_conf.is_some() => {
+            // A stream-only configuration is legitimate: a pure L4 proxy.
+            Arc::new(Http {
+                cache_zones: Default::default(),
+                limit_req_zones: Default::default(),
+                limit_req_keys: Default::default(),
+                listeners: Vec::new(),
+                upstreams: Default::default(),
+                maps: Vec::new(),
+                mime: Arc::new(Default::default()),
+                servers: Vec::new(),
+            })
+        }
+        None => {
+            eprintln!("oxiserve: no http or stream block in configuration, nothing to serve");
+            return Ok(());
+        }
     };
-    let http = Arc::new(http);
     let error_log = config.error_log.clone();
     let workers = config.worker_processes.resolve();
 
@@ -72,6 +89,19 @@ pub fn run(config: Config) -> io::Result<()> {
             if l.ssl { " ssl" } else { "" },
             if shared[i].is_none() { " (reuseport)" } else { "" }
         );
+    }
+
+    // Stream listeners bind up front too, so a port clash is one startup error.
+    let mut stream_bound: Vec<Option<BoundSocket>> = Vec::new();
+    if let Some(sc) = &stream_conf {
+        for l in &sc.listeners {
+            if cfg!(target_os = "linux") && l.reuseport {
+                stream_bound.push(None);
+            } else {
+                stream_bound.push(Some(bind_stream(l)?));
+            }
+            eprintln!("oxiserve: stream listening on {}", l.addr);
+        }
     }
 
     let tls = build_tls(&http)?;
@@ -99,6 +129,19 @@ pub fn run(config: Config) -> io::Result<()> {
             listeners.push((l.clone(), sock));
         }
 
+        let stream_conf_w = stream_conf.clone();
+        let mut stream_listeners: Vec<(Arc<crate::config::model::StreamListener>, Option<BoundSocket>)> =
+            Vec::new();
+        if let Some(sc) = &stream_conf {
+            for (i, l) in sc.listeners.iter().enumerate() {
+                let sock = match &stream_bound[i] {
+                    Some(s) => Some(s.try_clone()?),
+                    None => None,
+                };
+                stream_listeners.push((l.clone(), sock));
+            }
+        }
+
         handles.push(
             std::thread::Builder::new()
                 .name(format!("oxiserve-worker-{w}"))
@@ -107,7 +150,9 @@ pub fn run(config: Config) -> io::Result<()> {
                         // Pinning keeps a connection's buffers in one core's cache.
                         core_affinity::set_for_current(c);
                     }
-                    if let Err(e) = worker(w, http, listeners, error_log, tls) {
+                    if let Err(e) =
+                        worker(w, http, listeners, error_log, tls, stream_conf_w, stream_listeners)
+                    {
                         eprintln!("oxiserve: worker {w} exited: {e}");
                     }
                 })?,
@@ -128,6 +173,8 @@ fn worker(
     listeners: Vec<(Arc<Listener>, Option<BoundSocket>)>,
     error_log: crate::config::model::ErrorLogConf,
     tls: TlsMap,
+    stream_conf: Option<Arc<crate::config::model::StreamConf>>,
+    stream_listeners: Vec<(Arc<crate::config::model::StreamListener>, Option<BoundSocket>)>,
 ) -> io::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -159,6 +206,18 @@ fn worker(
 
             tasks.push(tokio::task::spawn_local(async move {
                 accept_loop(listener, lconf, http, logs, tls_cfg).await;
+            }));
+        }
+
+        for (lconf, sock) in stream_listeners {
+            let bound = match sock {
+                Some(s) => s,
+                None => bind_stream(&lconf)?,
+            };
+            let listener = bound.into_listener()?;
+            let Some(sc) = stream_conf.clone() else { continue };
+            tasks.push(tokio::task::spawn_local(async move {
+                stream_accept_loop(listener, lconf, sc).await;
             }));
         }
 
@@ -484,4 +543,75 @@ fn load_certified_key(
     let signing = rustls::crypto::ring::sign::any_supported_type(&key)
         .map_err(|e| io::Error::other(format!("{}: {e}", key_path.display())))?;
     Ok(rustls::sign::CertifiedKey::new(certs, signing))
+}
+
+/// Binds a `stream` listener. Same socket options as the HTTP side, minus the
+/// pieces that only make sense for HTTP.
+fn bind_stream(l: &crate::config::model::StreamListener) -> io::Result<BoundSocket> {
+    use crate::config::model::ListenAddr;
+    let tcp_addr = match &l.addr {
+        ListenAddr::Tcp(a) => *a,
+        ListenAddr::Unix(path) => {
+            let p = std::path::Path::new(&**path);
+            transport::unlink_stale_socket(p)?;
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let ul = std::os::unix::net::UnixListener::bind(p).map_err(|e| {
+                io::Error::new(e.kind(), format!("bind to unix:{path} failed: {e}"))
+            })?;
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o666));
+            return Ok(BoundSocket::Unix(ul));
+        }
+    };
+    let domain = match tcp_addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    sock.set_reuse_address(true)?;
+    if tcp_addr.is_ipv6() {
+        let _ = sock.set_only_v6(l.ipv6_only);
+    }
+    #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+    if l.reuseport {
+        sock.set_reuse_port(true)?;
+    }
+    sock.bind(&tcp_addr.into())
+        .map_err(|e| io::Error::new(e.kind(), format!("bind to {} failed: {e}", l.addr)))?;
+    sock.listen(l.backlog)?;
+    Ok(BoundSocket::Tcp(sock.into()))
+}
+
+async fn stream_accept_loop(
+    listener: transport::Listener,
+    conf: Arc<crate::config::model::StreamListener>,
+    sc: Arc<crate::config::model::StreamConf>,
+) {
+    loop {
+        let (sock, _peer) = match listener.accept().await {
+            Ok(p) => p,
+            Err(e) => {
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionAborted | io::ErrorKind::Interrupted
+                ) {
+                    continue;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        if let transport::Stream::Tcp(t) = &sock {
+            // Proxied protocols are usually request/response; Nagle would add
+            // latency to every small exchange.
+            let _ = t.set_nodelay(true);
+        }
+        let srv = conf.server.clone();
+        let sc = sc.clone();
+        tokio::task::spawn_local(async move {
+            stream::serve(sock, srv, sc).await;
+        });
+    }
 }

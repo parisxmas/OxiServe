@@ -1,6 +1,7 @@
 # ADR 0001 — Load balancer scope: what "HAProxy-like" would require
 
-**Status:** Accepted — items 1–3 implemented (v0.2.4), 4–5 outstanding
+**Status:** Accepted — items 1–3 (v0.2.4) and 5 (v0.2.9) implemented; item 4
+(active health checks) outstanding
 **Date:** 2026-08-06
 **Related:** README "Not implemented"; `src/server/proxy.rs`; `src/config/model.rs` (`Upstream`, `LbMethod`).
 
@@ -73,6 +74,14 @@ at all, so this differentiates against nginx *and* moves toward HAProxy.
 **5. `stream` block (L4 TCP/UDP)** — accept and splice, no HTTP parsing. The
 largest piece and HAProxy's core competence, but genuinely simpler than the
 HTTP path once connection handling is factored out.
+
+*Shipped in v0.2.9 for TCP; UDP is still open.* The prediction that it would be
+simpler held: the whole handler is ~150 lines, because upstream selection,
+health and `least_conn` were reused unchanged. Two things did need care —
+`proxy_timeout` had to be an idle timeout rather than a lifetime cap (the
+simpler reading would sever every long database session), and health cannot be
+inferred from a successful connect, since a crashed backend usually still
+accepts and then closes.
 
 Items 1–3 are treated as one unit of work because they share the same runtime
 structure (per-peer state hanging off `Upstream`) and splitting them would mean

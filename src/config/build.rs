@@ -607,6 +607,7 @@ impl Builder {
             worker_connections: 512,
             worker_rlimit_nofile: None,
             error_log: ErrorLogConf::default(),
+            stream: None,
             pid: None,
             daemon: false,
             user: None,
@@ -666,7 +667,11 @@ impl Builder {
                     let http = self.http(d)?;
                     cfg.http = Some(http);
                 }
-                "stream" | "mail" => self.note_unsupported(d),
+                "stream" => {
+                    let st = self.stream(d)?;
+                    cfg.stream = Some(st);
+                }
+                "mail" => self.note_unsupported(d),
                 "load_module" | "master_process" | "worker_shutdown_timeout"
                 | "worker_priority" | "working_directory" | "lock_file"
                 | "timer_resolution" | "pcre_jit" | "thread_pool" => {}
@@ -2546,5 +2551,106 @@ impl Builder {
             max_size,
             inactive,
         }))
+    }
+}
+
+impl Builder {
+    /// Builds the `stream { }` block.
+    ///
+    /// Deliberately reuses `upstream` and its health/balancing state from the
+    /// HTTP side: a dead TCP backend is dead the same way, and there is no
+    /// reason for `least_conn` to mean something different here.
+    fn stream(&mut self, d: &Directive) -> R<StreamConf> {
+        let mut upstreams: HashMap<Box<str>, Arc<Upstream>> = HashMap::new();
+        let mut servers: Vec<Arc<StreamServer>> = Vec::new();
+
+        for c in d.children() {
+            match c.name.as_str() {
+                "upstream" => {
+                    want_args(c, 1)?;
+                    let u = self.upstream(c)?;
+                    upstreams.insert(c.args[0].as_str().into(), Arc::new(u));
+                }
+                "server" => servers.push(Arc::new(self.stream_server(c)?)),
+                // Logging inside stream uses a different variable set than
+                // HTTP; accepted and ignored rather than silently misapplied.
+                "access_log" | "error_log" | "log_format" | "preread_buffer_size"
+                | "preread_timeout" | "tcp_nodelay" | "resolver" | "resolver_timeout"
+                | "variables_hash_bucket_size" | "variables_hash_max_size" => {}
+                _ => self.note_unsupported(c),
+            }
+        }
+
+        if servers.is_empty() {
+            bail!(d, "no server blocks defined in stream");
+        }
+
+        // A `proxy_pass` naming an upstream that does not exist is a config
+        // error, not a connection that fails later.
+        for s in &servers {
+            if let ProxyTarget::Upstream(n) = &s.target {
+                if !upstreams.contains_key(&**n) {
+                    return Err(BuildError {
+                        msg: format!("unknown upstream \"{n}\" in stream proxy_pass"),
+                        loc: format!("server at line {}", s.raw_line),
+                    });
+                }
+            }
+        }
+
+        let mut listeners = Vec::new();
+        for s in &servers {
+            for l in &s.listens {
+                listeners.push(Arc::new(StreamListener {
+                    addr: l.addr.clone(),
+                    backlog: l.backlog.unwrap_or(511),
+                    reuseport: l.reuseport,
+                    ipv6_only: l.ipv6_only,
+                    server: s.clone(),
+                }));
+            }
+        }
+
+        Ok(StreamConf { listeners, upstreams })
+    }
+
+    fn stream_server(&mut self, d: &Directive) -> R<StreamServer> {
+        let mut listens = Vec::new();
+        let mut target: Option<ProxyTarget> = None;
+        let mut connect_timeout = Duration::from_secs(60);
+        // nginx's default proxy_timeout is 10 minutes: stream connections are
+        // long-lived by nature (databases, message brokers).
+        let mut timeout = Duration::from_secs(600);
+
+        for c in d.children() {
+            match c.name.as_str() {
+                "listen" => listens.push(self.listen(c)?),
+                "proxy_pass" => {
+                    want_args(c, 1)?;
+                    // No scheme here — stream proxying has no protocol above TCP.
+                    target = Some(parse_fastcgi_target(&c.args[0], c)?);
+                }
+                "proxy_connect_timeout" => connect_timeout = time_arg(c, 0)?,
+                "proxy_timeout" => timeout = time_arg(c, 0)?,
+                "proxy_protocol" | "proxy_buffer_size" | "proxy_socket_keepalive"
+                | "proxy_next_upstream" | "proxy_next_upstream_tries"
+                | "proxy_next_upstream_timeout" | "ssl_preread" => {}
+                _ => self.note_unsupported(c),
+            }
+        }
+
+        if listens.is_empty() {
+            bail!(d, "no \"listen\" directive in stream server");
+        }
+        let Some(target) = target else {
+            bail!(d, "no \"proxy_pass\" directive in stream server");
+        };
+        for l in &listens {
+            if l.ssl {
+                bail!(d, "\"ssl\" on a stream listener is not supported yet");
+            }
+        }
+
+        Ok(StreamServer { listens, target, connect_timeout, timeout, raw_line: d.line })
     }
 }
