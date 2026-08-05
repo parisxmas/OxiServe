@@ -234,6 +234,10 @@ async fn dispatch(ctx: &mut Ctx<'_>, loc: &Arc<Location>, internal: bool) -> Ste
             Ok(r) => Step::Done(r),
             Err(c) => Step::Fail(c),
         },
+        Action::FastCgi(f) => match super::fastcgi::fastcgi(ctx, loc, f).await {
+            Ok(r) => Step::Done(r),
+            Err(c) => Step::Fail(c),
+        },
         Action::Static => match files::serve(ctx, Some(loc)).await {
             Ok(r) => Step::Done(r),
             Err(c) => Step::Fail(c),

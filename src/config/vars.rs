@@ -49,6 +49,13 @@ pub enum Var {
     Http(Arc<str>),
     /// `$sent_http_content_type` — a response header.
     SentHttp(Arc<str>),
+    /// `$fastcgi_script_name` — the script path after `fastcgi_split_path_info`
+    /// and `fastcgi_index` have been applied.
+    FastcgiScriptName,
+    /// `$fastcgi_path_info` — capture 2 of `fastcgi_split_path_info`.
+    FastcgiPathInfo,
+    /// `$https` — "on" over TLS, empty otherwise. Used with `if_not_empty`.
+    Https,
     /// The `host:port` of the upstream `proxy_pass` chose — nginx's default
     /// value for the forwarded `Host` header.
     ProxyHost,
@@ -118,6 +125,9 @@ impl Var {
             "connection_requests" => Var::ConnectionRequests,
             "pid" => Var::Pid,
             "nginx_version" => Var::NginxVersion,
+            "fastcgi_script_name" => Var::FastcgiScriptName,
+            "fastcgi_path_info" => Var::FastcgiPathInfo,
+            "https" => Var::Https,
             "proxy_host" => Var::ProxyHost,
             "proxy_port" => Var::ProxyPort,
             "proxy_add_x_forwarded_for" => Var::ProxyAddXForwardedFor,

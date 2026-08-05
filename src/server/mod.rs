@@ -13,7 +13,9 @@
 pub mod autoindex;
 pub mod conn;
 pub mod ctx;
+pub mod fastcgi;
 pub mod fcache;
+pub mod fcgi_proto;
 pub mod files;
 pub mod handler;
 pub mod log;

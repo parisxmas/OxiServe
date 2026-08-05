@@ -292,6 +292,13 @@ fn host_of(addr: &str) -> &str {
 }
 
 /// Chooses an upstream server according to the configured method.
+///
+/// Shared with the FastCGI handler: `fastcgi_pass backend;` load-balances over
+/// an `upstream` block exactly as `proxy_pass` does.
+pub fn pick_upstream(ctx: &Ctx<'_>, up: &Arc<Upstream>) -> Result<String, u16> {
+    pick(ctx, up)
+}
+
 fn pick(ctx: &Ctx<'_>, up: &Arc<Upstream>) -> Result<String, u16> {
     let live: Vec<&crate::config::model::UpstreamServer> =
         up.servers.iter().filter(|s| !s.down && !s.backup).collect();

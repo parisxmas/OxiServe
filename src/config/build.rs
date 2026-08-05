@@ -227,6 +227,7 @@ pub fn default_core() -> CoreConf {
         satisfy_any: false,
         internal: false,
         open_file_cache: OpenFileCache::default(),
+        fastcgi: Arc::new(FastCgiConf::default()),
     }
 }
 
@@ -277,6 +278,14 @@ struct CoreLayer {
     // any other scalar; the struct is assembled at resolve time.
     ofc: Option<OpenFileCache>,
     ofc_valid: Option<Duration>,
+    fcgi_params: Option<Vec<FastCgiParam>>,
+    fcgi_index: Option<Arc<str>>,
+    fcgi_split: Option<Arc<Regex>>,
+    fcgi_connect_timeout: Option<Duration>,
+    fcgi_read_timeout: Option<Duration>,
+    fcgi_send_timeout: Option<Duration>,
+    fcgi_keep_conn: Option<bool>,
+    fcgi_hide_headers: Option<Vec<Box<str>>>,
     ofc_min_uses: Option<u32>,
     ofc_errors: Option<bool>,
     // proxy_* are accumulated rather than replaced, matching nginx's
@@ -366,6 +375,45 @@ impl CoreLayer {
             c.open_file_cache.errors = v;
         }
 
+        if self.fcgi_params.is_some()
+            || self.fcgi_index.is_some()
+            || self.fcgi_split.is_some()
+            || self.fcgi_connect_timeout.is_some()
+            || self.fcgi_read_timeout.is_some()
+            || self.fcgi_send_timeout.is_some()
+            || self.fcgi_keep_conn.is_some()
+            || self.fcgi_hide_headers.is_some()
+        {
+            let mut f = (*c.fastcgi).clone();
+            // `fastcgi_param` follows the list rule: a level that defines any
+            // replaces the inherited set wholesale, exactly like add_header.
+            if let Some(v) = &self.fcgi_params {
+                f.params = v.clone();
+            }
+            if let Some(v) = &self.fcgi_index {
+                f.index = Some(v.clone());
+            }
+            if let Some(v) = &self.fcgi_split {
+                f.split_path_info = Some(v.clone());
+            }
+            if let Some(v) = self.fcgi_connect_timeout {
+                f.connect_timeout = Some(v);
+            }
+            if let Some(v) = self.fcgi_read_timeout {
+                f.read_timeout = Some(v);
+            }
+            if let Some(v) = self.fcgi_send_timeout {
+                f.send_timeout = Some(v);
+            }
+            if let Some(v) = self.fcgi_keep_conn {
+                f.keep_conn = v;
+            }
+            if let Some(v) = &self.fcgi_hide_headers {
+                f.hide_headers = v.clone();
+            }
+            c.fastcgi = Arc::new(f);
+        }
+
         let g = &mut c.gzip;
         if let Some(v) = self.gzip {
             g.enabled = v;
@@ -451,7 +499,6 @@ pub struct Builder {
 /// instead of "unknown directive", which is a very different message for
 /// someone porting a config.
 const KNOWN_UNIMPLEMENTED: &[&str] = &[
-    "fastcgi_pass", "fastcgi_param", "fastcgi_index", "fastcgi_split_path_info",
     "uwsgi_pass", "scgi_pass", "grpc_pass", "memcached_pass",
     "auth_basic", "auth_basic_user_file", "auth_request",
     "limit_req", "limit_req_zone", "limit_conn", "limit_conn_zone",
@@ -1188,6 +1235,51 @@ impl Builder {
             "limit_rate" => c.limit_rate = Some(size_arg(d, 0)?),
             "limit_rate_after" => c.limit_rate_after = Some(size_arg(d, 0)?),
             "internal" => c.internal = Some(true),
+            "fastcgi_pass" => {
+                want_args(d, 1)?;
+                lv.action = Some(Action::FastCgi(Arc::new(FastCgiPass {
+                    target: parse_fastcgi_target(&d.args[0], d)?,
+                })));
+            }
+            "fastcgi_param" => {
+                want_args_range(d, 2, 3)?;
+                c.fcgi_params.get_or_insert_with(Vec::new).push(FastCgiParam {
+                    name: Arc::from(d.args[0].as_str()),
+                    value: Arc::new(Template::compile(&d.args[1])),
+                    if_not_empty: d.arg(2) == Some("if_not_empty"),
+                });
+            }
+            "fastcgi_index" => {
+                want_args(d, 1)?;
+                c.fcgi_index = Some(Arc::from(d.args[0].as_str()));
+            }
+            "fastcgi_split_path_info" => {
+                want_args(d, 1)?;
+                let re = compile_regex(&d.args[0], false, d)?;
+                if re.captures_len() < 3 {
+                    bail!(
+                        d,
+                        "\"fastcgi_split_path_info\" needs two capture groups: \
+                         the script path and the path info"
+                    );
+                }
+                c.fcgi_split = Some(Arc::from(*re));
+            }
+            "fastcgi_connect_timeout" => c.fcgi_connect_timeout = Some(time_arg(d, 0)?),
+            "fastcgi_read_timeout" => c.fcgi_read_timeout = Some(time_arg(d, 0)?),
+            "fastcgi_send_timeout" => c.fcgi_send_timeout = Some(time_arg(d, 0)?),
+            "fastcgi_keep_conn" => c.fcgi_keep_conn = Some(flag(d)?),
+            "fastcgi_hide_header" => {
+                want_args(d, 1)?;
+                c.fcgi_hide_headers
+                    .get_or_insert_with(Vec::new)
+                    .push(d.args[0].to_ascii_lowercase().into_boxed_str());
+            }
+            "fastcgi_buffering" | "fastcgi_buffers" | "fastcgi_buffer_size"
+            | "fastcgi_busy_buffers_size" | "fastcgi_next_upstream"
+            | "fastcgi_intercept_errors" | "fastcgi_request_buffering"
+            | "fastcgi_temp_file_write_size" | "fastcgi_max_temp_file_size"
+            | "fastcgi_ignore_headers" | "fastcgi_pass_header" => {}
             "open_file_cache" => {
                 want_args_range(d, 1, 3)?;
                 if d.args[0] == "off" {
@@ -1558,6 +1650,23 @@ fn parse_return(d: &Directive) -> R<Action> {
     })
 }
 
+/// `fastcgi_pass` takes a bare `host:port` or an upstream name — no scheme.
+fn parse_fastcgi_target(s: &str, d: &Directive) -> R<ProxyTarget> {
+    if s.starts_with("unix:") {
+        bail!(d, "unix domain sockets are not supported yet in \"fastcgi_pass\"");
+    }
+    if s.contains('$') {
+        return Ok(ProxyTarget::Dynamic(Arc::new(Template::compile(s))));
+    }
+    if let Some((h, p)) = s.rsplit_once(':') {
+        if let Ok(port) = p.parse::<u16>() {
+            return Ok(ProxyTarget::Addr { host: Arc::from(h), port });
+        }
+    }
+    // No port: a bare name is an upstream reference.
+    Ok(ProxyTarget::Upstream(Arc::from(s)))
+}
+
 fn parse_proxy_pass(s: &str, d: &Directive) -> R<ProxyPass> {
     if s.contains('$') && !s.starts_with("http://") && !s.starts_with("https://") {
         return Ok(ProxyPass {
@@ -1829,12 +1938,62 @@ mod tests {
 
     #[test]
     fn known_unimplemented_gets_a_clearer_message() {
-        let c = build(&format!("{MIN} location / {{ fastcgi_pass 127.0.0.1:9000; }} }} }}")).unwrap();
+        let c = build(&format!("{MIN} location / {{ limit_req zone=one; }} }} }}")).unwrap();
         assert!(
-            c.unsupported.iter().any(|u| u.contains("not implemented yet") && u.contains("fastcgi_pass")),
+            c.unsupported.iter().any(|u| u.contains("not implemented yet") && u.contains("limit_req")),
             "{:?}",
             c.unsupported
         );
+    }
+
+    #[test]
+    fn fastcgi_directives_build() {
+        let c = build(&format!(
+            "{MIN} location ~ \\.php$ {{ \
+               fastcgi_pass 127.0.0.1:9000; \
+               fastcgi_index index.php; \
+               fastcgi_split_path_info \"^(.+\\.php)(/.*)$\"; \
+               fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name; \
+               fastcgi_param HTTPS $https if_not_empty; \
+               fastcgi_read_timeout 120s; }} }} }}"
+        ))
+        .unwrap();
+        let http = c.http.unwrap();
+        let loc = &http.servers[0].locations.regex[0];
+        assert!(matches!(loc.action, Action::FastCgi(_)));
+        let f = &loc.core.fastcgi;
+        assert_eq!(f.params.len(), 2);
+        assert!(f.params[1].if_not_empty, "if_not_empty must be recorded");
+        assert_eq!(f.index.as_deref(), Some("index.php"));
+        assert!(f.split_path_info.is_some());
+        assert_eq!(f.read_timeout, Some(Duration::from_secs(120)));
+        assert!(c.unsupported.is_empty(), "{:?}", c.unsupported);
+    }
+
+    #[test]
+    fn fastcgi_split_path_info_requires_two_captures() {
+        let e = build(&format!(
+            "{MIN} location / {{ fastcgi_pass 127.0.0.1:9000; \
+             fastcgi_split_path_info \"^(.+)$\"; }} }} }}"
+        ))
+        .unwrap_err();
+        assert!(e.msg.contains("two capture groups"), "{}", e.msg);
+    }
+
+    #[test]
+    fn fastcgi_pass_accepts_addresses_and_upstream_names() {
+        let c = build(
+            "events {} http { upstream php { server 127.0.0.1:9000; } \
+             server { listen 80; location / { fastcgi_pass php; } } }",
+        )
+        .unwrap();
+        let http = c.http.unwrap();
+        match &http.servers[0].locations.prefix[0].action {
+            Action::FastCgi(f) => {
+                assert!(matches!(&f.target, ProxyTarget::Upstream(n) if &**n == "php"))
+            }
+            _ => panic!("expected fastcgi"),
+        }
     }
 
     #[test]

@@ -190,6 +190,7 @@ pub struct CoreConf {
     pub satisfy_any: bool,
     pub internal: bool,
     pub open_file_cache: OpenFileCache,
+    pub fastcgi: Arc<FastCgiConf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,8 +295,41 @@ pub enum Action {
     Return { status: u16, body: Option<Arc<Template>> },
     /// `proxy_pass http://backend;`
     Proxy(Arc<ProxyPass>),
+    /// `fastcgi_pass 127.0.0.1:9000;`
+    FastCgi(Arc<FastCgiPass>),
     /// A location that only exists to hold configuration (e.g. `internal;`).
     None,
+}
+
+/// `fastcgi_pass` plus everything that shapes the FastCGI environment.
+#[derive(Debug, Clone)]
+pub struct FastCgiPass {
+    pub target: ProxyTarget,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FastCgiConf {
+    /// `fastcgi_param NAME value [if_not_empty]`, in configuration order.
+    pub params: Vec<FastCgiParam>,
+    /// `fastcgi_index` — appended when the script path ends in `/`.
+    pub index: Option<Arc<str>>,
+    /// `fastcgi_split_path_info` — capture 1 is SCRIPT_NAME, capture 2 is
+    /// PATH_INFO. This is what makes `/app.php/users/42` route correctly.
+    pub split_path_info: Option<Arc<Regex>>,
+    pub connect_timeout: Option<Duration>,
+    pub read_timeout: Option<Duration>,
+    pub send_timeout: Option<Duration>,
+    /// `fastcgi_keep_conn` — ask the application not to close the connection.
+    pub keep_conn: bool,
+    pub hide_headers: Vec<Box<str>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FastCgiParam {
+    pub name: Arc<str>,
+    pub value: Arc<Template>,
+    /// `if_not_empty` — omit the parameter when the value renders empty.
+    pub if_not_empty: bool,
 }
 
 #[derive(Debug, Clone)]

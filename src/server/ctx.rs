@@ -47,6 +47,10 @@ pub struct Ctx<'a> {
     /// `$request_filename` — the path the file handler resolved.
     pub filename: String,
 
+    /// Filled in by the FastCGI handler before any parameter is rendered.
+    pub fastcgi_script_name: String,
+    pub fastcgi_path_info: String,
+
     pub upstream_addr: String,
     pub upstream_status: u16,
     pub upstream_time: f64,
@@ -92,6 +96,8 @@ impl<'a> Ctx<'a> {
             conn_requests,
             document_root: String::new(),
             filename: String::new(),
+            fastcgi_script_name: String::new(),
+            fastcgi_path_info: String::new(),
             upstream_addr: String::new(),
             upstream_status: 0,
             upstream_time: 0.0,
@@ -197,7 +203,24 @@ impl<'a> Ctx<'a> {
             }
             Var::TimeLocal => date::append_time_local(out),
             Var::TimeIso8601 => date::append_time_iso8601(out),
-            Var::DocumentRoot => out.push_str(&self.document_root),
+            Var::DocumentRoot => {
+                // The static handler records the root it resolved. Any other
+                // handler (FastCGI, proxy) never touches the filesystem, so
+                // fall back to the matched location's `root`/`alias` — nginx
+                // makes `$document_root` available regardless of handler, and
+                // `SCRIPT_FILENAME $document_root$fastcgi_script_name` is the
+                // single most common use of it.
+                if !self.document_root.is_empty() {
+                    out.push_str(&self.document_root);
+                } else {
+                    let core = match &self.matched {
+                        Some(l) => &l.core,
+                        None => &self.server.core,
+                    };
+                    let t = core.alias.as_ref().unwrap_or(&core.root);
+                    t.render_into(&DepthSource { ctx: self, depth: depth + 1 }, out);
+                }
+            }
             Var::RequestFilename => out.push_str(&self.filename),
             Var::ContentType => {
                 if let Some(v) = r.hot_value(b, Hot::ContentType) {
@@ -228,6 +251,13 @@ impl<'a> Ctx<'a> {
             Var::Capture(i) => {
                 if let Some(c) = self.captures.get((*i as usize).wrapping_sub(1)) {
                     out.push_str(c);
+                }
+            }
+            Var::FastcgiScriptName => out.push_str(&self.fastcgi_script_name),
+            Var::FastcgiPathInfo => out.push_str(&self.fastcgi_path_info),
+            Var::Https => {
+                if self.scheme == "https" {
+                    out.push_str("on");
                 }
             }
             Var::ProxyHost => {
