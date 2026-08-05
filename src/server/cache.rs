@@ -271,6 +271,15 @@ pub fn load(zone: &Zone, key: &str, hash: KeyHash) -> Option<(Decoded, CacheStat
                     e.size = buf.len() as u64;
                 }
             });
+            // `inactive` is measured from last use, so a hit has to move the
+            // file's timestamp — throttled, because this is the hot path.
+            let mtime = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            touch_if_stale(&path, mtime);
             Some((d, status))
         }
         // A corrupt or foreign file is removed rather than retried forever.
@@ -497,6 +506,127 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    fn mkzone(name: &str, max_size: u64, inactive_secs: u64) -> Zone {
+        let root = std::env::temp_dir()
+            .join(format!("oxiserve-mgr-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        Zone {
+            name: name.into(),
+            root,
+            levels: vec![1, 2],
+            max_entries: 1000,
+            max_size,
+            inactive: Duration::from_secs(inactive_secs),
+        }
+    }
+
+    /// Writes an entry and backdates it, so age-based rules can be tested
+    /// without the test sleeping.
+    fn put_aged(zone: &Zone, key: &str, body: &[u8], age_secs: u64) {
+        let h = KeyHash::of(key);
+        let data = encode_entry(key, 200, &[], body, Duration::from_secs(3600));
+        store(zone, h, &data).unwrap();
+        let path = h.path(&zone.root, &zone.levels);
+        let when = std::time::SystemTime::now() - Duration::from_secs(age_secs);
+        let ft = filetime::FileTime::from_system_time(when);
+        let _ = filetime::set_file_mtime(&path, ft);
+    }
+
+    #[test]
+    fn manager_removes_entries_past_inactive() {
+        let z = mkzone("inactive", 0, 100);
+        put_aged(&z, "/fresh", b"new", 10);
+        put_aged(&z, "/stale", b"old", 500);
+
+        let st = manager_pass(&z);
+        assert_eq!(st.removed_inactive, 1, "only the stale entry should go");
+        assert!(load(&z, "/fresh", KeyHash::of("/fresh")).is_some(), "fresh must survive");
+        assert!(load(&z, "/stale", KeyHash::of("/stale")).is_none(), "stale must be gone");
+        let _ = std::fs::remove_dir_all(&z.root);
+    }
+
+    #[test]
+    fn manager_trims_to_max_size_oldest_first() {
+        // Ten 10 KB entries against a 50 KB cap.
+        let z = mkzone("maxsize", 50 * 1024, 0);
+        let body = vec![b'x'; 10 * 1024];
+        for i in 0..10 {
+            // Ascending age: /e0 is the oldest.
+            put_aged(&z, &format!("/e{i}"), &body, (10 - i) as u64 * 10);
+        }
+
+        let st = manager_pass(&z);
+        assert!(st.removed_oversize > 0, "must remove something to fit");
+        assert!(st.bytes <= 50 * 1024, "must end under max_size, got {}", st.bytes);
+        // The newest entry survives, the oldest does not.
+        assert!(load(&z, "/e9", KeyHash::of("/e9")).is_some(), "newest must survive");
+        assert!(load(&z, "/e0", KeyHash::of("/e0")).is_none(), "oldest must be evicted first");
+        let _ = std::fs::remove_dir_all(&z.root);
+    }
+
+    #[test]
+    fn manager_leaves_a_cache_under_the_limit_alone() {
+        let z = mkzone("under", 10 * 1024 * 1024, 0);
+        for i in 0..5 {
+            put_aged(&z, &format!("/k{i}"), b"small", 5);
+        }
+        let st = manager_pass(&z);
+        assert_eq!(st.removed_oversize, 0);
+        assert_eq!(st.removed_inactive, 0);
+        assert_eq!(st.entries, 5, "nothing should be touched");
+        let _ = std::fs::remove_dir_all(&z.root);
+    }
+
+    #[test]
+    fn manager_cleans_up_temp_files_from_interrupted_writes() {
+        // A crash between write and rename leaves a temp file that nothing
+        // else will ever claim.
+        let z = mkzone("temp", 0, 0);
+        let stray = z.root.join("abc.tmp99999");
+        std::fs::write(&stray, b"half-written").unwrap();
+        put_aged(&z, "/real", b"ok", 1);
+
+        let st = manager_pass(&z);
+        assert_eq!(st.removed_temp, 1, "the temp file must be reaped");
+        assert!(!stray.exists());
+        assert!(load(&z, "/real", KeyHash::of("/real")).is_some(), "real entries untouched");
+        let _ = std::fs::remove_dir_all(&z.root);
+    }
+
+    #[test]
+    fn manager_prunes_the_empty_directories_levels_left_behind() {
+        let z = mkzone("dirs", 0, 1);
+        put_aged(&z, "/gone", b"x", 500);
+        // levels=1:2 created two nested directories for that one entry.
+        assert!(walk_dirs(&z.root) > 0);
+        manager_pass(&z);
+        assert_eq!(walk_dirs(&z.root), 0, "empty level directories must be pruned");
+        let _ = std::fs::remove_dir_all(&z.root);
+    }
+
+    #[test]
+    fn manager_on_an_empty_or_missing_directory_is_harmless() {
+        let z = mkzone("empty", 1024, 60);
+        assert_eq!(manager_pass(&z), ManagerStats::default());
+        let _ = std::fs::remove_dir_all(&z.root);
+        // Missing entirely: must not panic.
+        let st = manager_pass(&z);
+        assert_eq!(st.entries, 0);
+    }
+
+    fn walk_dirs(p: &Path) -> usize {
+        let mut n = 0;
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                if e.path().is_dir() {
+                    n += 1 + walk_dirs(&e.path());
+                }
+            }
+        }
+        n
+    }
+
     #[test]
     fn min_uses_counting() {
         let zone = Zone {
@@ -546,5 +676,158 @@ mod tests {
             }
         }
         out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cache manager
+// ---------------------------------------------------------------------------
+
+/// What one maintenance pass did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ManagerStats {
+    pub entries: usize,
+    pub bytes: u64,
+    /// Removed for exceeding `inactive=`.
+    pub removed_inactive: usize,
+    /// Removed to get back under `max_size=`.
+    pub removed_oversize: usize,
+    /// Leftover temporary files from an interrupted write.
+    pub removed_temp: usize,
+}
+
+/// One entry seen on disk.
+struct OnDisk {
+    path: PathBuf,
+    size: u64,
+    /// Seconds since the epoch of the last write or touch.
+    mtime: u64,
+}
+
+/// Runs one maintenance pass over a zone's directory.
+///
+/// Deliberately driven by **the filesystem, not the in-process index**. The
+/// index is per worker: it does not know what other workers wrote and it is
+/// empty after a restart, so trusting it would leak disk forever. Walking the
+/// directory is the only view that is complete and survives restarts — which
+/// is also why nginx has a separate cache loader process.
+///
+/// Blocking I/O by design; the caller runs it off the request path.
+pub fn manager_pass(zone: &Zone) -> ManagerStats {
+    let mut stats = ManagerStats::default();
+    let mut entries: Vec<OnDisk> = Vec::new();
+    let now = now_secs();
+
+    collect(&zone.root, &mut entries, &mut stats);
+
+    // 1. Anything untouched for longer than `inactive` goes, regardless of
+    //    how much room is left. This is nginx's rule and it keeps a cache of
+    //    one-off URLs from staying warm forever.
+    let inactive = zone.inactive.as_secs();
+    if inactive > 0 {
+        entries.retain(|e| {
+            if now.saturating_sub(e.mtime) > inactive {
+                if std::fs::remove_file(&e.path).is_ok() {
+                    stats.removed_inactive += 1;
+                    stats.bytes = stats.bytes.saturating_sub(e.size);
+                    return false;
+                }
+            }
+            true
+        });
+    }
+
+    // 2. Then trim to `max_size`, oldest first.
+    if zone.max_size > 0 && stats.bytes > zone.max_size {
+        // Free down to 90% rather than exactly to the limit, so the next few
+        // stores do not each trigger another full pass.
+        let target = zone.max_size - zone.max_size / 10;
+        entries.sort_by_key(|e| e.mtime);
+        for e in &entries {
+            if stats.bytes <= target {
+                break;
+            }
+            if std::fs::remove_file(&e.path).is_ok() {
+                stats.removed_oversize += 1;
+                stats.bytes = stats.bytes.saturating_sub(e.size);
+            }
+        }
+    }
+
+    stats.entries = entries.len() - stats.removed_oversize;
+    prune_empty_dirs(&zone.root);
+    stats
+}
+
+fn collect(dir: &Path, out: &mut Vec<OnDisk>, stats: &mut ManagerStats) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let path = e.path();
+        let Ok(md) = e.metadata() else { continue };
+        if md.is_dir() {
+            collect(&path, out, stats);
+            continue;
+        }
+        // A temp file means a write died mid-flight; it will never be renamed
+        // into place, so nothing else will ever clean it up.
+        if path
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| x.starts_with("tmp"))
+        {
+            if std::fs::remove_file(&path).is_ok() {
+                stats.removed_temp += 1;
+            }
+            continue;
+        }
+        let mtime = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        stats.bytes += md.len();
+        out.push(OnDisk { path, size: md.len(), mtime });
+    }
+}
+
+/// Removes directories the `levels=` layout left empty, so a long-lived cache
+/// does not accumulate thousands of empty two-character directories.
+fn prune_empty_dirs(root: &Path) {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            prune_empty_dirs(&p);
+            // Fails harmlessly when the directory is not empty.
+            let _ = std::fs::remove_dir(&p);
+        }
+    }
+}
+
+/// How stale an entry's timestamp may get before a hit refreshes it.
+///
+/// `inactive` is measured from the last *use*, so a hit has to move the
+/// timestamp — but doing that on every hit would add a syscall to the hot
+/// path. Refreshing only once per minute keeps the cost negligible while
+/// still preventing a busy entry from being reaped.
+const TOUCH_INTERVAL: u64 = 60;
+
+/// Marks an entry as recently used, cheaply.
+fn touch_if_stale(path: &Path, mtime: u64) {
+    if now_secs().saturating_sub(mtime) < TOUCH_INTERVAL {
+        return;
+    }
+    // Rewriting the mtime without rewriting the file: open for append and
+    // write nothing does not update it, so the portable move is a no-op
+    // truncate-free touch via `File::open` + `set_len` at the same length.
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+        if let Ok(md) = f.metadata() {
+            let _ = f.set_len(md.len());
+        }
     }
 }

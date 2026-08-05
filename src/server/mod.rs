@@ -162,6 +162,33 @@ fn worker(
             }));
         }
 
+        // The cache manager runs on ONE worker only. Every worker shares the
+        // same directory, so several of them pruning at once would race to
+        // delete the same files and each see a different total size. Worker 0
+        // is as good a choice as any and needs no coordination.
+        if id == 0 {
+            for zone in http.cache_zones.values() {
+                let zone = zone.clone();
+                tasks.push(tokio::task::spawn_local(async move {
+                    // Sweep at a fraction of `inactive`, so an entry is not
+                    // kept far past its welcome, with sane bounds either way.
+                    let every = (zone.inactive / 10)
+                        .clamp(std::time::Duration::from_secs(10), std::time::Duration::from_secs(300));
+                    let mut tick = tokio::time::interval(every);
+                    loop {
+                        tick.tick().await;
+                        let z = zone.clone();
+                        // Walking a large cache directory is blocking work and
+                        // must not sit on the worker's event loop.
+                        let _ = tokio::task::spawn_blocking(move || {
+                            crate::server::cache::manager_pass(&z)
+                        })
+                        .await;
+                    }
+                }));
+            }
+        }
+
         // A periodic tick flushes buffered log lines waiting on a `flush=`
         // deadline rather than on buffer pressure.
         let flusher_logs = logs.clone();

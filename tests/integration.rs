@@ -1639,3 +1639,92 @@ fn unknown_cache_zone_is_a_config_error() {
     let err = oxiserve::config::load(&f, dir).unwrap_err().to_string();
     assert!(err.contains("unknown proxy_cache zone"), "got: {err}");
 }
+
+#[test]
+fn cache_manager_enforces_max_size_on_a_running_server() {
+    // The manager is what stops the cache directory growing without bound.
+    // Proving it needs a real server: the sweep runs on worker 0's timer.
+    //
+    // The counting backend returns ~11-byte bodies, far too small to overfill
+    // a 20 KB cap in a reasonable number of requests, so this uses a backend
+    // that returns 2 KB per response.
+    let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+    let l = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut c = c;
+                let mut b = [0u8; 4096];
+                if c.read(&mut b).is_err() {
+                    return;
+                }
+                let body = "y".repeat(2048);
+                let r = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = c.write_all(r.as_bytes());
+            });
+        }
+    });
+    let s = Server::start(
+        "cachemgr",
+        &format!("
+worker_processes 1;
+error_log {{DIR}}/error.log crit;
+events {{ worker_connections 64; }}
+http {{
+    access_log off;
+    proxy_cache_path {{DIR}}/cache levels=1:2 keys_zone=mgr:10m inactive=30s max_size=20k;
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        location / {{
+            proxy_pass http://127.0.0.1:{port};
+            proxy_cache mgr;
+            proxy_cache_valid 200 300s;
+        }}
+    }}
+}}"),
+        &[],
+    );
+
+    // A 20 KB cap, overfilled well past it.
+    for i in 0..40 {
+        assert_eq!(s.get(&format!("/item{i}")).status, 200);
+    }
+    let dir = s.dir.join("cache");
+    let before = dir_bytes(&dir);
+    assert!(before > 20 * 1024, "test must actually overfill the cache, got {before} bytes");
+
+    // The sweep interval floors at 10s; wait for one to land.
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut after = before;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+        after = dir_bytes(&dir);
+        if after <= 20 * 1024 {
+            break;
+        }
+    }
+    assert!(
+        after <= 20 * 1024,
+        "cache manager must trim to max_size: {before} -> {after} bytes"
+    );
+    assert!(after > 0, "it must not delete everything either");
+}
+
+fn dir_bytes(p: &std::path::Path) -> u64 {
+    let mut total = 0;
+    if let Ok(rd) = std::fs::read_dir(p) {
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                total += dir_bytes(&path);
+            } else if let Ok(md) = e.metadata() {
+                total += md.len();
+            }
+        }
+    }
+    total
+}
