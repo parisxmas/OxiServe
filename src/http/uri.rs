@@ -29,6 +29,12 @@ pub enum UriError {
 /// Returns a path that always starts with `/`, contains no `.`/`..` segments,
 /// and no empty segments. A trailing slash is preserved because `try_files`
 /// and directory-index handling depend on it.
+///
+/// **Call this exactly once per request.** Decoding is one-way: `/50%2525.html`
+/// decodes to `/50%25.html`, and decoding that again would give a third
+/// result. nginx has the same property, and the single call site is in
+/// `conn.rs`. A `%`-free result is safe to re-normalise, which is what the
+/// idempotence test asserts.
 pub fn normalize(path: &str) -> Result<String, UriError> {
     if !path.starts_with('/') {
         return Err(UriError::NotAbsolute);
@@ -210,14 +216,24 @@ mod tests {
     }
 
     #[test]
-    fn normalisation_is_idempotent() {
-        // A second pass anywhere in the pipeline must not produce a different
-        // path than the one the security checks examined.
+    fn normalisation_is_idempotent_when_the_result_has_no_percent() {
         for p in ["/a/b", "/ürün/x", "//a///b", "/a/./b/../c", "/tr/ç/", "/%C3%A7"] {
             let once = normalize(p).unwrap();
+            assert!(!once.contains('%'), "test input chosen to decode cleanly");
             let twice = normalize(&once).unwrap();
             assert_eq!(once, twice, "normalising {p:?} twice changed it");
         }
+    }
+
+    #[test]
+    fn decoding_is_one_way_and_that_is_intended() {
+        // A literal `%` in a filename survives one pass, and re-normalising
+        // would misread it as the start of an escape. This is why normalize is
+        // called exactly once per request, in conn.rs.
+        assert_eq!(normalize("/50%2525.html").unwrap(), "/50%25.html");
+        assert_eq!(normalize("/a%25b").unwrap(), "/a%b");
+        // Feeding the result back in is not something the server ever does.
+        assert_eq!(normalize("/a%b"), Err(UriError::Invalid));
     }
 
     #[test]
