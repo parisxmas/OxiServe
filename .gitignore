@@ -7,3 +7,7 @@ bench/results/
 bench/work/
 html/1k.html
 html/assets/big.txt
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/

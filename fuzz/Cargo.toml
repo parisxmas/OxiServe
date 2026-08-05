@@ -1,0 +1,47 @@
+[package]
+name = "oxiserve-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxiserve = { path = ".." }
+
+[[bin]]
+name = "http_request"
+path = "fuzz_targets/http_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uri_normalize"
+path = "fuzz_targets/uri_normalize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cache_entry"
+path = "fuzz_targets/cache_entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fcgi_record"
+path = "fuzz_targets/fcgi_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_lexer"
+path = "fuzz_targets/config_lexer.rs"
+test = false
+doc = false
+bench = false
