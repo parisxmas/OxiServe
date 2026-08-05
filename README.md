@@ -122,6 +122,42 @@ keepalive, access logging off on both, page cache warmed before each
 measurement — across four payload sizes chosen to exercise different paths.
 It requires `nginx` and one of `wrk` / `oha` / `bombardier`.
 
+### Real-world check: WordPress
+
+WordPress 6.x on PHP 8.3 (php-fpm in a container over a Unix socket, MariaDB,
+`try_files $uri $uri/ /index.php?$args`, pretty permalinks) runs on OxiServe
+end to end: front page, static assets, admin login and dashboard, REST API,
+and creating + publishing a post through `POST /wp-json/wp/v2/posts`.
+
+Against nginx on the **same** php-fpm socket, same files, same port taken in
+turn, responses verified byte-identical (69,783 B) before trusting either
+number:
+
+| | OxiServe | nginx |
+|---|---:|---:|
+| WordPress page (PHP) | **70.9 rps** | 64.6 rps |
+| static CSS | 19,601 rps | 19,895 rps |
+
+The PHP number is dominated by php-fpm, so neither server is really being
+measured there; the honest reading is "no regression from the FastCGI path".
+
+Running it found two bugs that no unit test had:
+
+- **`index` leaked PHP source.** nginx treats an `index` match as an internal
+  redirect so location selection runs again and `/` reaches
+  `location ~ \.php$`. We served the matched file directly — meaning
+  `wp-config.php` credentials would go to the client verbatim. Fixed, with a
+  regression test that asserts neither `<?php` nor a planted secret appears in
+  the body.
+- **gzip skipped every file above 64 KB.** Those take the sendfile path, and
+  the compressor only handled in-memory bodies — so WordPress's 131 KB
+  stylesheet shipped uncompressed. Now compressed (81% smaller), bounded at
+  8 MB.
+
+Known gap found in the same run: a `HEAD` request does not report
+`Content-Encoding: gzip` (the body is dropped before the compressor sees it),
+where nginx does.
+
 ### Linux — the corrected result
 
 The first Linux comparison reported here said nginx wins at every size. **That
