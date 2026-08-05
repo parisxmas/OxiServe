@@ -64,9 +64,9 @@ search order.
 
 **Rate limiting** — `limit_req_zone` / `limit_req` (`burst`, `nodelay`,
 `delay=N`) / `limit_req_status`, using nginx's leaky bucket with excess in
-milli-requests so `30r/m` is exact. In-process and sharded: measured at no
-detectable throughput cost (112k rps with and without, inside run-to-run
-noise).
+milli-requests so `30r/m` is exact. In-process and sharded: no detectable throughput cost (within
+run-to-run noise). Verified under load on Linux — `rate=50r/s burst=10` over
+5 seconds admitted 263 requests and rejected 460,495, against 260 predicted.
 
 **Bodies** — `Content-Length` and chunked request bodies are read and decoded
 before routing, `Expect: 100-continue`, `client_max_body_size` enforcement.
