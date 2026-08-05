@@ -85,9 +85,15 @@ block, `fastcgi_param` with `if_not_empty`, `fastcgi_index`,
 `try_files $uri $uri/ /index.php?$args` front-controller pattern, and
 300 KB responses spanning multiple records.
 
-**Proxying** — `proxy_pass` to upstreams or literal addresses, `upstream` blocks
-with `weight` / `backup` / `down` / `max_fails`, round-robin and `ip_hash`,
+**Proxying** — `proxy_pass` to upstreams, literal addresses or Unix sockets,
+`upstream` blocks with `weight` / `backup` / `down`, round-robin and `ip_hash`,
 `proxy_set_header`, `proxy_hide_header`, timeouts, chunked pass-through.
+
+> **Not a load balancer yet.** `max_fails` / `fail_timeout` / `least_conn` /
+> `keepalive` are parsed and have **no effect** — a dead backend keeps
+> receiving traffic, and `least_conn` silently balances round-robin.
+> `oxiserve -t` reports each of these explicitly. Scope and the order the gaps
+> get closed: [ADR-0001](docs/decisions/0001-load-balancer-scope.md).
 
 **TLS** — rustls, `ssl_certificate` / `ssl_certificate_key`, SNI across servers
 sharing a listener.
@@ -300,6 +306,16 @@ Three findings, none of which were guessable from reading the code:
 Serving large files from a memory map was also tried, and is *worse* under
 concurrency regardless of write size. Mapping is therefore reserved for small
 files, where its single-syscall write is what produces the 2× at 100 KiB.
+
+## Decisions
+
+Architecture decisions are recorded in [`docs/decisions/`](docs/decisions/):
+
+- [ADR-0001](docs/decisions/0001-load-balancer-scope.md) — load balancer scope:
+  what is real, what only looks real, and the order the gaps close.
+- [ADR-0002](docs/decisions/0002-no-database-on-the-request-path.md) — why no
+  store, not even an embedded one, sits on the per-request path, with the
+  measurements that overturned my earlier claim.
 
 ## Building
 

@@ -531,6 +531,19 @@ impl Builder {
         }
     }
 
+    /// Directives we parse and then do nothing with. Distinct from
+    /// "unimplemented": these appear in a working config and read as if they
+    /// take effect, so silence about them is misleading. See ADR-0001.
+    fn note_accepted_but_ignored(&mut self, what: &str, d: &Directive) {
+        let msg = format!(
+            "{}: \"{what}\" is accepted but has no effect yet — see docs/decisions/0001-load-balancer-scope.md",
+            d.loc()
+        );
+        if !self.unsupported.contains(&msg) {
+            self.unsupported.push(msg);
+        }
+    }
+
     fn note_unsupported(&mut self, d: &Directive) {
         let msg = if KNOWN_UNIMPLEMENTED.contains(&d.name.as_str()) {
             format!("{}: directive \"{}\" is recognised but not implemented yet", d.loc(), d.name)
@@ -769,6 +782,7 @@ impl Builder {
         let mut servers = Vec::new();
         let mut method = LbMethod::RoundRobin;
         let mut keepalive = 0;
+        let mut ignored_params: Vec<&str> = Vec::new();
 
         for c in d.children() {
             match c.name.as_str() {
@@ -788,8 +802,10 @@ impl Builder {
                             s.weight = v.parse().unwrap_or(1);
                         } else if let Some(v) = p.strip_prefix("max_fails=") {
                             s.max_fails = v.parse().unwrap_or(1);
+                            ignored_params.push("max_fails");
                         } else if let Some(v) = p.strip_prefix("fail_timeout=") {
                             s.fail_timeout = parse_time(v).unwrap_or(Duration::from_secs(10));
+                            ignored_params.push("fail_timeout");
                         } else if let Some(v) = p.strip_prefix("max_conns=") {
                             s.max_conns = v.parse().ok();
                         } else if p == "backup" {
@@ -804,13 +820,21 @@ impl Builder {
                     }
                     servers.push(s);
                 }
-                "least_conn" => method = LbMethod::LeastConn,
+                "least_conn" => {
+                    // Falls through to round-robin: no per-peer connection
+                    // count exists yet, so this must not pass silently.
+                    method = LbMethod::LeastConn;
+                    self.note_accepted_but_ignored("least_conn", c);
+                }
                 "ip_hash" => method = LbMethod::IpHash,
                 "random" => method = LbMethod::Random,
                 "hash" => method = LbMethod::RoundRobin, // consistent hashing: TODO
                 "keepalive" => {
                     want_args(c, 1)?;
                     keepalive = c.args[0].parse().unwrap_or(0);
+                    if keepalive > 0 {
+                        self.note_accepted_but_ignored("keepalive", c);
+                    }
                 }
                 "keepalive_requests" | "keepalive_timeout" | "zone" | "queue" => {}
                 _ => self.note_unsupported(c),
@@ -818,6 +842,11 @@ impl Builder {
         }
         if servers.is_empty() {
             bail!(d, "no servers defined in upstream \"{}\"", d.args[0]);
+        }
+        ignored_params.sort_unstable();
+        ignored_params.dedup();
+        for p in ignored_params {
+            self.note_accepted_but_ignored(p, d);
         }
         Ok(Upstream {
             name: d.args[0].as_str().into(),
@@ -2199,6 +2228,31 @@ mod tests {
         let e = build("events {} http { open_file_cache inactive=20s; server { listen 80; } }")
             .unwrap_err();
         assert!(e.msg.contains("max"), "{}", e.msg);
+    }
+
+    #[test]
+    fn accepted_but_ignored_directives_are_reported() {
+        // ADR-0001: these read as if they take effect and do not. Silence
+        // about them is worse than an "unsupported" error, because the config
+        // looks like it has fault tolerance and has none.
+        let c = build(
+            "events {} http { upstream b { least_conn; \
+             server 10.0.0.1:80 max_fails=3 fail_timeout=30s; keepalive 32; } \
+             server { listen 80; location / { proxy_pass http://b; } } }",
+        )
+        .unwrap();
+        let joined = c.unsupported.join("\n");
+        for d in ["least_conn", "keepalive", "max_fails", "fail_timeout"] {
+            assert!(joined.contains(d), "{d} must be reported; got:\n{joined}");
+        }
+        assert!(joined.contains("no effect yet"), "{joined}");
+        // A config that uses none of them stays quiet.
+        let clean = build(
+            "events {} http { upstream b { server 10.0.0.1:80; } \
+             server { listen 80; location / { proxy_pass http://b; } } }",
+        )
+        .unwrap();
+        assert!(clean.unsupported.is_empty(), "{:?}", clean.unsupported);
     }
 
     #[test]
