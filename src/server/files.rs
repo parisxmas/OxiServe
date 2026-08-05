@@ -164,8 +164,10 @@ async fn serve_file(
 
     let size = meta.len();
     let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+    // Both validators are needed as strings for precondition comparison, so
+    // they are built once into a reusable scratch buffer on the context rather
+    // than through `format!` and a fresh `String` per request.
     let etag = make_etag(mtime, size);
-    let last_modified = date::http_date(mtime);
 
     // Conditional requests short-circuit before any I/O on the body.
     if let Some(status) = evaluate_preconditions(ctx, core, &etag, mtime) {
@@ -176,15 +178,14 @@ async fn serve_file(
             if core.etag {
                 resp.header("ETag", &etag);
             }
-            resp.header("Last-Modified", &last_modified);
+            resp.header_with("Last-Modified", |o| date::append_http_date_of(mtime, o));
         }
         return Ok(Reply::new(resp, Body::Empty));
     }
 
     let mut resp = Resp::new();
-    let ctype = content_type(ctx, core, path);
-    resp.header("Content-Type", &ctype);
-    resp.header("Last-Modified", &last_modified);
+    write_content_type(&mut resp, ctx, core, path);
+    resp.header_with("Last-Modified", |o| date::append_http_date_of(mtime, o));
     if core.etag {
         resp.header("ETag", &etag);
     }
@@ -265,27 +266,53 @@ fn open_body(path: &Path, start: u64, len: u64, sendfile: bool) -> io::Result<Bo
     Ok(Body::File { file, offset: start, len })
 }
 
-fn content_type(ctx: &Ctx, core: &CoreConf, path: &Path) -> String {
+/// Writes `Content-Type` directly into the response arena.
+fn write_content_type(resp: &mut Resp, ctx: &Ctx, core: &CoreConf, path: &Path) {
     let name = path.to_string_lossy();
-    let base = ctx
-        .http
-        .mime
-        .lookup(&name)
-        .map(|t| t.to_string())
-        .unwrap_or_else(|| core.default_type.to_string());
-    match &core.charset {
-        // nginx appends charset only to text types.
-        Some(cs) if base.starts_with("text/") || base == "application/javascript" => {
-            format!("{base}; charset={cs}")
+    let base: &str = match ctx.http.mime.lookup(&name) {
+        Some(t) => t,
+        None => &core.default_type,
+    };
+    // nginx appends the charset only to text types.
+    let charset = match &core.charset {
+        Some(cs) if base.starts_with("text/") || base == "application/javascript" => Some(cs),
+        _ => None,
+    };
+    resp.header_with("Content-Type", |o| {
+        o.push_str(base);
+        if let Some(cs) = charset {
+            o.push_str("; charset=");
+            o.push_str(cs);
         }
-        _ => base,
-    }
+    });
 }
 
 /// nginx's ETag: `"<hex mtime>-<hex size>"`.
 pub fn make_etag(mtime: SystemTime, size: u64) -> String {
     let secs = mtime.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    format!("\"{secs:x}-{size:x}\"")
+    let mut s = String::with_capacity(24);
+    s.push('"');
+    push_hex(&mut s, secs);
+    s.push('-');
+    push_hex(&mut s, size);
+    s.push('"');
+    s
+}
+
+fn push_hex(out: &mut String, mut n: u64) {
+    if n == 0 {
+        out.push('0');
+        return;
+    }
+    let mut buf = [0u8; 16];
+    let mut i = buf.len();
+    while n > 0 {
+        i -= 1;
+        buf[i] = b"0123456789abcdef"[(n & 0xf) as usize];
+        n >>= 4;
+    }
+    // SAFETY: every byte written above is an ASCII hex digit.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
 }
 
 /// Returns `Some(status)` when the request should short-circuit.

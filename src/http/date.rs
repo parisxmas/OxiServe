@@ -84,7 +84,54 @@ pub fn append_time_iso8601(out: &mut String) {
 
 /// Formats an arbitrary time as an HTTP-date (for `Last-Modified`).
 pub fn http_date(t: SystemTime) -> String {
-    httpdate::fmt_http_date(t)
+    let mut s = String::with_capacity(29);
+    append_http_date_of(t, &mut s);
+    s
+}
+
+const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// Appends an RFC 7231 HTTP-date without allocating — `Last-Modified` is on
+/// every static response, so going through `String` per request was pure waste.
+pub fn append_http_date_of(t: SystemTime, out: &mut String) {
+    let secs = t
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let (y, m, d) = civil_from_days(days);
+    // 1970-01-01 was a Thursday.
+    let dow = (days + 4).rem_euclid(7) as usize;
+
+    out.push_str(DAYS[dow]);
+    out.push_str(", ");
+    pad2(d, out);
+    out.push(' ');
+    out.push_str(MONTHS[(m as usize - 1).min(11)]);
+    out.push(' ');
+    out.push_str(&y.to_string());
+    out.push(' ');
+    pad2((rem / 3600) as u32, out);
+    out.push(':');
+    pad2(((rem % 3600) / 60) as u32, out);
+    out.push(':');
+    pad2((rem % 60) as u32, out);
+    out.push_str(" GMT");
+}
+
+/// Days since the epoch to (year, month, day). Howard Hinnant's algorithm.
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    ((y + i64::from(m <= 2)) as i32, m as u32, d as u32)
 }
 
 /// Parses an HTTP-date (for `If-Modified-Since` / `If-Range`).
@@ -139,20 +186,6 @@ fn local_time(secs: i64) -> LocalTime {
         sec: (rem % 60) as u32,
         off: 0,
     }
-}
-
-#[cfg(not(unix))]
-fn civil_from_days(z: i64) -> (i32, u32, u32) {
-    let z = z + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z.rem_euclid(146097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    ((y + i64::from(m <= 2)) as i32, m as u32, d as u32)
 }
 
 const MONTHS: [&str; 12] = [
@@ -216,6 +249,15 @@ fn fmt_offset(off: i32, out: &mut String, colon: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hand_rolled_date_matches_httpdate_crate() {
+        // Spot-check the no-alloc formatter against the reference impl.
+        for secs in [0u64, 784_111_777, 1_700_000_000, 2_000_000_000, 951_782_400] {
+            let t = UNIX_EPOCH + Duration::from_secs(secs);
+            assert_eq!(http_date(t), httpdate::fmt_http_date(t), "secs={secs}");
+        }
+    }
 
     #[test]
     fn http_date_is_rfc7231() {
