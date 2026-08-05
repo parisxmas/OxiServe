@@ -181,7 +181,16 @@ async fn route(ctx: &mut Ctx<'_>, internal: bool) -> Step {
     ctx.matched = found.clone();
 
     let Some(loc) = found else {
-        // No location at all: fall back to the server's own action or static.
+        // No location matched, so `dispatch` never runs — but a `limit_req`
+        // declared at server level still applies. Missing this meant a config
+        // with no location block was not rate limited at all.
+        let srv = ctx.server.clone();
+        if !internal && !srv.core.limit_reqs.is_empty() {
+            if let Some(status) = apply_limit_req(ctx, &srv.core).await {
+                return Step::Fail(status);
+            }
+        }
+        // Fall back to the server's own action or static serving.
         return match &ctx.server.action {
             Action::Return { status, body } => Step::Done(return_reply(ctx, *status, body.clone())),
             _ => served_to_step(files::serve(ctx, None).await),

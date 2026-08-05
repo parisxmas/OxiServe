@@ -62,6 +62,12 @@ including the list-directive replace-wholesale rule.
 `location` (`=`, `^~`, `~`, `~*`, prefix, `@named`, nested), the full nginx
 search order.
 
+**Rate limiting** — `limit_req_zone` / `limit_req` (`burst`, `nodelay`,
+`delay=N`) / `limit_req_status`, using nginx's leaky bucket with excess in
+milli-requests so `30r/m` is exact. In-process and sharded: measured at no
+detectable throughput cost (112k rps with and without, inside run-to-run
+noise).
+
 **Bodies** — `Content-Length` and chunked request bodies are read and decoded
 before routing, `Expect: 100-continue`, `client_max_body_size` enforcement.
 
@@ -104,7 +110,7 @@ regex captures `$1`–`$9`.
 - **FastCGI response streaming** — responses are fully buffered
   (`fastcgi_buffering on`, capped at 64 MB) rather than streamed.
 - **`proxy_cache`** and the content cache.
-- **`limit_req` / `limit_conn`** rate limiting.
+- **`limit_conn`** connection limiting (`limit_req` is implemented).
 - **`auth_basic`**, `auth_request`.
 - **Unix domain sockets** in `listen`.
 - **`stream` and `mail`** blocks.
@@ -300,7 +306,11 @@ files, where its single-syscall write is what produces the 2× at 100 KiB.
 ```console
 $ cargo build --release
 $ cargo test
+$ scripts/bump.sh          # 0.2.3 -> 0.2.4, before committing a change
 ```
+
+The version reaches clients in the `Server:` header and in `oxiserve -v`, so
+each build that changes behaviour should carry its own.
 
 The release profile uses fat LTO and a single codegen unit; both matter
 measurably here.

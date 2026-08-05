@@ -1028,3 +1028,44 @@ fn unknown_limit_req_zone_is_a_config_error() {
     let err = oxiserve::config::load(&f, dir).unwrap_err().to_string();
     assert!(err.contains("unknown limit_req zone"), "got: {err}");
 }
+
+#[test]
+fn limit_req_applies_without_a_location_block() {
+    // Regression: with no `location` the router takes a server-level fallback
+    // path that skipped dispatch entirely, so the limit never ran. A config
+    // this plain is common, and it was silently unlimited.
+    let s = Server::start(
+        "limitnoloc",
+        &format!("{BASE}
+    limit_req_zone $binary_remote_addr zone=nl:1m rate=1r/s;
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        limit_req zone=nl;
+    }}
+}}"),
+        &[("index.html", b"served")],
+    );
+
+    assert_eq!(s.get("/index.html").status, 200, "first request passes");
+    assert_eq!(s.get("/index.html").status, 503, "server-level limit must apply");
+}
+
+#[test]
+fn limit_req_inherits_from_server_into_locations() {
+    let s = Server::start(
+        "limitinherit",
+        &format!("{BASE}
+    limit_req_zone $binary_remote_addr zone=ih:1m rate=1r/s;
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        limit_req zone=ih;
+        location /a {{ return 200 \"a\"; }}
+    }}
+}}"),
+        &[],
+    );
+    assert_eq!(s.get("/a").status, 200);
+    assert_eq!(s.get("/a").status, 503, "a location must inherit the server's limit");
+}
