@@ -45,7 +45,13 @@ impl RawStream for tokio::net::TcpStream {
     }
 }
 
-impl<T> RawStream for tokio_rustls::server::TlsStream<T> {}
+impl<T: RawStream> RawStream for tokio_rustls::server::TlsStream<T> {
+    fn as_tcp(&self) -> Option<&tokio::net::TcpStream> {
+        // TLS records must be encrypted in user space, so sendfile can never
+        // apply here regardless of the transport underneath.
+        None
+    }
+}
 
 pub struct ConnState {
     pub read: Vec<u8>,
@@ -79,8 +85,8 @@ pub async fn serve<S>(
     listener: &Arc<Listener>,
     http: &Arc<Http>,
     logs: &Rc<RefCell<Logs>>,
-    remote: SocketAddr,
-    local: SocketAddr,
+    remote: Option<SocketAddr>,
+    local: Option<SocketAddr>,
     scheme: &'static str,
     conn_id: u64,
 ) where

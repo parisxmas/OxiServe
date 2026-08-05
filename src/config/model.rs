@@ -345,6 +345,8 @@ pub struct ProxyPass {
 pub enum ProxyTarget {
     Upstream(Arc<str>),
     Addr { host: Arc<str>, port: u16 },
+    /// `unix:/run/php-fpm.sock` — how php-fpm ships by default.
+    Unix(Arc<str>),
     /// `proxy_pass $backend;` — resolved per request.
     Dynamic(Arc<Template>),
 }
@@ -539,9 +541,40 @@ pub struct TlsConf {
     pub alpn_h2: bool,
 }
 
+/// Where a listener binds. nginx allows both on the same `listen` directive
+/// family, and a config commonly has a TCP port plus a Unix socket for a
+/// front proxy on the same host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListenAddr {
+    Tcp(SocketAddr),
+    Unix(Arc<str>),
+}
+
+impl ListenAddr {
+    pub fn port(&self) -> u16 {
+        match self {
+            ListenAddr::Tcp(a) => a.port(),
+            ListenAddr::Unix(_) => 0,
+        }
+    }
+
+    pub fn is_ipv6(&self) -> bool {
+        matches!(self, ListenAddr::Tcp(a) if a.is_ipv6())
+    }
+}
+
+impl std::fmt::Display for ListenAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ListenAddr::Tcp(a) => write!(f, "{a}"),
+            ListenAddr::Unix(p) => write!(f, "unix:{p}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ListenSpec {
-    pub addr: SocketAddr,
+    pub addr: ListenAddr,
     pub default_server: bool,
     pub ssl: bool,
     pub http2: bool,
@@ -556,7 +589,7 @@ pub struct ListenSpec {
 /// One bound socket, plus every server that can be selected on it.
 #[derive(Debug)]
 pub struct Listener {
-    pub addr: SocketAddr,
+    pub addr: ListenAddr,
     pub backlog: i32,
     pub reuseport: bool,
     pub ssl: bool,
@@ -837,7 +870,7 @@ mod tests {
 
     fn listener(servers: Vec<Arc<ServerConf>>) -> Listener {
         Listener {
-            addr: "0.0.0.0:80".parse().unwrap(),
+            addr: ListenAddr::Tcp("0.0.0.0:80".parse().unwrap()),
             backlog: 511,
             reuseport: false,
             ssl: false,

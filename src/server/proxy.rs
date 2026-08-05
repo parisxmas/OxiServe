@@ -12,7 +12,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+
+use super::transport::Stream;
 
 use super::ctx::Ctx;
 use super::reply::{Body, Reply};
@@ -42,6 +43,7 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
 
     let (addr_str, tls) = match &pp.target {
         ProxyTarget::Addr { host, port } => (format!("{host}:{port}"), pp.tls),
+        ProxyTarget::Unix(path) => (format!("unix:{path}"), false),
         ProxyTarget::Dynamic(t) => {
             let rendered = t.render(&*ctx);
             let (scheme_tls, rest) = match rendered.strip_prefix("https://") {
@@ -74,12 +76,11 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
     ctx.upstream_addr = addr_str.clone();
 
     let connect_to = Duration::from_secs(60).min(conf.connect_timeout.unwrap_or(Duration::from_secs(60)));
-    let mut up = match tokio::time::timeout(connect_to, TcpStream::connect(&addr_str)).await {
+    let mut up = match tokio::time::timeout(connect_to, Stream::connect(&addr_str)).await {
         Ok(Ok(s)) => s,
         Ok(Err(_)) => return Err(502),
         Err(_) => return Err(504),
     };
-    let _ = up.set_nodelay(true);
 
     // ---- request head -----------------------------------------------------
     let mut head = String::with_capacity(512);
@@ -288,7 +289,13 @@ fn upstream_uri(ctx: &Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> String {
 }
 
 fn host_of(addr: &str) -> &str {
-    addr
+    // `unix:/run/app.sock` is not a valid Host value; nginx sends the socket
+    // path's basename-free form, so fall back to a stable placeholder.
+    if addr.starts_with("unix:") {
+        "localhost"
+    } else {
+        addr
+    }
 }
 
 /// Chooses an upstream server according to the configured method.
@@ -347,10 +354,12 @@ fn pick(ctx: &Ctx<'_>, up: &Arc<Upstream>) -> Result<String, u16> {
     })
 }
 
-fn addr_bytes(a: &SocketAddr) -> Vec<u8> {
+fn addr_bytes(a: &Option<SocketAddr>) -> Vec<u8> {
     match a {
-        SocketAddr::V4(v) => v.ip().octets().to_vec(),
-        SocketAddr::V6(v) => v.ip().octets().to_vec(),
+        Some(SocketAddr::V4(v)) => v.ip().octets().to_vec(),
+        Some(SocketAddr::V6(v)) => v.ip().octets().to_vec(),
+        // A Unix peer has no address, so every such client hashes alike.
+        None => Vec::new(),
     }
 }
 

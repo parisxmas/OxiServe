@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+
+use super::transport::Stream;
 
 use super::ctx::Ctx;
 use super::fcgi_proto as p;
@@ -39,6 +40,8 @@ pub async fn fastcgi(
 
     let addr = match &pass.target {
         ProxyTarget::Addr { host, port } => format!("{host}:{port}"),
+        // Kept in nginx's own `unix:` form; `Stream::connect` dispatches on it.
+        ProxyTarget::Unix(path) => format!("unix:{path}"),
         ProxyTarget::Upstream(name) => {
             let up = ctx.http.upstreams.get(&**name).ok_or(502u16)?;
             super::proxy::pick_upstream(ctx, up)?
@@ -65,12 +68,11 @@ pub async fn fastcgi(
     p::push_stdin(&mut out, ctx.body);
 
     let connect_to = conf.connect_timeout.unwrap_or(Duration::from_secs(60));
-    let mut sock = match tokio::time::timeout(connect_to, TcpStream::connect(&addr)).await {
+    let mut sock = match tokio::time::timeout(connect_to, Stream::connect(&addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(_)) => return Err(502),
         Err(_) => return Err(504),
     };
-    let _ = sock.set_nodelay(true);
 
     if sock.write_all(&out).await.is_err() {
         return Err(502);
@@ -167,7 +169,7 @@ fn build_params(ctx: &Ctx<'_>, conf: &FastCgiConf) -> Vec<u8> {
 /// `STDERR` is drained and discarded rather than mixed into the response —
 /// applications log to it, and folding that into the page would corrupt output.
 async fn read_response(
-    sock: &mut TcpStream,
+    sock: &mut Stream,
     conf: &FastCgiConf,
 ) -> Result<(Vec<u8>, u32), u16> {
     let read_to = conf.read_timeout.unwrap_or(Duration::from_secs(60));

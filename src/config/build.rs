@@ -888,7 +888,7 @@ impl Builder {
 
         if listens.is_empty() {
             listens.push(ListenSpec {
-                addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 80),
+                addr: ListenAddr::Tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 80)),
                 default_server: false,
                 ssl: false,
                 http2: false,
@@ -959,14 +959,14 @@ impl Builder {
         want_args_range(d, 1, 16)?;
         let spec = &d.args[0];
 
-        if spec.starts_with("unix:") {
-            bail!(d, "unix domain sockets are not supported yet");
-        }
-
-        let addr = parse_listen_addr(spec).ok_or_else(|| BuildError {
-            msg: format!("invalid listen address \"{spec}\""),
-            loc: d.loc(),
-        })?;
+        let addr = match spec.strip_prefix("unix:") {
+            Some(path) if !path.is_empty() => ListenAddr::Unix(Arc::from(path)),
+            Some(_) => bail!(d, "empty path in \"listen unix:\""),
+            None => ListenAddr::Tcp(parse_listen_addr(spec).ok_or_else(|| BuildError {
+                msg: format!("invalid listen address \"{spec}\""),
+                loc: d.loc(),
+            })?),
+        };
 
         let mut l = ListenSpec {
             addr,
@@ -1017,7 +1017,7 @@ impl Builder {
             servers: Vec<Arc<ServerConf>>,
             default: Option<usize>,
         }
-        let mut by_addr: Vec<(SocketAddr, Acc)> = Vec::new();
+        let mut by_addr: Vec<(ListenAddr, Acc)> = Vec::new();
 
         for s in servers {
             for l in &s.listens {
@@ -1025,7 +1025,7 @@ impl Builder {
                     Some((_, acc)) => acc,
                     None => {
                         by_addr.push((
-                            l.addr,
+                            l.addr.clone(),
                             Acc { spec: l.clone(), servers: Vec::new(), default: None },
                         ));
                         &mut by_addr.last_mut().unwrap().1
@@ -1652,8 +1652,12 @@ fn parse_return(d: &Directive) -> R<Action> {
 
 /// `fastcgi_pass` takes a bare `host:port` or an upstream name — no scheme.
 fn parse_fastcgi_target(s: &str, d: &Directive) -> R<ProxyTarget> {
-    if s.starts_with("unix:") {
-        bail!(d, "unix domain sockets are not supported yet in \"fastcgi_pass\"");
+    if let Some(path) = s.strip_prefix("unix:") {
+        if path.is_empty() {
+            bail!(d, "empty socket path in \"fastcgi_pass unix:\"");
+        }
+        // A trailing `:` is nginx's separator before a URI; FastCGI has none.
+        return Ok(ProxyTarget::Unix(Arc::from(path.trim_end_matches(':'))));
     }
     if s.contains('$') {
         return Ok(ProxyTarget::Dynamic(Arc::new(Template::compile(s))));
@@ -1682,6 +1686,23 @@ fn parse_proxy_pass(s: &str, d: &Directive) -> R<ProxyPass> {
     } else {
         bail!(d, "invalid URL prefix in \"proxy_pass\" — expected http:// or https://");
     };
+
+    // nginx's Unix form is `http://unix:/path/to.sock:/uri` — the socket path
+    // runs to the LAST colon, which separates it from the optional URI.
+    if let Some(after) = rest.strip_prefix("unix:") {
+        let (path, uri) = match after.rfind(':') {
+            Some(i) => (&after[..i], Some(&after[i + 1..])),
+            None => (after, None),
+        };
+        if path.is_empty() {
+            bail!(d, "empty socket path in \"proxy_pass ... unix:\"");
+        }
+        return Ok(ProxyPass {
+            target: ProxyTarget::Unix(Arc::from(path)),
+            uri: uri.filter(|u| !u.is_empty()).map(|u| Arc::new(Template::compile(u))),
+            tls,
+        });
+    }
 
     let (authority, uri) = match rest.find('/') {
         Some(i) => (&rest[..i], Some(&rest[i..])),

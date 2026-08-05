@@ -21,6 +21,7 @@ pub mod handler;
 pub mod log;
 pub mod proxy;
 pub mod reply;
+pub mod transport;
 
 use std::cell::RefCell;
 use std::io;
@@ -50,7 +51,7 @@ pub fn run(config: Config) -> io::Result<()> {
 
     // Sockets are bound before workers start, so a port conflict is reported
     // once, at startup, rather than N times from N threads.
-    let mut shared: Vec<Option<StdListener>> = Vec::new();
+    let mut shared: Vec<Option<BoundSocket>> = Vec::new();
     for l in &http.listeners {
         if cfg!(target_os = "linux") && l.reuseport {
             // Each worker will bind its own socket instead.
@@ -85,7 +86,7 @@ pub fn run(config: Config) -> io::Result<()> {
 
         // Each worker needs its own listener handle. Cloning the descriptor
         // gives every worker an independent accept loop on the same queue.
-        let mut listeners: Vec<(Arc<Listener>, Option<StdListener>)> = Vec::new();
+        let mut listeners: Vec<(Arc<Listener>, Option<BoundSocket>)> = Vec::new();
         for (i, l) in http.listeners.iter().enumerate() {
             let sock = match &shared[i] {
                 Some(s) => Some(s.try_clone()?),
@@ -120,7 +121,7 @@ type TlsMap = Arc<Vec<Option<Arc<rustls::ServerConfig>>>>;
 fn worker(
     id: usize,
     http: Arc<Http>,
-    listeners: Vec<(Arc<Listener>, Option<StdListener>)>,
+    listeners: Vec<(Arc<Listener>, Option<BoundSocket>)>,
     error_log: crate::config::model::ErrorLogConf,
     tls: TlsMap,
 ) -> io::Result<()> {
@@ -142,12 +143,11 @@ fn worker(
         let mut tasks = Vec::new();
 
         for (idx, (lconf, sock)) in listeners.into_iter().enumerate() {
-            let std_sock = match sock {
+            let bound = match sock {
                 Some(s) => s,
                 None => bind(&lconf)?,
             };
-            std_sock.set_nonblocking(true)?;
-            let listener = tokio::net::TcpListener::from_std(std_sock)?;
+            let listener = bound.into_listener()?;
 
             let http = http.clone();
             let logs = logs.clone();
@@ -201,13 +201,16 @@ async fn shutdown_signal() {
 }
 
 async fn accept_loop(
-    listener: tokio::net::TcpListener,
+    listener: transport::Listener,
     conf: Arc<Listener>,
     http: Arc<Http>,
     logs: Rc<RefCell<Logs>>,
     tls: Option<Arc<rustls::ServerConfig>>,
 ) {
-    let local_addr = listener.local_addr().unwrap_or(conf.addr);
+    let local_addr = match &conf.addr {
+        crate::config::model::ListenAddr::Tcp(a) => Some(*a),
+        crate::config::model::ListenAddr::Unix(_) => None,
+    };
     let nodelay = conf.servers[conf.default_server].core.tcp_nodelay;
 
     loop {
@@ -229,7 +232,9 @@ async fn accept_loop(
             }
         };
         if nodelay {
-            let _ = sock.set_nodelay(true);
+            if let transport::Stream::Tcp(t) = &sock {
+                let _ = t.set_nodelay(true);
+            }
         }
 
         let conf = conf.clone();
@@ -256,9 +261,57 @@ async fn accept_loop(
     }
 }
 
+/// A bound socket, before it is handed to a worker's runtime.
+enum BoundSocket {
+    Tcp(StdListener),
+    Unix(std::os::unix::net::UnixListener),
+}
+
+impl BoundSocket {
+    fn try_clone(&self) -> io::Result<BoundSocket> {
+        match self {
+            BoundSocket::Tcp(l) => l.try_clone().map(BoundSocket::Tcp),
+            BoundSocket::Unix(l) => l.try_clone().map(BoundSocket::Unix),
+        }
+    }
+
+    fn into_listener(self) -> io::Result<transport::Listener> {
+        match self {
+            BoundSocket::Tcp(l) => {
+                l.set_nonblocking(true)?;
+                tokio::net::TcpListener::from_std(l).map(transport::Listener::Tcp)
+            }
+            BoundSocket::Unix(l) => {
+                l.set_nonblocking(true)?;
+                tokio::net::UnixListener::from_std(l).map(transport::Listener::Unix)
+            }
+        }
+    }
+}
+
 /// Creates and binds one listening socket with the configured options.
-fn bind(l: &Listener) -> io::Result<StdListener> {
-    let domain = match l.addr {
+fn bind(l: &Listener) -> io::Result<BoundSocket> {
+    let tcp_addr = match &l.addr {
+        crate::config::model::ListenAddr::Tcp(a) => *a,
+        crate::config::model::ListenAddr::Unix(path) => {
+            let p = std::path::Path::new(&**path);
+            // A socket file left by a crash blocks `bind` with EADDRINUSE.
+            transport::unlink_stale_socket(p)?;
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let ul = std::os::unix::net::UnixListener::bind(p).map_err(|e| {
+                io::Error::new(e.kind(), format!("bind to unix:{path} failed: {e}"))
+            })?;
+            // Default 0666 so a front proxy running as another user can reach
+            // it, which is the whole point of a Unix listener.
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o666));
+            return Ok(BoundSocket::Unix(ul));
+        }
+    };
+
+    let domain = match tcp_addr {
         SocketAddr::V4(_) => Domain::IPV4,
         SocketAddr::V6(_) => Domain::IPV6,
     };
@@ -282,10 +335,10 @@ fn bind(l: &Listener) -> io::Result<StdListener> {
         sock.set_reuse_port(true)?;
     }
 
-    sock.bind(&l.addr.into())
+    sock.bind(&tcp_addr.into())
         .map_err(|e| io::Error::new(e.kind(), format!("bind to {} failed: {e}", l.addr)))?;
     sock.listen(l.backlog)?;
-    Ok(sock.into())
+    Ok(BoundSocket::Tcp(sock.into()))
 }
 
 /// Builds one rustls config per listener, with SNI resolution across every

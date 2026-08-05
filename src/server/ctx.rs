@@ -34,8 +34,9 @@ pub struct Ctx<'a> {
     /// Variables assigned by `set`.
     pub set_vars: Vec<(Arc<str>, String)>,
 
-    pub remote: SocketAddr,
-    pub local: SocketAddr,
+    /// `None` for a Unix-socket client, which has no address at all.
+    pub remote: Option<SocketAddr>,
+    pub local: Option<SocketAddr>,
     pub scheme: &'static str,
     pub start: Instant,
     /// Requests already served on this connection, for `$connection_requests`.
@@ -71,8 +72,8 @@ impl<'a> Ctx<'a> {
         http: &'a Http,
         server: &'a Arc<ServerConf>,
         uri: String,
-        remote: SocketAddr,
-        local: SocketAddr,
+        remote: Option<SocketAddr>,
+        local: Option<SocketAddr>,
         scheme: &'static str,
         conn_id: u64,
         conn_requests: u64,
@@ -177,10 +178,10 @@ impl<'a> Ctx<'a> {
             }
             Var::ServerProtocol => out.push_str(if r.minor == 0 { "HTTP/1.0" } else { "HTTP/1.1" }),
             Var::ServerName => out.push_str(&first_server_name(self.server)),
-            Var::ServerPort => push_num(out, self.local.port() as u64),
+            Var::ServerPort => push_num(out, self.local.map(|a| a.port()).unwrap_or(0) as u64),
             Var::ServerAddr => push_addr(out, &self.local),
             Var::RemoteAddr => push_addr(out, &self.remote),
-            Var::RemotePort => push_num(out, self.remote.port() as u64),
+            Var::RemotePort => push_num(out, self.remote.map(|a| a.port()).unwrap_or(0) as u64),
             Var::RemoteUser => {
                 // Only the userinfo half of Basic auth, un-decoded users get "".
                 if let Some(a) = r.hot_value(b, Hot::Authorization) {
@@ -410,7 +411,12 @@ fn push_lower(out: &mut String, s: &str) {
     }
 }
 
-fn push_addr(out: &mut String, a: &SocketAddr) {
+fn push_addr(out: &mut String, a: &Option<SocketAddr>) {
+    // nginx reports "unix:" for a peer on a Unix socket.
+    let Some(a) = a else {
+        out.push_str("unix:");
+        return;
+    };
     match a {
         SocketAddr::V4(v) => {
             let o = v.ip().octets();
@@ -504,8 +510,11 @@ mod tests {
     #[test]
     fn ipv4_formatting_avoids_allocation_path() {
         let mut s = String::new();
-        push_addr(&mut s, &"192.168.1.10:1234".parse().unwrap());
+        push_addr(&mut s, &Some("192.168.1.10:1234".parse().unwrap()));
         assert_eq!(s, "192.168.1.10");
+        s.clear();
+        push_addr(&mut s, &None);
+        assert_eq!(s, "unix:", "a Unix peer has no address");
     }
 
     #[test]

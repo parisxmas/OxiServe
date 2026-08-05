@@ -140,7 +140,7 @@ fn dir_redirect(ctx: &Ctx, core: &CoreConf) -> Reply {
         let host = ctx.req.host(ctx.buf);
         loc.push_str(if host.is_empty() { "localhost" } else { host });
         if core.port_in_redirect {
-            let port = ctx.local.port();
+            let port = ctx.local.map(|a| a.port()).unwrap_or(0);
             let default = if ctx.scheme == "https" { 443 } else { 80 };
             if port != default {
                 loc.push(':');

@@ -434,3 +434,104 @@ fn large_response_survives_record_splitting() {
     assert_eq!(body.len(), 200_000);
     assert!(body.bytes().all(|b| b == b'z'));
 }
+
+#[test]
+fn fastcgi_over_a_unix_socket() {
+    // php-fpm's default packaging listens on a Unix socket, so this is the
+    // path most real configurations take.
+    use std::os::unix::net::UnixListener;
+
+    let dir = std::path::PathBuf::from(format!("/tmp/oxs-t{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let sock = dir.join("fcgi.sock");
+    let _ = std::fs::remove_file(&sock);
+
+    let l = UnixListener::bind(&sock).unwrap();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            // The mock speaks the same protocol over either transport.
+            let tcp_like = c;
+            serve_fcgi_unix(tcp_like, |_| {
+                b"Content-Type: text/plain\r\n\r\nvia unix socket".to_vec()
+            });
+        }
+    });
+
+    let s = Server::start(
+        "unixsock",
+        &format!("
+worker_processes 1;
+error_log {{DIR}}/error.log crit;
+events {{ worker_connections 64; }}
+http {{
+    access_log off;
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        location / {{
+            fastcgi_pass unix:{};
+            fastcgi_param REQUEST_METHOD $request_method;
+        }}
+    }}
+}}", sock.display()),
+        &[],
+    );
+
+    let (status, _, body) = s.get("/x.php");
+    assert_eq!(status, 200);
+    assert_eq!(body, "via unix socket");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `serve_fcgi` over a Unix stream — same logic, different socket type.
+fn serve_fcgi_unix(
+    mut s: std::os::unix::net::UnixStream,
+    reply: impl Fn(&FcgiRequest) -> Vec<u8>,
+) {
+    let mut buf = Vec::new();
+    let mut params_raw = Vec::new();
+    let mut stdin = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut done = false;
+    while !done {
+        let n = match s.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        let mut off = 0;
+        while buf.len() - off >= 8 {
+            let content = u16::from_be_bytes([buf[off + 4], buf[off + 5]]) as usize;
+            let padding = buf[off + 6] as usize;
+            let total = 8 + content + padding;
+            if buf.len() - off < total {
+                break;
+            }
+            let ty = buf[off + 1];
+            let body = &buf[off + 8..off + 8 + content];
+            match ty {
+                4 if !body.is_empty() => params_raw.extend_from_slice(body),
+                5 => {
+                    if body.is_empty() {
+                        done = true;
+                    } else {
+                        stdin.extend_from_slice(body);
+                    }
+                }
+                _ => {}
+            }
+            off += total;
+        }
+        buf.drain(..off);
+    }
+    let req = FcgiRequest { params: decode_params(&params_raw), stdin };
+    let out = reply(&req);
+    let mut resp = Vec::new();
+    for c in out.chunks(65535) {
+        push_rec(&mut resp, 6, c);
+    }
+    push_rec(&mut resp, 6, &[]);
+    push_rec(&mut resp, 3, &[0u8; 8]);
+    let _ = s.write_all(&resp);
+    let _ = s.flush();
+}

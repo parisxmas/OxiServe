@@ -665,7 +665,7 @@ pub fn absolute_url(ctx: &Ctx<'_>, path: &str) -> String {
     s.push_str("://");
     let host = ctx.req.host(ctx.buf);
     s.push_str(if host.is_empty() { "localhost" } else { host });
-    let port = ctx.local.port();
+    let port = ctx.local.map(|a| a.port()).unwrap_or(0);
     let default = if ctx.scheme == "https" { 443 } else { 80 };
     if port != default {
         s.push(':');
