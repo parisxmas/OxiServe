@@ -455,9 +455,19 @@ mod tests {
         assert_eq!(d.status, 200);
 
         // Nothing is left behind by the atomic write.
-        let leftover = walk(&root).into_iter().filter(|p| {
-            p.to_string_lossy().contains("tmp")
-        }).count();
+        //
+        // Match on the FILE NAME, not the whole path: on Linux the temp
+        // directory is literally /tmp, so a path-wide search matches every
+        // entry and the test accuses itself. macOS hid this because its temp
+        // directory is /var/folders/…/T/.
+        let leftover = walk(&root)
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains(".tmp"))
+            })
+            .count();
         assert_eq!(leftover, 0, "temporary files must be renamed away");
         let _ = std::fs::remove_dir_all(&root);
     }
