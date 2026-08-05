@@ -578,7 +578,15 @@ where
         }
         Body::File { file, offset, len } => {
             sock.write_all(wbuf).await?;
-            stream_file(sock, file, offset, len, server.core.output_buffers.1).await?
+            stream_file(
+                sock,
+                file,
+                offset,
+                len,
+                server.core.output_buffers.1,
+                server.core.sendfile,
+            )
+            .await?
         }
         Body::Stream { pre, io, len } => {
             sock.write_all(wbuf).await?;
@@ -656,6 +664,7 @@ async fn stream_file<S>(
     offset: u64,
     len: u64,
     buf_size: usize,
+    sendfile: bool,
 ) -> io::Result<u64>
 where
     S: AsyncWrite + Unpin + RawStream,
@@ -664,9 +673,12 @@ where
     // socket without it ever entering user space. This is the single biggest
     // advantage nginx had on Linux.
     #[cfg(target_os = "linux")]
-    if let Some(tcp) = sock.as_tcp() {
-        return sendfile_all(tcp, &file, offset, len).await;
+    if sendfile {
+        if let Some(tcp) = sock.as_tcp() {
+            return sendfile_all(tcp, &file, offset, len).await;
+        }
     }
+    let _ = sendfile; // not consulted on platforms without sendfile(2)
 
     let mut sent = 0u64;
     let mut pos = offset;
