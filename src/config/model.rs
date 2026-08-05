@@ -720,6 +720,11 @@ pub struct Upstream {
     pub method: LbMethod,
     /// `keepalive N;` — idle upstream connections to retain per worker.
     pub keepalive: usize,
+    /// Live per-peer health and load, parallel to `servers`. Shared across
+    /// workers so one worker's discovery of a dead backend spares the rest.
+    pub health: Vec<crate::server::upstream::PeerHealth>,
+    /// Reference point for the millisecond timestamps in `health`.
+    pub origin: std::time::Instant,
 }
 
 /// A compiled `map $in $out { ... }`.

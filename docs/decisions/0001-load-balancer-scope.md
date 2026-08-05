@@ -1,6 +1,6 @@
 # ADR 0001 — Load balancer scope: what "HAProxy-like" would require
 
-**Status:** Accepted
+**Status:** Accepted — items 1–3 implemented (v0.2.4), 4–5 outstanding
 **Date:** 2026-08-06
 **Related:** README "Not implemented"; `src/server/proxy.rs`; `src/config/model.rs` (`Upstream`, `LbMethod`).
 
@@ -78,12 +78,35 @@ Items 1–3 are treated as one unit of work because they share the same runtime
 structure (per-peer state hanging off `Upstream`) and splitting them would mean
 building that structure three times.
 
+### Implementation notes (added after 1–3 shipped)
+
+Health is shared across workers via atomics on `Arc<Upstream>`; the connection
+pool is per worker, because a socket belongs to the reactor of the thread that
+opened it. `least_conn` uses an RAII guard so an early return cannot leak the
+in-flight count and slowly poison balancing.
+
+Two decisions worth recording because they were not obvious going in:
+
+- **A pooled connection is probed before reuse** (non-blocking read:
+  `WouldBlock` = alive, `Ok(0)` = peer closed, any bytes = dirty). The first
+  design instead retried on a fresh connection after a failed write, which
+  meant duplicating the whole request/response path and risked charging the
+  peer for our own stale socket. Probing is both simpler and more correct.
+- **A failure on a reused connection is not counted against the peer.** An
+  upstream closing an idle connection is normal; counting it would eject
+  healthy backends under light traffic, which is precisely backwards.
+
+A `5xx` from a live backend is also not counted as a failure. nginx only does
+that under `proxy_next_upstream`, which is not implemented, so a backend
+returning 500 stays in rotation rather than being ejected for doing its job.
+
 ## Consequences
 
-- Until (1) lands, `max_fails` / `fail_timeout` / `least_conn` are recorded as
-  **accepted-but-ignored** rather than supported. `oxiserve -t` should say so,
-  the same way it distinguishes "not implemented yet" from "unknown directive"
-  elsewhere.
+- ~~Until (1) lands, `max_fails` / `fail_timeout` / `least_conn` are recorded
+  as accepted-but-ignored.~~ **Resolved in v0.2.4** — all four directives now
+  have real behaviour, and the `-t` warning for them was removed. The
+  reporting mechanism itself is kept for the next directive that ships as
+  parse-only.
 - Per-worker state means round-robin and `least_conn` balance within a worker,
   not globally. With N workers the distribution is still even in aggregate, but
   `least_conn` is approximate. nginx has the same property; it should be

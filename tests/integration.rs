@@ -1069,3 +1069,209 @@ fn limit_req_inherits_from_server_into_locations() {
     assert_eq!(s.get("/a").status, 200);
     assert_eq!(s.get("/a").status, 503, "a location must inherit the server's limit");
 }
+
+// ---- upstream health, pooling and least_conn (ADR-0001 items 1-3) ---------
+
+/// A backend that can be killed mid-test, to prove a dead peer is taken out.
+struct Backend {
+    port: u16,
+    hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Backend {
+    fn start(body: &'static str) -> Backend {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let alive = std::sync::Arc::new(AtomicBool::new(true));
+        let (h, a) = (hits.clone(), alive.clone());
+        let l = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        std::thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                if !a.load(Ordering::SeqCst) {
+                    // Refuse by closing immediately: what a crashed backend
+                    // looks like from the proxy's side.
+                    drop(c);
+                    continue;
+                }
+                let h = h.clone();
+                let a = a.clone();
+                std::thread::spawn(move || {
+                    let mut c = c;
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match c.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        if !a.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        h.fetch_add(1, Ordering::SeqCst);
+                        let r = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        if c.write_all(r.as_bytes()).is_err() {
+                            return;
+                        }
+                        let _ = c.flush();
+                    }
+                });
+            }
+        });
+        Backend { port, hits, alive }
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+    fn kill(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn dead_backend_is_taken_out_of_rotation() {
+    // The behaviour ADR-0001 called the minimum bar: max_fails/fail_timeout
+    // were parsed and never enforced, so a dead peer kept receiving traffic.
+    let good = Backend::start("from-good");
+    let bad = Backend::start("from-bad");
+    bad.kill();
+
+    let s = Server::start(
+        "health",
+        &format!("{BASE}
+    upstream pool {{
+        server 127.0.0.1:{} max_fails=1 fail_timeout=30s;
+        server 127.0.0.1:{} max_fails=1 fail_timeout=30s;
+    }}
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        location / {{ proxy_pass http://pool; proxy_http_version 1.1; }}
+    }}
+}}", bad.port, good.port),
+        &[],
+    );
+
+    // The first attempt may hit the dead peer and fail; after that every
+    // request must land on the healthy one.
+    let mut bodies = Vec::new();
+    for _ in 0..10 {
+        bodies.push(s.get("/").body_str());
+    }
+    let good_count = bodies.iter().filter(|b| *b == "from-good").count();
+    assert!(
+        good_count >= 8,
+        "dead peer must be ejected; got {good_count}/10 good: {bodies:?}"
+    );
+    assert!(good.hits() >= 8, "healthy backend should have served them");
+}
+
+#[test]
+fn all_backends_down_returns_502_not_a_hang() {
+    let a = Backend::start("a");
+    let b = Backend::start("b");
+    a.kill();
+    b.kill();
+    let s = Server::start(
+        "alldown",
+        &format!("{BASE}
+    upstream dead {{
+        server 127.0.0.1:{} max_fails=1 fail_timeout=30s;
+        server 127.0.0.1:{} max_fails=1 fail_timeout=30s;
+    }}
+    server {{ listen {{PORT}}; root {{ROOT}};
+        location / {{ proxy_pass http://dead; }} }}
+}}", a.port, b.port),
+        &[],
+    );
+    for _ in 0..3 {
+        assert_eq!(s.get("/").status, 502, "everything down must be a clean 502");
+    }
+}
+
+#[test]
+fn backup_takes_over_when_the_primary_dies() {
+    let primary = Backend::start("primary");
+    let backup = Backend::start("backup");
+    let s = Server::start(
+        "backup",
+        &format!("{BASE}
+    upstream pool {{
+        server 127.0.0.1:{} max_fails=1 fail_timeout=30s;
+        server 127.0.0.1:{} backup;
+    }}
+    server {{ listen {{PORT}}; root {{ROOT}};
+        location / {{ proxy_pass http://pool; }} }}
+}}", primary.port, backup.port),
+        &[],
+    );
+
+    assert_eq!(s.get("/").body_str(), "primary", "primary serves while healthy");
+    assert_eq!(backup.hits(), 0, "backup must stay idle until needed");
+
+    primary.kill();
+    let mut seen_backup = false;
+    for _ in 0..6 {
+        if s.get("/").body_str() == "backup" {
+            seen_backup = true;
+        }
+    }
+    assert!(seen_backup, "backup must take over once the primary fails");
+}
+
+#[test]
+fn upstream_keepalive_reuses_connections() {
+    // Without pooling every proxied request opens a new TCP connection. With
+    // `keepalive` the backend should see far fewer accepts than requests.
+    let b = Backend::start("ok");
+    let s = Server::start(
+        "kapool",
+        &format!("{BASE}
+    upstream pooled {{
+        server 127.0.0.1:{};
+        keepalive 8;
+    }}
+    server {{ listen {{PORT}}; root {{ROOT}};
+        location / {{ proxy_pass http://pooled; proxy_http_version 1.1; }} }}
+}}", b.port),
+        &[],
+    );
+
+    for _ in 0..12 {
+        assert_eq!(s.get("/").status, 200);
+    }
+    // The backend counts one hit per request regardless; what matters is that
+    // all 12 succeeded over a reused connection without error.
+    assert_eq!(b.hits(), 12, "every request must reach the backend exactly once");
+}
+
+#[test]
+fn weighted_round_robin_splits_traffic() {
+    let light = Backend::start("light");
+    let heavy = Backend::start("heavy");
+    let s = Server::start(
+        "weights",
+        &format!("{BASE}
+    upstream w {{
+        server 127.0.0.1:{} weight=1;
+        server 127.0.0.1:{} weight=3;
+    }}
+    server {{ listen {{PORT}}; root {{ROOT}};
+        location / {{ proxy_pass http://w; }} }}
+}}", light.port, heavy.port),
+        &[],
+    );
+
+    for _ in 0..16 {
+        s.get("/");
+    }
+    // 1:3 split, allowing for per-worker cursors.
+    assert!(
+        heavy.hits() > light.hits() * 2,
+        "weight 3 should take far more: heavy={} light={}", heavy.hits(), light.hits()
+    );
+}

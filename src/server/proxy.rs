@@ -18,6 +18,7 @@ use super::transport::Stream;
 use super::ctx::Ctx;
 use super::reply::{Body, Reply};
 use crate::config::model::{LbMethod, Location, ProxyPass, ProxyTarget, Upstream};
+use super::upstream::{self as up_state, InFlightGuard};
 use crate::http::response::{Framing, Resp};
 
 /// Headers that describe *this* hop and must never be forwarded.
@@ -41,6 +42,9 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
     let conf = &loc.core.proxy;
     let started = Instant::now();
 
+    // When the target is an upstream we keep hold of the chosen peer, so the
+    // outcome of this request can be fed back into its health state.
+    let mut chosen: Option<(&Arc<Upstream>, usize)> = None;
     let (addr_str, tls) = match &pp.target {
         ProxyTarget::Addr { host, port } => (format!("{host}:{port}"), pp.tls),
         ProxyTarget::Unix(path) => (format!("unix:{path}"), false),
@@ -63,7 +67,10 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
         }
         ProxyTarget::Upstream(name) => {
             let up = ctx.http.upstreams.get(&**name).ok_or(502u16)?;
-            (pick(ctx, up)?, pp.tls)
+            let idx = select_peer(ctx, up)?;
+            let addr = peer_addr(&up.servers[idx].addr);
+            chosen = Some((up, idx));
+            (addr, pp.tls)
         }
     };
 
@@ -75,11 +82,25 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
 
     ctx.upstream_addr = addr_str.clone();
 
-    let connect_to = Duration::from_secs(60).min(conf.connect_timeout.unwrap_or(Duration::from_secs(60)));
-    let mut up = match tokio::time::timeout(connect_to, Stream::connect(&addr_str)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(_)) => return Err(502),
-        Err(_) => return Err(504),
+    // Counted for the whole life of the request, released even on an early
+    // return — this is the number `least_conn` balances on.
+    let _in_flight = chosen.map(|(u, i)| InFlightGuard::enter(&u.health[i]));
+
+    let keepalive = chosen.map(|(u, _)| u.keepalive).unwrap_or(0);
+    let connect_to = conf.connect_timeout.unwrap_or(Duration::from_secs(60));
+
+    // A pooled connection skips the handshake entirely.
+    let (mut up, reused) = match up_state::take(&addr_str) {
+        Some(s) => (s, true),
+        None => match tokio::time::timeout(connect_to, Stream::connect(&addr_str)).await {
+            Ok(Ok(s)) => (s, false),
+            Ok(Err(_)) | Err(_) => {
+                // A refused or timed-out connection is exactly what passive
+                // health tracking exists to notice.
+                note_failure(chosen, ctx);
+                return Err(502);
+            }
+        },
     };
 
     // ---- request head -----------------------------------------------------
@@ -141,9 +162,22 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
         crate::http::response::push_num(&mut head, ctx.body.len() as u64);
         head.push_str("\r\n");
     }
-    head.push_str("Connection: close\r\n\r\n");
+    // With a pool we must ask the upstream to keep the connection, and that
+    // only works on HTTP/1.1.
+    let want_keepalive = keepalive > 0 && conf.http_version_11;
+    if want_keepalive {
+        head.push_str("Connection: keep-alive\r\n\r\n");
+    } else {
+        head.push_str("Connection: close\r\n\r\n");
+    }
 
     if up.write_all(head.as_bytes()).await.is_err() {
+        // Only counted against the peer when we opened the connection
+        // ourselves; a reused one that died is our bookkeeping, not their
+        // fault. `take` probes for liveness, so this is already rare.
+        if !reused {
+            note_failure(chosen, ctx);
+        }
         return Err(502);
     }
 
@@ -151,6 +185,7 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
     // The connection layer has already read and de-chunked the whole body, so
     // it forwards as a plain Content-Length regardless of how it arrived.
     if !ctx.body.is_empty() && up.write_all(ctx.body).await.is_err() {
+        note_failure(chosen, ctx);
         return Err(502);
     }
     let _ = up.flush().await;
@@ -163,14 +198,30 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut upstream_chunked = false;
     let mut upstream_len: Option<u64> = None;
+    let mut upstream_said_close = false;
 
     loop {
         let mut chunk = [0u8; 8192];
         let n = match tokio::time::timeout(read_to, up.read(&mut chunk)).await {
-            Ok(Ok(0)) => return Err(502),
+            Ok(Ok(0)) => {
+                // EOF before a response. On a reused connection that is the
+                // peer having closed it while idle, not a fault of theirs.
+                if !(reused && buf.is_empty()) {
+                    note_failure(chosen, ctx);
+                }
+                return Err(502);
+            }
             Ok(Ok(n)) => n,
-            Ok(Err(_)) => return Err(502),
-            Err(_) => return Err(504),
+            Ok(Err(_)) => {
+                if !(reused && buf.is_empty()) {
+                    note_failure(chosen, ctx);
+                }
+                return Err(502);
+            }
+            Err(_) => {
+                note_failure(chosen, ctx);
+                return Err(504);
+            }
         };
         buf.extend_from_slice(&chunk[..n]);
 
@@ -195,6 +246,10 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
                         upstream_len = value.trim().parse().ok();
                         continue;
                     }
+                    if lower == "connection" {
+                        upstream_said_close = value.eq_ignore_ascii_case("close");
+                        continue;
+                    }
                     if HOP_BY_HOP.contains(&lower.as_str()) {
                         continue;
                     }
@@ -207,15 +262,26 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
             }
             Ok(httparse::Status::Partial) => {
                 if buf.len() > 64 * 1024 {
+                    note_failure(chosen, ctx);
                     return Err(502);
                 }
             }
-            Err(_) => return Err(502),
+            Err(_) => {
+                note_failure(chosen, ctx);
+                return Err(502);
+            }
         }
     }
 
     if status == 0 {
         status = 502;
+    }
+    // A complete response head is proof the peer is serving; clear its
+    // failure count. nginx treats 5xx as a failure only with
+    // proxy_next_upstream, which we do not implement, so a 500 from a live
+    // backend is not held against it.
+    if let Some((u, i)) = chosen {
+        u.health[i].record_success();
     }
     ctx.upstream_status = status;
     ctx.upstream_time = started.elapsed().as_secs_f64();
@@ -241,6 +307,12 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
         resp.framing = Framing::Length(n);
         let remaining = n.saturating_sub(pre.len() as u64);
         if remaining == 0 {
+            // The entire body already arrived with the head, so the connection
+            // is at a clean boundary and can be reused. Only ever pooled here:
+            // returning one mid-body would corrupt whoever picked it up next.
+            if want_keepalive && !upstream_said_close {
+                up_state::put(&addr_str, up, keepalive);
+            }
             Ok(Reply::new(resp, Body::Bytes(pre)))
         } else {
             Ok(Reply::new(
@@ -298,61 +370,6 @@ fn host_of(addr: &str) -> &str {
     }
 }
 
-/// Chooses an upstream server according to the configured method.
-///
-/// Shared with the FastCGI handler: `fastcgi_pass backend;` load-balances over
-/// an `upstream` block exactly as `proxy_pass` does.
-pub fn pick_upstream(ctx: &Ctx<'_>, up: &Arc<Upstream>) -> Result<String, u16> {
-    pick(ctx, up)
-}
-
-fn pick(ctx: &Ctx<'_>, up: &Arc<Upstream>) -> Result<String, u16> {
-    let live: Vec<&crate::config::model::UpstreamServer> =
-        up.servers.iter().filter(|s| !s.down && !s.backup).collect();
-    let pool = if live.is_empty() {
-        // Everything primary is down: fall back to the backup set.
-        up.servers.iter().filter(|s| !s.down).collect::<Vec<_>>()
-    } else {
-        live
-    };
-    if pool.is_empty() {
-        return Err(502);
-    }
-
-    let idx = match up.method {
-        LbMethod::IpHash => {
-            let mut h: u64 = 0;
-            for b in addr_bytes(&ctx.remote) {
-                h = h.wrapping_mul(31).wrapping_add(b as u64);
-            }
-            (h % pool.len() as u64) as usize
-        }
-        LbMethod::Random => {
-            // Cheap per-connection jitter; no RNG dependency needed.
-            (ctx.conn_id as usize).wrapping_add(ctx.conn_requests as usize) % pool.len()
-        }
-        // LeastConn needs live connection counts we do not track yet; round
-        // robin is the honest fallback rather than a wrong approximation.
-        LbMethod::RoundRobin | LbMethod::LeastConn => {
-            let key = Arc::as_ptr(up) as usize;
-            RR.with(|rr| {
-                let mut m = rr.borrow_mut();
-                let c = m.entry(key).or_insert(0);
-                let i = *c;
-                *c = c.wrapping_add(1);
-                i % pool.len()
-            })
-        }
-    };
-
-    let s = pool[idx];
-    let addr = s.addr.to_string();
-    Ok(if addr.contains(':') {
-        addr
-    } else {
-        format!("{addr}:80")
-    })
-}
 
 fn addr_bytes(a: &Option<SocketAddr>) -> Vec<u8> {
     match a {
@@ -376,4 +393,53 @@ mod tests {
         assert!(HOP_BY_HOP.contains(&"transfer-encoding"));
         assert!(HOP_BY_HOP.contains(&"upgrade"));
     }
+}
+
+/// Records a failed attempt against the chosen peer, if the target was an
+/// upstream. A literal `proxy_pass` address has no health state to update.
+fn note_failure(chosen: Option<(&Arc<Upstream>, usize)>, _ctx: &Ctx<'_>) {
+    if let Some((up, i)) = chosen {
+        let now_ms = Instant::now()
+            .saturating_duration_since(up.origin)
+            .as_millis() as u64;
+        let s = &up.servers[i];
+        up.health[i].record_failure(
+            now_ms,
+            s.max_fails,
+            s.fail_timeout.as_millis() as u64,
+        );
+    }
+}
+
+
+/// Peer address in the form `Stream::connect` understands.
+pub fn peer_addr(addr: &str) -> String {
+    if addr.starts_with("unix:") || addr.contains(':') {
+        addr.to_string()
+    } else {
+        format!("{addr}:80")
+    }
+}
+
+/// Chooses a peer via the shared health/load state.
+pub fn select_peer(ctx: &Ctx<'_>, up: &Arc<Upstream>) -> Result<usize, u16> {
+    let hash = match up.method {
+        LbMethod::IpHash => {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in addr_bytes(&ctx.remote) {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            Some(h)
+        }
+        _ => None,
+    };
+    let cursor = RR.with(|rr| {
+        let mut m = rr.borrow_mut();
+        let c = m.entry(Arc::as_ptr(up) as usize).or_insert(0);
+        let i = *c;
+        *c = c.wrapping_add(1);
+        i
+    });
+    up_state::select(up, Instant::now(), hash, cursor).ok_or(502)
 }

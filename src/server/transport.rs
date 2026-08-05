@@ -43,6 +43,24 @@ impl Stream {
     }
 }
 
+impl Stream {
+    /// True when the socket looks usable for a new request.
+    ///
+    /// A pooled connection may have been closed by the peer while it sat idle.
+    /// A non-blocking read distinguishes the three cases: `WouldBlock` means
+    /// alive with nothing pending (what we want), `Ok(0)` means the peer
+    /// closed, and any actual bytes mean leftover data from a previous
+    /// exchange — a connection we must not reuse either way.
+    pub fn is_reusable(&self) -> bool {
+        let mut probe = [0u8; 1];
+        let r = match self {
+            Stream::Tcp(s) => s.try_read(&mut probe),
+            Stream::Unix(s) => s.try_read(&mut probe),
+        };
+        matches!(&r, Err(e) if e.kind() == io::ErrorKind::WouldBlock)
+    }
+}
+
 impl AsyncRead for Stream {
     fn poll_read(
         self: Pin<&mut Self>,

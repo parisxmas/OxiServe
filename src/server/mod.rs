@@ -23,6 +23,7 @@ pub mod log;
 pub mod proxy;
 pub mod reply;
 pub mod transport;
+pub mod upstream;
 
 use std::cell::RefCell;
 use std::io;

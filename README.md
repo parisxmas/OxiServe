@@ -89,11 +89,15 @@ block, `fastcgi_param` with `if_not_empty`, `fastcgi_index`,
 `upstream` blocks with `weight` / `backup` / `down`, round-robin and `ip_hash`,
 `proxy_set_header`, `proxy_hide_header`, timeouts, chunked pass-through.
 
-> **Not a load balancer yet.** `max_fails` / `fail_timeout` / `least_conn` /
-> `keepalive` are parsed and have **no effect** — a dead backend keeps
-> receiving traffic, and `least_conn` silently balances round-robin.
-> `oxiserve -t` reports each of these explicitly. Scope and the order the gaps
-> get closed: [ADR-0001](docs/decisions/0001-load-balancer-scope.md).
+**Load balancing** — passive health checks (`max_fails` / `fail_timeout`, with
+ejection and automatic recovery), `backup` failover, weighted round-robin, real
+`least_conn` (in-flight counts, weight-aware), `ip_hash`, and an upstream
+`keepalive` pool that probes a connection for liveness before reusing it.
+Health is shared across workers; the pool is per worker.
+
+> **Still missing for a true HAProxy replacement:** active health checks,
+> `stream` (L4 TCP/UDP), cookie-based sticky sessions, a stats endpoint.
+> Scope and order: [ADR-0001](docs/decisions/0001-load-balancer-scope.md).
 
 **TLS** — rustls, `ssl_certificate` / `ssl_certificate_key`, SNI across servers
 sharing a listener.

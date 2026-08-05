@@ -43,8 +43,11 @@ pub async fn fastcgi(
         // Kept in nginx's own `unix:` form; `Stream::connect` dispatches on it.
         ProxyTarget::Unix(path) => format!("unix:{path}"),
         ProxyTarget::Upstream(name) => {
+            // FastCGI upstreams get the same health-aware selection as HTTP
+            // ones; a dead php-fpm peer is skipped exactly the same way.
             let up = ctx.http.upstreams.get(&**name).ok_or(502u16)?;
-            super::proxy::pick_upstream(ctx, up)?
+            let idx = super::proxy::select_peer(ctx, up)?;
+            super::proxy::peer_addr(&up.servers[idx].addr)
         }
         ProxyTarget::Dynamic(t) => {
             let a = t.render(&*ctx);
