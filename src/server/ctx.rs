@@ -181,6 +181,9 @@ impl<'a> Ctx<'a> {
             Var::ServerPort => push_num(out, self.local.map(|a| a.port()).unwrap_or(0) as u64),
             Var::ServerAddr => push_addr(out, &self.local),
             Var::RemoteAddr => push_addr(out, &self.remote),
+            // Used only as a hash key, so the text form identifies the same
+            // client just as well and stays debuggable in logs.
+            Var::BinaryRemoteAddr => push_addr(out, &self.remote),
             Var::RemotePort => push_num(out, self.remote.map(|a| a.port()).unwrap_or(0) as u64),
             Var::RemoteUser => {
                 // Only the userinfo half of Basic auth, un-decoded users get "".

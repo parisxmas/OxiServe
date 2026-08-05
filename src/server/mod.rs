@@ -18,6 +18,7 @@ pub mod fcache;
 pub mod fcgi_proto;
 pub mod files;
 pub mod handler;
+pub mod limit_req;
 pub mod log;
 pub mod proxy;
 pub mod reply;

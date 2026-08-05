@@ -27,6 +27,9 @@ pub enum Var {
     ServerPort,
     ServerAddr,
     RemoteAddr,
+    /// `$binary_remote_addr` — nginx's compact address form, the conventional
+    /// `limit_req_zone` key because it is shorter than the text one.
+    BinaryRemoteAddr,
     RemotePort,
     RemoteUser,
     Status,
@@ -107,6 +110,7 @@ impl Var {
             "server_port" => Var::ServerPort,
             "server_addr" => Var::ServerAddr,
             "remote_addr" => Var::RemoteAddr,
+            "binary_remote_addr" => Var::BinaryRemoteAddr,
             "remote_port" => Var::RemotePort,
             "remote_user" => Var::RemoteUser,
             "status" => Var::Status,

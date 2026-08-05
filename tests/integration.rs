@@ -877,3 +877,154 @@ fn gzip_compresses_files_too_large_for_the_inline_path() {
     let plain = s.get("/big.css");
     assert_eq!(plain.body.len(), big.len());
 }
+
+// ---- limit_req ------------------------------------------------------------
+
+#[test]
+fn limit_req_rejects_over_the_rate() {
+    // 1r/s, no burst: the first request passes, the rest of the flood is 503.
+    let s = Server::start(
+        "limitreq",
+        &format!("{BASE}
+    limit_req_zone $binary_remote_addr zone=one:1m rate=1r/s;
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        location / {{ limit_req zone=one; return 200 \"ok\"; }}
+    }}
+}}"),
+        &[],
+    );
+
+    assert_eq!(s.get("/").status, 200, "first request must pass");
+    let rejected = (0..5).filter(|_| s.get("/").status == 503).count();
+    assert_eq!(rejected, 5, "every request over the rate must be rejected");
+}
+
+#[test]
+fn limit_req_burst_admits_a_spike() {
+    let s = Server::start(
+        "limitburst",
+        &format!("{BASE}
+    limit_req_zone $binary_remote_addr zone=b:1m rate=1r/s;
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        location / {{ limit_req zone=b burst=3 nodelay; return 200 \"ok\"; }}
+    }}
+}}"),
+        &[],
+    );
+
+    // 1 on-rate + 3 burst = 4 admitted, then rejection.
+    let codes: Vec<u16> = (0..6).map(|_| s.get("/").status).collect();
+    assert_eq!(&codes[..4], &[200, 200, 200, 200], "burst must be admitted: {codes:?}");
+    assert_eq!(&codes[4..], &[503, 503], "past the burst must reject: {codes:?}");
+}
+
+#[test]
+fn limit_req_status_is_configurable() {
+    let s = Server::start(
+        "limitstatus",
+        &format!("{BASE}
+    limit_req_zone $binary_remote_addr zone=st:1m rate=1r/s;
+    limit_req_status 429;
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        location / {{ limit_req zone=st; return 200 \"ok\"; }}
+    }}
+}}"),
+        &[],
+    );
+    assert_eq!(s.get("/").status, 200);
+    assert_eq!(s.get("/").status, 429, "limit_req_status must be honoured");
+}
+
+#[test]
+fn limit_req_only_applies_where_configured() {
+    let s = Server::start(
+        "limitscope",
+        &format!("{BASE}
+    limit_req_zone $binary_remote_addr zone=sc:1m rate=1r/s;
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        location /limited {{ limit_req zone=sc; return 200 \"limited\"; }}
+        location /open    {{ return 200 \"open\"; }}
+    }}
+}}"),
+        &[],
+    );
+
+    assert_eq!(s.get("/limited").status, 200);
+    assert_eq!(s.get("/limited").status, 503);
+    // An unlimited location keeps serving regardless.
+    for _ in 0..5 {
+        assert_eq!(s.get("/open").status, 200, "unlimited location must not be throttled");
+    }
+}
+
+#[test]
+fn limit_req_recovers_after_the_window() {
+    let s = Server::start(
+        "limitrecover",
+        &format!("{BASE}
+    limit_req_zone $binary_remote_addr zone=rc:1m rate=5r/s;
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        location / {{ limit_req zone=rc; return 200 \"ok\"; }}
+    }}
+}}"),
+        &[],
+    );
+
+    assert_eq!(s.get("/").status, 200);
+    assert_eq!(s.get("/").status, 503, "immediate repeat is over 5r/s");
+    // 5r/s means one request per 200ms; after that the bucket has drained.
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(s.get("/").status, 200, "must recover once the bucket drains");
+}
+
+#[test]
+fn limit_req_burst_without_nodelay_delays_rather_than_rejecting() {
+    let s = Server::start(
+        "limitdelay",
+        &format!("{BASE}
+    limit_req_zone $binary_remote_addr zone=dl:1m rate=10r/s;
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        location / {{ limit_req zone=dl burst=2; return 200 \"ok\"; }}
+    }}
+}}"),
+        &[],
+    );
+
+    assert_eq!(s.get("/").status, 200);
+    // The next one is inside the burst, so it is held rather than refused —
+    // at 10r/s that is ~100ms, not an error.
+    let t = Instant::now();
+    let r = s.get("/");
+    let waited = t.elapsed();
+    assert_eq!(r.status, 200, "a burst request must be delayed, not rejected");
+    assert!(
+        waited >= Duration::from_millis(50),
+        "expected the request to be held back, waited only {waited:?}"
+    );
+}
+
+#[test]
+fn unknown_limit_req_zone_is_a_config_error() {
+    let dir = std::env::temp_dir().join(format!("oxiserve-badzone-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("bad.conf");
+    std::fs::write(
+        &f,
+        "events {} http { server { listen 80; location / { limit_req zone=nope; } } }",
+    )
+    .unwrap();
+    let err = oxiserve::config::load(&f, dir).unwrap_err().to_string();
+    assert!(err.contains("unknown limit_req zone"), "got: {err}");
+}

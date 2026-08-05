@@ -147,6 +147,31 @@ impl Default for OpenFileCache {
     }
 }
 
+/// A `limit_req_zone` declaration, before its runtime state exists.
+#[derive(Debug, Clone)]
+pub struct LimitReqZoneDef {
+    pub name: Box<str>,
+    /// The key to rate-limit on, e.g. `$binary_remote_addr`.
+    pub key: Arc<Template>,
+    /// Requests per second, scaled by 1000 so `30r/m` stays exact.
+    pub rate: u64,
+    /// Derived from `zone=name:SIZE` the way nginx does: 64 bytes per entry.
+    pub max_entries: usize,
+}
+
+/// One `limit_req` applied at a level. Several may apply to one request; nginx
+/// evaluates them all and the most restrictive outcome wins.
+#[derive(Debug, Clone)]
+pub struct LimitReq {
+    pub zone: Box<str>,
+    /// Burst allowance, scaled by 1000.
+    pub burst: u64,
+    /// `nodelay` — admit the whole burst immediately.
+    pub nodelay: bool,
+    /// `delay=N` — admit N of the burst immediately, delay the rest.
+    pub delay_after: u64,
+}
+
 /// Directives that inherit down `http` → `server` → `location`.
 ///
 /// Every field is resolved (no `Option`) by the time a request sees it; the
@@ -191,6 +216,9 @@ pub struct CoreConf {
     pub internal: bool,
     pub open_file_cache: OpenFileCache,
     pub fastcgi: Arc<FastCgiConf>,
+    pub limit_reqs: Arc<Vec<LimitReq>>,
+    /// `limit_req_status` — the status returned when a limit rejects.
+    pub limit_req_status: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -742,6 +770,9 @@ impl MimeTypes {
 
 #[derive(Debug)]
 pub struct Http {
+    pub limit_req_zones: HashMap<Box<str>, Arc<crate::server::limit_req::Zone>>,
+    /// Each zone's key template, kept beside it so a location only names a zone.
+    pub limit_req_keys: HashMap<Box<str>, Arc<Template>>,
     pub listeners: Vec<Arc<Listener>>,
     pub upstreams: HashMap<Box<str>, Arc<Upstream>>,
     pub maps: Vec<Arc<MapConf>>,

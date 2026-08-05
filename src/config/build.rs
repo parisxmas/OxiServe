@@ -228,6 +228,8 @@ pub fn default_core() -> CoreConf {
         internal: false,
         open_file_cache: OpenFileCache::default(),
         fastcgi: Arc::new(FastCgiConf::default()),
+        limit_reqs: Arc::new(Vec::new()),
+        limit_req_status: 503,
     }
 }
 
@@ -286,6 +288,8 @@ struct CoreLayer {
     fcgi_send_timeout: Option<Duration>,
     fcgi_keep_conn: Option<bool>,
     fcgi_hide_headers: Option<Vec<Box<str>>>,
+    limit_reqs: Option<Vec<LimitReq>>,
+    limit_req_status: Option<u16>,
     ofc_min_uses: Option<u32>,
     ofc_errors: Option<bool>,
     // proxy_* are accumulated rather than replaced, matching nginx's
@@ -373,6 +377,15 @@ impl CoreLayer {
         }
         if let Some(v) = self.ofc_errors {
             c.open_file_cache.errors = v;
+        }
+
+        // `limit_req` follows the list rule: a level that declares any replaces
+        // the inherited set, exactly as nginx does.
+        if let Some(v) = &self.limit_reqs {
+            c.limit_reqs = Arc::new(v.clone());
+        }
+        if let Some(v) = self.limit_req_status {
+            c.limit_req_status = v;
         }
 
         if self.fcgi_params.is_some()
@@ -501,7 +514,7 @@ pub struct Builder {
 const KNOWN_UNIMPLEMENTED: &[&str] = &[
     "uwsgi_pass", "scgi_pass", "grpc_pass", "memcached_pass",
     "auth_basic", "auth_basic_user_file", "auth_request",
-    "limit_req", "limit_req_zone", "limit_conn", "limit_conn_zone",
+    "limit_conn", "limit_conn_zone",
     "ssi", "sub_filter", "sub_filter_types", "addition_before_body",
     "dav_methods", "mp4", "flv", "xslt_stylesheet", "image_filter",
     "stub_status", "perl", "js_content",
@@ -643,6 +656,7 @@ impl Builder {
         crate::mime::load_defaults(&mut mime);
 
         let mut upstreams: HashMap<Box<str>, Arc<Upstream>> = HashMap::new();
+        let mut zone_defs: Vec<LimitReqZoneDef> = Vec::new();
         let mut maps = Vec::new();
         let mut level = Level::default();
         let mut server_dirs = Vec::new();
@@ -673,6 +687,10 @@ impl Builder {
                             mime.insert(ext, &t.name);
                         }
                     }
+                }
+                "limit_req_zone" => {
+                    want_args_range(c, 3, 4)?;
+                    zone_defs.push(parse_limit_req_zone(c)?);
                 }
                 "upstream" => {
                     want_args(c, 1)?;
@@ -716,7 +734,29 @@ impl Builder {
 
         let listeners = self.listeners(&servers)?;
 
+        // Materialise each zone's shared state once, at load time.
+        let mut limit_req_zones: HashMap<Box<str>, Arc<crate::server::limit_req::Zone>> =
+            HashMap::new();
+        let mut limit_req_keys: HashMap<Box<str>, Arc<Template>> = HashMap::new();
+        for z in &zone_defs {
+            limit_req_zones.insert(
+                z.name.clone(),
+                Arc::new(crate::server::limit_req::Zone::new(&z.name, z.rate, z.max_entries)),
+            );
+            limit_req_keys.insert(z.name.clone(), z.key.clone());
+        }
+        // A `limit_req` naming a zone that was never declared is a config
+        // error, not a silently disabled limit.
+        for s in &servers {
+            check_zones_exist(&s.core, &limit_req_zones)?;
+            for l in s.locations.prefix.iter().chain(&s.locations.regex).chain(&s.locations.exact) {
+                check_zones_exist(&l.core, &limit_req_zones)?;
+            }
+        }
+
         Ok(Http {
+            limit_req_zones,
+            limit_req_keys,
             listeners,
             upstreams,
             maps,
@@ -1280,6 +1320,51 @@ impl Builder {
             | "fastcgi_intercept_errors" | "fastcgi_request_buffering"
             | "fastcgi_temp_file_write_size" | "fastcgi_max_temp_file_size"
             | "fastcgi_ignore_headers" | "fastcgi_pass_header" => {}
+            "limit_req" => {
+                want_args_range(d, 1, 4)?;
+                let mut lr = LimitReq {
+                    zone: "".into(),
+                    burst: 0,
+                    nodelay: false,
+                    delay_after: 0,
+                };
+                for a in &d.args {
+                    if let Some(v) = a.strip_prefix("zone=") {
+                        lr.zone = v.into();
+                    } else if let Some(v) = a.strip_prefix("burst=") {
+                        let n: u64 = v.parse().map_err(|_| BuildError {
+                            msg: format!("invalid \"burst\" value \"{v}\" in \"limit_req\""),
+                            loc: d.loc(),
+                        })?;
+                        lr.burst = n * crate::server::limit_req::SCALE;
+                    } else if a == "nodelay" {
+                        lr.nodelay = true;
+                    } else if let Some(v) = a.strip_prefix("delay=") {
+                        let n: u64 = v.parse().map_err(|_| BuildError {
+                            msg: format!("invalid \"delay\" value \"{v}\" in \"limit_req\""),
+                            loc: d.loc(),
+                        })?;
+                        lr.delay_after = n * crate::server::limit_req::SCALE;
+                    } else {
+                        bail!(d, "invalid parameter \"{a}\" in \"limit_req\"");
+                    }
+                }
+                if lr.zone.is_empty() {
+                    bail!(d, "\"limit_req\" requires a \"zone=\" parameter");
+                }
+                if lr.nodelay && lr.delay_after > 0 {
+                    bail!(d, "\"nodelay\" and \"delay=\" are mutually exclusive in \"limit_req\"");
+                }
+                lv.core.limit_reqs.get_or_insert_with(Vec::new).push(lr);
+            }
+            "limit_req_status" => {
+                want_args(d, 1)?;
+                c.limit_req_status = d.args[0].parse().ok().filter(|s| (400..600).contains(s));
+                if c.limit_req_status.is_none() {
+                    bail!(d, "invalid status \"{}\" in \"limit_req_status\"", d.args[0]);
+                }
+            }
+            "limit_req_log_level" => {}
             "open_file_cache" => {
                 want_args_range(d, 1, 3)?;
                 if d.args[0] == "off" {
@@ -1762,6 +1847,71 @@ fn parse_listen_addr(s: &str) -> Option<SocketAddr> {
     std::net::ToSocketAddrs::to_socket_addrs(&(h, port)).ok()?.next()
 }
 
+fn check_zones_exist(
+    core: &CoreConf,
+    zones: &HashMap<Box<str>, Arc<crate::server::limit_req::Zone>>,
+) -> R<()> {
+    for l in core.limit_reqs.iter() {
+        if !zones.contains_key(&l.zone) {
+            return Err(BuildError {
+                msg: format!("unknown limit_req zone \"{}\"", l.zone),
+                loc: "limit_req".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// `limit_req_zone $key zone=name:10m rate=5r/s;`
+fn parse_limit_req_zone(d: &Directive) -> R<LimitReqZoneDef> {
+    let key = Arc::new(Template::compile(&d.args[0]));
+    let mut name: Box<str> = "".into();
+    let mut max_entries = 0usize;
+    let mut rate = 0u64;
+
+    for a in &d.args[1..] {
+        if let Some(v) = a.strip_prefix("zone=") {
+            let (n, size) = v.split_once(':').ok_or_else(|| BuildError {
+                msg: format!("invalid \"zone=\" value \"{v}\", expected name:size"),
+                loc: d.loc(),
+            })?;
+            name = n.into();
+            let bytes = parse_size(size).ok_or_else(|| BuildError {
+                msg: format!("invalid zone size \"{size}\""),
+                loc: d.loc(),
+            })?;
+            // nginx budgets roughly 64 bytes per tracked key.
+            max_entries = (bytes / 64) as usize;
+        } else if let Some(v) = a.strip_prefix("rate=") {
+            rate = parse_rate(v).ok_or_else(|| BuildError {
+                msg: format!("invalid rate \"{v}\", expected e.g. 5r/s or 30r/m"),
+                loc: d.loc(),
+            })?;
+        } else {
+            bail!(d, "invalid parameter \"{a}\" in \"limit_req_zone\"");
+        }
+    }
+    if name.is_empty() {
+        bail!(d, "\"limit_req_zone\" requires a \"zone=\" parameter");
+    }
+    if rate == 0 {
+        bail!(d, "\"limit_req_zone\" requires a non-zero \"rate=\" parameter");
+    }
+    Ok(LimitReqZoneDef { name, key, rate, max_entries: max_entries.max(1) })
+}
+
+/// `5r/s` or `30r/m`, returned scaled by 1000 so fractions stay exact.
+pub fn parse_rate(s: &str) -> Option<u64> {
+    let (n, unit) = s.split_once("r/")?;
+    let n: u64 = n.parse().ok()?;
+    match unit {
+        "s" => Some(n * crate::server::limit_req::SCALE),
+        // 30r/m is half a request per second: 500 scaled.
+        "m" => Some(n * crate::server::limit_req::SCALE / 60),
+        _ => None,
+    }
+}
+
 pub const COMBINED_FORMAT: &str = concat!(
     r#"$remote_addr - $remote_user [$time_local] "$request" "#,
     r#"$status $body_bytes_sent "$http_referer" "$http_user_agent""#
@@ -1959,9 +2109,9 @@ mod tests {
 
     #[test]
     fn known_unimplemented_gets_a_clearer_message() {
-        let c = build(&format!("{MIN} location / {{ limit_req zone=one; }} }} }}")).unwrap();
+        let c = build(&format!("{MIN} location / {{ limit_conn addr 10; }} }} }}")).unwrap();
         assert!(
-            c.unsupported.iter().any(|u| u.contains("not implemented yet") && u.contains("limit_req")),
+            c.unsupported.iter().any(|u| u.contains("not implemented yet") && u.contains("limit_conn")),
             "{:?}",
             c.unsupported
         );
@@ -2049,6 +2199,54 @@ mod tests {
         let e = build("events {} http { open_file_cache inactive=20s; server { listen 80; } }")
             .unwrap_err();
         assert!(e.msg.contains("max"), "{}", e.msg);
+    }
+
+    #[test]
+    fn limit_req_zone_and_rates_parse() {
+        let c = build(
+            "events {} http { limit_req_zone $binary_remote_addr zone=api:10m rate=5r/s; \
+             limit_req_status 429; \
+             server { listen 80; location / { limit_req zone=api burst=20 nodelay; } } }",
+        )
+        .unwrap();
+        let http = c.http.unwrap();
+        let z = http.limit_req_zones.get("api").expect("zone registered");
+        assert_eq!(z.rate, 5 * crate::server::limit_req::SCALE);
+        // 10m / 64 bytes per entry, as nginx budgets it.
+        assert_eq!(z.max_entries, 10 * 1024 * 1024 / 64);
+        let loc = &http.servers[0].locations.prefix[0];
+        assert_eq!(loc.core.limit_reqs.len(), 1);
+        assert_eq!(loc.core.limit_reqs[0].burst, 20 * crate::server::limit_req::SCALE);
+        assert!(loc.core.limit_reqs[0].nodelay);
+        assert_eq!(loc.core.limit_req_status, 429);
+        assert!(c.unsupported.is_empty(), "{:?}", c.unsupported);
+    }
+
+    #[test]
+    fn rate_syntax() {
+        assert_eq!(parse_rate("1r/s"), Some(1000));
+        assert_eq!(parse_rate("5r/s"), Some(5000));
+        // 30 per minute is half a request per second.
+        assert_eq!(parse_rate("30r/m"), Some(500));
+        assert_eq!(parse_rate("60r/m"), Some(1000));
+        assert_eq!(parse_rate("5"), None);
+        assert_eq!(parse_rate("5r/h"), None);
+    }
+
+    #[test]
+    fn limit_req_rejects_contradictory_parameters() {
+        let e = build(
+            "events {} http { limit_req_zone $binary_remote_addr zone=z:1m rate=1r/s; \
+             server { listen 80; location / { limit_req zone=z burst=5 nodelay delay=2; } } }",
+        )
+        .unwrap_err();
+        assert!(e.msg.contains("mutually exclusive"), "{}", e.msg);
+
+        let e = build(
+            "events {} http { server { listen 80; location / { limit_req burst=5; } } }",
+        )
+        .unwrap_err();
+        assert!(e.msg.contains("zone="), "{}", e.msg);
     }
 
     #[test]

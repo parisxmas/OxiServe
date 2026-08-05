@@ -211,6 +211,15 @@ async fn dispatch(ctx: &mut Ctx<'_>, loc: &Arc<Location>, internal: bool) -> Ste
         return Step::Fail(404);
     }
 
+    // Rate limiting runs before any work is done for the request, and only on
+    // the real client request — an internal redirect is the same request and
+    // must not be charged twice.
+    if !internal && !loc.core.limit_reqs.is_empty() {
+        if let Some(status) = apply_limit_req(ctx, &loc.core).await {
+            return Step::Fail(status);
+        }
+    }
+
     if let Some(allowed) = &loc.allowed_methods {
         let m = ctx.req.method.as_str();
         // limit_except names the methods that stay unrestricted; GET implies HEAD.
@@ -249,6 +258,48 @@ async fn dispatch(ctx: &mut Ctx<'_>, loc: &Arc<Location>, internal: bool) -> Ste
             Err(c) => Step::Fail(c),
         },
         Action::Static => served_to_step(files::serve(ctx, Some(loc)).await),
+    }
+}
+
+/// Evaluates every `limit_req` that applies. Returns the rejection status if
+/// any limit refuses the request.
+///
+/// nginx evaluates all applicable limits and the most restrictive wins; a
+/// delay from one and a rejection from another means rejection.
+async fn apply_limit_req(ctx: &mut Ctx<'_>, core: &CoreConf) -> Option<u16> {
+    use crate::server::limit_req::Decision;
+
+    let mut longest_delay = 0u64;
+    for l in core.limit_reqs.iter() {
+        let Some(zone) = ctx.http.limit_req_zones.get(&l.zone) else {
+            // Config load rejects unknown zones, so this is unreachable.
+            continue;
+        };
+        let mut key = String::with_capacity(32);
+        // The zone's key template belongs to the zone, not the location.
+        zone_key(ctx, &l.zone, &mut key);
+        if key.is_empty() {
+            // nginx skips a request whose key evaluates empty.
+            continue;
+        }
+        match zone.check(&key, ctx.start, l.burst, l.nodelay, l.delay_after) {
+            Decision::Pass => {}
+            Decision::Delay(ms) => longest_delay = longest_delay.max(ms),
+            Decision::Reject => return Some(core.limit_req_status),
+        }
+    }
+
+    if longest_delay > 0 {
+        // Holding the task is what shapes traffic to the configured rate; the
+        // worker stays free for other connections while this one waits.
+        tokio::time::sleep(std::time::Duration::from_millis(longest_delay)).await;
+    }
+    None
+}
+
+fn zone_key(ctx: &Ctx<'_>, zone: &str, out: &mut String) {
+    if let Some(t) = ctx.http.limit_req_keys.get(zone) {
+        t.render_into(ctx, out);
     }
 }
 
