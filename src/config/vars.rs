@@ -69,6 +69,8 @@ pub enum Var {
     /// `$upstream_addr` and friends.
     UpstreamAddr,
     UpstreamStatus,
+    /// `$upstream_cache_status` — MISS / HIT / EXPIRED / BYPASS / STALE.
+    UpstreamCacheStatus,
     UpstreamResponseTime,
     UpstreamConnectTime,
     /// `$cookie_sessionid`
@@ -137,6 +139,7 @@ impl Var {
             "proxy_add_x_forwarded_for" => Var::ProxyAddXForwardedFor,
             "upstream_addr" => Var::UpstreamAddr,
             "upstream_status" => Var::UpstreamStatus,
+            "upstream_cache_status" => Var::UpstreamCacheStatus,
             "upstream_response_time" => Var::UpstreamResponseTime,
             "upstream_connect_time" => Var::UpstreamConnectTime,
             _ => Var::User(Arc::from(name)),
@@ -193,6 +196,7 @@ impl Var {
             Var::ProxyAddXForwardedFor => "proxy_add_x_forwarded_for",
             Var::UpstreamAddr => "upstream_addr",
             Var::UpstreamStatus => "upstream_status",
+            Var::UpstreamCacheStatus => "upstream_cache_status",
             Var::UpstreamResponseTime => "upstream_response_time",
             Var::UpstreamConnectTime => "upstream_connect_time",
             // The dynamic ones rebuild the name they were written with.

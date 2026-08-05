@@ -54,6 +54,8 @@ pub struct Ctx<'a> {
 
     pub upstream_addr: String,
     pub upstream_status: u16,
+    /// Set by the proxy handler; surfaces as `$upstream_cache_status`.
+    pub cache_status: Option<crate::server::cache::CacheStatus>,
     pub upstream_time: f64,
 
     /// How many internal redirects have happened, to break `try_files` loops.
@@ -101,6 +103,7 @@ impl<'a> Ctx<'a> {
             fastcgi_path_info: String::new(),
             upstream_addr: String::new(),
             upstream_status: 0,
+            cache_status: None,
             upstream_time: 0.0,
             redirects: 0,
             matched: None,
@@ -283,6 +286,11 @@ impl<'a> Ctx<'a> {
                 push_addr(out, &self.remote);
             }
             Var::UpstreamAddr => out.push_str(&self.upstream_addr),
+            Var::UpstreamCacheStatus => {
+                if let Some(s) = self.cache_status {
+                    out.push_str(s.as_str());
+                }
+            }
             Var::UpstreamStatus => {
                 if self.upstream_status > 0 {
                     push_num(out, self.upstream_status as u64);

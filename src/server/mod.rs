@@ -11,6 +11,7 @@
 //! and no atomics in the steady state.
 
 pub mod autoindex;
+pub mod cache;
 pub mod conn;
 pub mod ctx;
 pub mod fastcgi;

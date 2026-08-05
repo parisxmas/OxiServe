@@ -228,6 +228,7 @@ pub fn default_core() -> CoreConf {
         internal: false,
         open_file_cache: OpenFileCache::default(),
         fastcgi: Arc::new(FastCgiConf::default()),
+        proxy_cache: ProxyCacheConf::default(),
         limit_reqs: Arc::new(Vec::new()),
         limit_req_status: 503,
     }
@@ -288,6 +289,13 @@ struct CoreLayer {
     fcgi_send_timeout: Option<Duration>,
     fcgi_keep_conn: Option<bool>,
     fcgi_hide_headers: Option<Vec<Box<str>>>,
+    cache_zone: Option<Option<Arc<str>>>,
+    cache_key: Option<Arc<Template>>,
+    cache_valid: Option<Vec<CacheValid>>,
+    cache_methods: Option<Vec<Box<str>>>,
+    cache_min_uses: Option<u32>,
+    cache_bypass: Option<Vec<Arc<Template>>>,
+    cache_no_cache: Option<Vec<Arc<Template>>>,
     limit_reqs: Option<Vec<LimitReq>>,
     limit_req_status: Option<u16>,
     ofc_min_uses: Option<u32>,
@@ -377,6 +385,28 @@ impl CoreLayer {
         }
         if let Some(v) = self.ofc_errors {
             c.open_file_cache.errors = v;
+        }
+
+        if let Some(v) = &self.cache_zone {
+            c.proxy_cache.zone = v.clone();
+        }
+        if let Some(v) = &self.cache_key {
+            c.proxy_cache.key = v.clone();
+        }
+        if let Some(v) = &self.cache_valid {
+            c.proxy_cache.valid = Arc::new(v.clone());
+        }
+        if let Some(v) = &self.cache_methods {
+            c.proxy_cache.methods = Arc::new(v.clone());
+        }
+        if let Some(v) = self.cache_min_uses {
+            c.proxy_cache.min_uses = v;
+        }
+        if let Some(v) = &self.cache_bypass {
+            c.proxy_cache.bypass = Arc::new(v.clone());
+        }
+        if let Some(v) = &self.cache_no_cache {
+            c.proxy_cache.no_cache = Arc::new(v.clone());
         }
 
         // `limit_req` follows the list rule: a level that declares any replaces
@@ -519,7 +549,6 @@ const KNOWN_UNIMPLEMENTED: &[&str] = &[
     "dav_methods", "mp4", "flv", "xslt_stylesheet", "image_filter",
     "stub_status", "perl", "js_content",
     "geo", "split_clients", "referer_hash_bucket_size",
-    "proxy_cache", "proxy_cache_path", "proxy_cache_valid", "proxy_cache_key",
 ];
 
 impl Builder {
@@ -675,6 +704,7 @@ impl Builder {
 
         let mut upstreams: HashMap<Box<str>, Arc<Upstream>> = HashMap::new();
         let mut zone_defs: Vec<LimitReqZoneDef> = Vec::new();
+        let mut cache_defs: Vec<Arc<crate::server::cache::Zone>> = Vec::new();
         let mut maps = Vec::new();
         let mut level = Level::default();
         let mut server_dirs = Vec::new();
@@ -705,6 +735,10 @@ impl Builder {
                             mime.insert(ext, &t.name);
                         }
                     }
+                }
+                "proxy_cache_path" => {
+                    want_args_range(c, 2, 12)?;
+                    cache_defs.push(self.parse_cache_path(c)?);
                 }
                 "limit_req_zone" => {
                     want_args_range(c, 3, 4)?;
@@ -772,7 +806,19 @@ impl Builder {
             }
         }
 
+        let mut cache_zones: HashMap<Box<str>, Arc<crate::server::cache::Zone>> = HashMap::new();
+        for z in cache_defs {
+            cache_zones.insert(z.name.clone(), z);
+        }
+        for s in &servers {
+            check_cache_zone(&s.core, &cache_zones)?;
+            for l in s.locations.prefix.iter().chain(&s.locations.regex).chain(&s.locations.exact) {
+                check_cache_zone(&l.core, &cache_zones)?;
+            }
+        }
+
         Ok(Http {
+            cache_zones,
             limit_req_zones,
             limit_req_keys,
             listeners,
@@ -1344,6 +1390,58 @@ impl Builder {
             | "fastcgi_intercept_errors" | "fastcgi_request_buffering"
             | "fastcgi_temp_file_write_size" | "fastcgi_max_temp_file_size"
             | "fastcgi_ignore_headers" | "fastcgi_pass_header" => {}
+            "proxy_cache" => {
+                want_args(d, 1)?;
+                c.cache_zone = Some(if d.args[0] == "off" {
+                    None
+                } else {
+                    Some(Arc::from(d.args[0].as_str()))
+                });
+            }
+            "proxy_cache_key" => {
+                want_args(d, 1)?;
+                c.cache_key = Some(Arc::new(Template::compile(&d.args[0])));
+            }
+            "proxy_cache_valid" => {
+                want_args_range(d, 1, 32)?;
+                let ttl = time_arg(d, d.args.len() - 1)?;
+                let mut codes = Vec::new();
+                for a in &d.args[..d.args.len() - 1] {
+                    if a == "any" {
+                        codes.clear();
+                        break;
+                    }
+                    match a.parse::<u16>() {
+                        Ok(n) => codes.push(n),
+                        Err(_) => bail!(d, "invalid status \"{a}\" in \"proxy_cache_valid\""),
+                    }
+                }
+                c.cache_valid.get_or_insert_with(Vec::new).push(CacheValid { codes, ttl });
+            }
+            "proxy_cache_methods" => {
+                want_args_range(d, 1, 16)?;
+                c.cache_methods =
+                    Some(d.args.iter().map(|m| m.to_ascii_uppercase().into_boxed_str()).collect());
+            }
+            "proxy_cache_min_uses" => {
+                want_args(d, 1)?;
+                c.cache_min_uses = d.args[0].parse().ok();
+            }
+            "proxy_cache_bypass" => {
+                want_args_range(d, 1, 32)?;
+                c.cache_bypass = Some(
+                    d.args.iter().map(|a| Arc::new(Template::compile(a))).collect(),
+                );
+            }
+            "proxy_no_cache" => {
+                want_args_range(d, 1, 32)?;
+                c.cache_no_cache = Some(
+                    d.args.iter().map(|a| Arc::new(Template::compile(a))).collect(),
+                );
+            }
+            "proxy_cache_use_stale" | "proxy_cache_lock" | "proxy_cache_lock_timeout"
+            | "proxy_cache_background_update" | "proxy_cache_revalidate"
+            | "proxy_cache_convert_head" => {}
             "limit_req" => {
                 want_args_range(d, 1, 4)?;
                 let mut lr = LimitReq {
@@ -1901,6 +1999,21 @@ fn parse_listen_addr(s: &str) -> Option<SocketAddr> {
     std::net::ToSocketAddrs::to_socket_addrs(&(h, port)).ok()?.next()
 }
 
+fn check_cache_zone(
+    core: &CoreConf,
+    zones: &HashMap<Box<str>, Arc<crate::server::cache::Zone>>,
+) -> R<()> {
+    if let Some(z) = &core.proxy_cache.zone {
+        if !zones.contains_key(&**z) {
+            return Err(BuildError {
+                msg: format!("unknown proxy_cache zone \"{z}\""),
+                loc: "proxy_cache".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn check_zones_exist(
     core: &CoreConf,
     zones: &HashMap<Box<str>, Arc<crate::server::limit_req::Zone>>,
@@ -2333,5 +2446,76 @@ mod tests {
     fn missing_ssl_certificate_is_rejected() {
         let e = build("events {} http { server { listen 443 ssl; } }").unwrap_err();
         assert!(e.msg.contains("ssl_certificate"), "{}", e.msg);
+    }
+}
+
+impl Builder {
+    /// `proxy_cache_path /var/cache levels=1:2 keys_zone=name:10m
+    ///  [inactive=60m] [max_size=1g];`
+    fn parse_cache_path(&mut self, d: &Directive) -> R<Arc<crate::server::cache::Zone>> {
+        let root = self.abs(&d.args[0]);
+        let mut name: Box<str> = "".into();
+        let mut levels: Vec<u8> = Vec::new();
+        let mut max_entries = 0usize;
+        let mut inactive = Duration::from_secs(600);
+        let mut max_size = 0u64;
+
+        for a in &d.args[1..] {
+            if let Some(v) = a.strip_prefix("keys_zone=") {
+                let (n, size) = v.split_once(':').ok_or_else(|| BuildError {
+                    msg: format!("invalid \"keys_zone=\" value \"{v}\", expected name:size"),
+                    loc: d.loc(),
+                })?;
+                name = n.into();
+                let bytes = parse_size(size).ok_or_else(|| BuildError {
+                    msg: format!("invalid zone size \"{size}\""),
+                    loc: d.loc(),
+                })?;
+                // nginx budgets roughly 128 bytes of zone per cached key.
+                max_entries = (bytes / 128) as usize;
+            } else if let Some(v) = a.strip_prefix("levels=") {
+                for part in v.split(':') {
+                    match part.parse::<u8>() {
+                        Ok(n) if (1..=2).contains(&n) => levels.push(n),
+                        _ => bail!(d, "invalid \"levels\" value \"{v}\" — each level must be 1 or 2"),
+                    }
+                }
+            } else if let Some(v) = a.strip_prefix("inactive=") {
+                inactive = parse_time(v).ok_or_else(|| BuildError {
+                    msg: format!("invalid \"inactive\" value \"{v}\""),
+                    loc: d.loc(),
+                })?;
+            } else if let Some(v) = a.strip_prefix("max_size=") {
+                max_size = parse_size(v).ok_or_else(|| BuildError {
+                    msg: format!("invalid \"max_size\" value \"{v}\""),
+                    loc: d.loc(),
+                })?;
+            } else if a.starts_with("use_temp_path=")
+                || a.starts_with("loader_")
+                || a.starts_with("manager_")
+                || a.starts_with("min_free=")
+            {
+                // Accepted; they tune background maintenance we do not run.
+            } else {
+                bail!(d, "invalid parameter \"{a}\" in \"proxy_cache_path\"");
+            }
+        }
+        if name.is_empty() {
+            bail!(d, "\"proxy_cache_path\" requires a \"keys_zone=\" parameter");
+        }
+        // Fail at startup rather than on the first cacheable response.
+        std::fs::create_dir_all(&root).map_err(|e| BuildError {
+            msg: format!("cannot create proxy_cache_path {}: {e}", root.display()),
+            loc: d.loc(),
+        })?;
+
+        Ok(Arc::new(crate::server::cache::Zone {
+            name,
+            root,
+            levels,
+            max_entries: max_entries.max(1),
+            max_size,
+            inactive,
+        }))
     }
 }

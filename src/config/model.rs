@@ -207,6 +207,44 @@ pub struct LimitReq {
     pub delay_after: u64,
 }
 
+/// `proxy_cache_valid [code…] time;` — how long each status stays fresh.
+#[derive(Debug, Clone)]
+pub struct CacheValid {
+    /// Empty means "any status nginx caches by default" (200, 301, 302).
+    pub codes: Vec<u16>,
+    pub ttl: Duration,
+}
+
+/// The caching settings that apply to a location.
+#[derive(Debug, Clone)]
+pub struct ProxyCacheConf {
+    /// Zone name; `None` means `proxy_cache off`.
+    pub zone: Option<Arc<str>>,
+    pub key: Arc<Template>,
+    pub valid: Arc<Vec<CacheValid>>,
+    pub methods: Arc<Vec<Box<str>>>,
+    pub min_uses: u32,
+    /// `proxy_cache_bypass` — non-empty, non-"0" means skip the lookup.
+    pub bypass: Arc<Vec<Arc<Template>>>,
+    /// `proxy_no_cache` — non-empty, non-"0" means do not store the response.
+    pub no_cache: Arc<Vec<Arc<Template>>>,
+}
+
+impl Default for ProxyCacheConf {
+    fn default() -> Self {
+        ProxyCacheConf {
+            zone: None,
+            // nginx's default key.
+            key: Arc::new(Template::compile("$scheme$proxy_host$request_uri")),
+            valid: Arc::new(Vec::new()),
+            methods: Arc::new(vec![Box::from("GET"), Box::from("HEAD")]),
+            min_uses: 1,
+            bypass: Arc::new(Vec::new()),
+            no_cache: Arc::new(Vec::new()),
+        }
+    }
+}
+
 /// Directives that inherit down `http` → `server` → `location`.
 ///
 /// Every field is resolved (no `Option`) by the time a request sees it; the
@@ -251,6 +289,7 @@ pub struct CoreConf {
     pub internal: bool,
     pub open_file_cache: OpenFileCache,
     pub fastcgi: Arc<FastCgiConf>,
+    pub proxy_cache: ProxyCacheConf,
     pub limit_reqs: Arc<Vec<LimitReq>>,
     /// `limit_req_status` — the status returned when a limit rejects.
     pub limit_req_status: u16,
@@ -810,6 +849,7 @@ impl MimeTypes {
 
 #[derive(Debug)]
 pub struct Http {
+    pub cache_zones: HashMap<Box<str>, Arc<crate::server::cache::Zone>>,
     pub limit_req_zones: HashMap<Box<str>, Arc<crate::server::limit_req::Zone>>,
     /// Each zone's key template, kept beside it so a location only names a zone.
     pub limit_req_keys: HashMap<Box<str>, Arc<Template>>,

@@ -89,6 +89,15 @@ block, `fastcgi_param` with `if_not_empty`, `fastcgi_index`,
 `upstream` blocks with `weight` / `backup` / `down`, round-robin and `ip_hash`,
 `proxy_set_header`, `proxy_hide_header`, timeouts, chunked pass-through.
 
+**Content cache** — `proxy_cache_path` (with `levels=`, `keys_zone=`,
+`inactive=`, `max_size=`), `proxy_cache`, `proxy_cache_key`,
+`proxy_cache_valid`, `proxy_cache_methods`, `proxy_cache_min_uses`,
+`proxy_cache_bypass`, `proxy_no_cache`, and `$upstream_cache_status`
+(MISS/HIT/EXPIRED/BYPASS). The index every request consults is in-process;
+only bodies touch the disk. Each entry stores its own cache key and it is
+compared on every read, so a digest collision cannot serve one URL's response
+for another.
+
 **Load balancing** — passive health checks (`max_fails` / `fail_timeout`, with
 ejection and automatic recovery), `backup` failover, weighted round-robin, real
 `least_conn` (in-flight counts, weight-aware), `ip_hash`, and an upstream
@@ -131,7 +140,10 @@ regex captures `$1`–`$9`.
 - **uwsgi / SCGI / gRPC** — `uwsgi_pass` and friends (FastCGI *is* supported).
 - **FastCGI response streaming** — responses are fully buffered
   (`fastcgi_buffering on`, capped at 64 MB) rather than streamed.
-- **`proxy_cache`** and the content cache.
+- **`proxy_cache_use_stale` / `proxy_cache_lock` / background revalidation** —
+  parsed and ignored; the cache is fetch-on-expiry with no stale serving.
+- **Cache `max_size` enforcement and the cache manager** — `max_size` is
+  parsed but nothing prunes the directory yet.
 - **`limit_conn`** connection limiting (`limit_req` is implemented).
 - **`auth_basic`**, `auth_request`.
 - **Unix domain sockets** in `listen`.

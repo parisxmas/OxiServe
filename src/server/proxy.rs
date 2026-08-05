@@ -42,6 +42,25 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
     let conf = &loc.core.proxy;
     let started = Instant::now();
 
+    // ---- cache lookup -----------------------------------------------------
+    // Done before a connection is even considered: a hit must not cost an
+    // upstream round trip, which is the entire point.
+    let cache = cache_context(ctx, loc);
+    if let Some(cc) = &cache {
+        if cc.bypassed {
+            ctx.cache_status = Some(cache::CacheStatus::Bypass);
+        } else if let Some((entry, status)) = cache::load(&cc.zone, &cc.key, cc.hash) {
+            if status == cache::CacheStatus::Hit {
+                ctx.cache_status = Some(status);
+                return Ok(cached_reply(entry));
+            }
+            // Expired: fall through and revalidate by fetching again.
+            ctx.cache_status = Some(cache::CacheStatus::Expired);
+        } else {
+            ctx.cache_status = Some(cache::CacheStatus::Miss);
+        }
+    }
+
     // When the target is an upstream we keep hold of the chosen peer, so the
     // outcome of this request can be fed back into its health state.
     let mut chosen: Option<(&Arc<Upstream>, usize)> = None;
@@ -191,6 +210,8 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
     let _ = up.flush().await;
 
     // ---- response head ----------------------------------------------------
+    // Header values are needed twice when caching (once to answer, once to
+    // store), so they are collected rather than streamed straight through.
     let read_to = conf.read_timeout.unwrap_or(Duration::from_secs(60));
     let mut buf = Vec::with_capacity(8192);
     let head_len;
@@ -288,11 +309,17 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
 
     let mut resp = Resp::new();
     resp.status = status;
+    let resp_headers = headers.clone();
     for (n, v) in headers {
         resp.header(&n, &v);
     }
 
     let pre = buf[head_len..].to_vec();
+
+    // Store, when the response is cacheable and fully in hand. Only bodies
+    // that arrived complete are cached: writing a partial entry would be
+    // worse than not caching at all.
+    let store_ttl = cache.as_ref().and_then(|cc| cacheable_ttl(cc, ctx, status));
 
     // Framing is decided here rather than by `Reply::frame`, so a chunked
     // upstream body passes through byte-for-byte instead of being decoded and
@@ -312,6 +339,10 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
             // returning one mid-body would corrupt whoever picked it up next.
             if want_keepalive && !upstream_said_close {
                 up_state::put(&addr_str, up, keepalive);
+            }
+            if let (Some(cc), Some(ttl)) = (&cache, store_ttl) {
+                let entry = cache::encode_entry(&cc.key, status, &resp_headers, &pre, ttl);
+                let _ = cache::store(&cc.zone, cc.hash, &entry);
             }
             Ok(Reply::new(resp, Body::Bytes(pre)))
         } else {
@@ -442,4 +473,76 @@ pub fn select_peer(ctx: &Ctx<'_>, up: &Arc<Upstream>) -> Result<usize, u16> {
         i
     });
     up_state::select(up, Instant::now(), hash, cursor).ok_or(502)
+}
+
+use super::cache;
+
+/// Everything the cache needs for one request, resolved once.
+struct CacheCtx {
+    zone: Arc<cache::Zone>,
+    key: String,
+    hash: cache::KeyHash,
+    bypassed: bool,
+    conf: crate::config::model::ProxyCacheConf,
+}
+
+/// Resolves the caching context, or `None` when this request is not cacheable
+/// at all (`proxy_cache off`, or a method outside `proxy_cache_methods`).
+fn cache_context(ctx: &Ctx<'_>, loc: &Arc<Location>) -> Option<CacheCtx> {
+    let c = &loc.core.proxy_cache;
+    let zone_name = c.zone.as_ref()?;
+    let zone = ctx.http.cache_zones.get(&**zone_name)?.clone();
+
+    // nginx caches only the configured methods; a POST must never be served
+    // from, or written to, the cache.
+    let method = ctx.req.method.as_str();
+    if !c.methods.iter().any(|m| &**m == method) {
+        return None;
+    }
+
+    let key = c.key.render(ctx);
+    let hash = cache::KeyHash::of(&key);
+    // `proxy_cache_bypass` skips the lookup but still allows storing.
+    let bypassed = c.bypass.iter().any(|t| truthy(&t.render(ctx)));
+
+    Some(CacheCtx { zone, key, hash, bypassed, conf: c.clone() })
+}
+
+/// nginx's truth test for these directives: non-empty and not "0".
+fn truthy(s: &str) -> bool {
+    !s.is_empty() && s != "0"
+}
+
+/// How long this response may be cached, or `None` if it must not be.
+fn cacheable_ttl(cc: &CacheCtx, ctx: &Ctx<'_>, status: u16) -> Option<Duration> {
+    // `proxy_no_cache` wins over everything.
+    if cc.conf.no_cache.iter().any(|t| truthy(&t.render(ctx))) {
+        return None;
+    }
+    // `proxy_cache_min_uses` — a URL requested once does not earn a disk write.
+    if cc.conf.min_uses > 1 && cache::note_use(&cc.zone, cc.hash) < cc.conf.min_uses {
+        return None;
+    }
+    // First an exact status match, then a catch-all `proxy_cache_valid` entry.
+    cc.conf
+        .valid
+        .iter()
+        .find(|v| v.codes.contains(&status))
+        .or_else(|| cc.conf.valid.iter().find(|v| v.codes.is_empty()))
+        .map(|v| v.ttl)
+}
+
+/// Builds a response from a cache entry.
+fn cached_reply(entry: cache::Decoded) -> Reply {
+    let mut resp = Resp::new();
+    resp.status = entry.status;
+    for (n, v) in &entry.headers {
+        // Framing is decided from the body we actually hold.
+        if n.eq_ignore_ascii_case("content-length") || n.eq_ignore_ascii_case("transfer-encoding") {
+            continue;
+        }
+        resp.header(n, v);
+    }
+    resp.framing = Framing::Length(entry.body.len() as u64);
+    Reply::new(resp, Body::Bytes(entry.body))
 }

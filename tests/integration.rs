@@ -1424,3 +1424,218 @@ http {{
     }
     panic!("file sink must still receive its line");
 }
+
+// ---- proxy_cache ----------------------------------------------------------
+
+/// A backend that returns a different body each time, so a cache HIT is
+/// provable: identical bodies mean the request never reached it.
+fn counting_backend() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::AtomicUsize;
+    let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let l = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            let h = h.clone();
+            std::thread::spawn(move || {
+                let mut c = c;
+                let mut buf = [0u8; 4096];
+                if c.read(&mut buf).is_err() {
+                    return;
+                }
+                let n = h.fetch_add(1, Ordering::SeqCst) + 1;
+                let body = format!("response-{n}");
+                let r = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = c.write_all(r.as_bytes());
+                let _ = c.flush();
+            });
+        }
+    });
+    (port, hits)
+}
+
+fn cache_conf(port: u16, extra: &str, loc_extra: &str) -> String {
+    format!("
+worker_processes 1;
+error_log {{DIR}}/error.log crit;
+events {{ worker_connections 64; }}
+http {{
+    access_log off;
+    proxy_cache_path {{DIR}}/cache levels=1:2 keys_zone=zone1:10m;
+    {extra}
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        location / {{
+            proxy_pass http://127.0.0.1:{port};
+            proxy_cache zone1;
+            proxy_cache_valid 200 60s;
+            add_header X-Cache-Status $upstream_cache_status always;
+            {loc_extra}
+        }}
+    }}
+}}")
+}
+
+#[test]
+fn a_cached_response_is_served_without_hitting_the_backend() {
+    let (port, hits) = counting_backend();
+    let s = Server::start("cachehit", &cache_conf(port, "", ""), &[]);
+
+    let first = s.get("/page");
+    assert_eq!(first.status, 200);
+    assert_eq!(first.body_str(), "response-1");
+    assert_eq!(first.header("X-Cache-Status"), Some("MISS"));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    // Every following request must come from disk, not the backend.
+    for i in 0..5 {
+        let r = s.get("/page");
+        assert_eq!(r.body_str(), "response-1", "request {i} must be the cached body");
+        assert_eq!(r.header("X-Cache-Status"), Some("HIT"));
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "backend must be hit exactly once");
+}
+
+#[test]
+fn different_urls_do_not_share_a_cache_entry() {
+    let (port, hits) = counting_backend();
+    let s = Server::start("cachekeys", &cache_conf(port, "", ""), &[]);
+
+    assert_eq!(s.get("/a").body_str(), "response-1");
+    assert_eq!(s.get("/b").body_str(), "response-2", "a different URL must miss");
+    assert_eq!(s.get("/a").body_str(), "response-1", "and each keeps its own entry");
+    assert_eq!(s.get("/b").body_str(), "response-2");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn an_entry_expires_and_is_refetched() {
+    let (port, hits) = counting_backend();
+    // A 1-second TTL so expiry is observable without a slow test.
+    let conf = cache_conf(port, "", "").replace("proxy_cache_valid 200 60s;", "proxy_cache_valid 200 1s;");
+    let s = Server::start("cacheexp", &conf, &[]);
+
+    assert_eq!(s.get("/x").body_str(), "response-1");
+    assert_eq!(s.get("/x").body_str(), "response-1", "still fresh");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    std::thread::sleep(Duration::from_millis(1500));
+    let r = s.get("/x");
+    assert_eq!(r.body_str(), "response-2", "an expired entry must be refetched");
+    assert_eq!(r.header("X-Cache-Status"), Some("EXPIRED"));
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn uncacheable_statuses_are_not_stored() {
+    // Only 200 is listed in proxy_cache_valid, and this backend returns 404.
+    let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+    let l = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h = hits.clone();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            let h = h.clone();
+            std::thread::spawn(move || {
+                let mut c = c;
+                let mut b = [0u8; 4096];
+                if c.read(&mut b).is_err() { return; }
+                h.fetch_add(1, Ordering::SeqCst);
+                let _ = c.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 5\r\n\r\ngone!");
+            });
+        }
+    });
+
+    let s = Server::start("cache404", &cache_conf(port, "", ""), &[]);
+    for _ in 0..3 {
+        assert_eq!(s.get("/missing").status, 404);
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 3, "a 404 must not be cached");
+}
+
+#[test]
+fn proxy_cache_bypass_skips_the_lookup() {
+    let (port, hits) = counting_backend();
+    let s = Server::start(
+        "cachebypass",
+        &cache_conf(port, "", "proxy_cache_bypass $http_x_refresh;"),
+        &[],
+    );
+
+    assert_eq!(s.get("/p").body_str(), "response-1");
+    assert_eq!(s.get("/p").body_str(), "response-1", "cached");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    // The header makes this request go to the backend regardless.
+    let r = s.raw("GET /p HTTP/1.1\r\nHost: x\r\nX-Refresh: 1\r\nConnection: close\r\n\r\n");
+    assert_eq!(r.body_str(), "response-2", "bypass must reach the backend");
+    assert_eq!(r.header("X-Cache-Status"), Some("BYPASS"));
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn proxy_no_cache_prevents_storing() {
+    let (port, hits) = counting_backend();
+    let s = Server::start(
+        "nocache",
+        &cache_conf(port, "", "proxy_no_cache $http_x_private;"),
+        &[],
+    );
+
+    // With the header set the response must not be stored...
+    let r = s.raw("GET /q HTTP/1.1\r\nHost: x\r\nX-Private: 1\r\nConnection: close\r\n\r\n");
+    assert_eq!(r.body_str(), "response-1");
+    // ...so the next plain request still reaches the backend.
+    assert_eq!(s.get("/q").body_str(), "response-2");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn post_requests_are_never_cached() {
+    let (port, hits) = counting_backend();
+    let s = Server::start("cachepost", &cache_conf(port, "", ""), &[]);
+
+    for _ in 0..3 {
+        let r = s.raw("POST /submit HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi");
+        assert_eq!(r.status, 200);
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 3, "POST must always reach the backend");
+}
+
+#[test]
+fn proxy_cache_min_uses_delays_storing() {
+    let (port, hits) = counting_backend();
+    let s = Server::start(
+        "minuses",
+        &cache_conf(port, "", "proxy_cache_min_uses 3;"),
+        &[],
+    );
+
+    // The first two go to the backend without being stored.
+    assert_eq!(s.get("/m").body_str(), "response-1");
+    assert_eq!(s.get("/m").body_str(), "response-2");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    // The third is stored, so the fourth is served from cache.
+    let third = s.get("/m").body_str();
+    let fourth = s.get("/m").body_str();
+    assert_eq!(fourth, third, "after min_uses the entry must be served: {third} vs {fourth}");
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn unknown_cache_zone_is_a_config_error() {
+    let dir = std::env::temp_dir().join(format!("oxiserve-badcache-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("bad.conf");
+    std::fs::write(
+        &f,
+        "events {} http { server { listen 80; location / { proxy_pass http://127.0.0.1:1; proxy_cache nope; } } }",
+    ).unwrap();
+    let err = oxiserve::config::load(&f, dir).unwrap_err().to_string();
+    assert!(err.contains("unknown proxy_cache zone"), "got: {err}");
+}
