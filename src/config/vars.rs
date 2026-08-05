@@ -237,12 +237,15 @@ impl Template {
     pub fn compile(src: &str) -> Template {
         let mut segs = Vec::new();
         let b = src.as_bytes();
-        let mut lit = String::new();
+        // Literal runs are collected as bytes and converted once. Pushing
+        // `byte as char` reinterpreted each byte as Latin-1, corrupting every
+        // non-ASCII literal in a log format or header value.
+        let mut lit: Vec<u8> = Vec::new();
         let mut i = 0;
 
         while i < b.len() {
             if b[i] != b'$' {
-                lit.push(b[i] as char);
+                lit.push(b[i]);
                 i += 1;
                 continue;
             }
@@ -255,7 +258,7 @@ impl Template {
                         (&src[i + 2..end], end + 1)
                     }
                     None => {
-                        lit.push('$');
+                        lit.push(b'$');
                         i += 1;
                         continue;
                     }
@@ -267,7 +270,7 @@ impl Template {
                     e += 1;
                 }
                 if e == start {
-                    lit.push('$');
+                    lit.push(b'$');
                     i += 1;
                     continue;
                 }
@@ -275,7 +278,9 @@ impl Template {
             };
 
             if !lit.is_empty() {
-                segs.push(Seg::Lit(std::mem::take(&mut lit).into_boxed_str()));
+                let text = String::from_utf8_lossy(&lit).into_owned();
+                lit.clear();
+                segs.push(Seg::Lit(text.into_boxed_str()));
             }
             // A bare digit is a regex capture group.
             let var = if name.len() == 1 && name.as_bytes()[0].is_ascii_digit() {
@@ -287,7 +292,9 @@ impl Template {
             i = next;
         }
         if !lit.is_empty() {
-            segs.push(Seg::Lit(lit.into_boxed_str()));
+            segs.push(Seg::Lit(
+                String::from_utf8_lossy(&lit).into_owned().into_boxed_str(),
+            ));
         }
 
         let literal = match segs.as_slice() {
@@ -430,6 +437,16 @@ mod tests {
         assert_eq!(Var::parse("arg_q").field_name(), "arg_q");
         assert_eq!(Var::parse("cookie_sid").field_name(), "cookie_sid");
         assert_eq!(Var::parse("my_var").field_name(), "my_var");
+    }
+
+    #[test]
+    fn non_ascii_literals_survive_compilation() {
+        struct Empty;
+        impl VarSource for Empty {
+            fn var(&self, _: &Var, _: &mut String) {}
+        }
+        assert_eq!(Template::compile("Türkçe metin").render(&Empty), "Türkçe metin");
+        assert_eq!(Template::compile("ürün: $uri").render(&Empty), "ürün: ");
     }
 
     #[test]

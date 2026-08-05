@@ -187,31 +187,35 @@ impl<'a> Lexer<'a> {
 /// why `location ~ \.php$` reaches the regex engine with its backslash intact
 /// rather than silently degrading to "any character".
 fn unescape(raw: &[u8]) -> String {
+    // Bytes throughout, converted once at the end. Pushing `byte as char`
+    // would read each byte as a Latin-1 code point, so any non-ASCII value in
+    // a config — a UTF-8 `add_header`, a path with an accent — came out
+    // mangled. Same bug fuzzing found in URI normalisation.
     if !raw.contains(&b'\\') {
-        return raw.iter().map(|&c| c as char).collect();
+        return String::from_utf8_lossy(raw).into_owned();
     }
-    let mut s = String::with_capacity(raw.len());
+    let mut s: Vec<u8> = Vec::with_capacity(raw.len());
     let mut i = 0;
     while i < raw.len() {
         if raw[i] == b'\\' && i + 1 < raw.len() {
             match raw[i + 1] {
                 b'"' | b'\'' | b'\\' => {
-                    s.push(raw[i + 1] as char);
+                    s.push(raw[i + 1]);
                     i += 2;
                     continue;
                 }
                 b't' => {
-                    s.push('\t');
+                    s.push(b'\t');
                     i += 2;
                     continue;
                 }
                 b'r' => {
-                    s.push('\r');
+                    s.push(b'\r');
                     i += 2;
                     continue;
                 }
                 b'n' => {
-                    s.push('\n');
+                    s.push(b'\n');
                     i += 2;
                     continue;
                 }
@@ -220,10 +224,12 @@ fn unescape(raw: &[u8]) -> String {
                 _ => {}
             }
         }
-        s.push(raw[i] as char);
+        s.push(raw[i]);
         i += 1;
     }
-    s
+    // A config file that is not valid UTF-8 is a broken file, but refusing to
+    // start over one stray byte would be worse than carrying on.
+    String::from_utf8_lossy(&s).into_owned()
 }
 
 #[inline]
@@ -302,6 +308,14 @@ mod tests {
     // nginx keeps the backslash for every escape it does not recognise. If we
     // stripped it, `\.` in a location regex would become "any character" and
     // silently match more than the config author asked for.
+    #[test]
+    fn non_ascii_values_survive_the_lexer() {
+        // A UTF-8 value in a config must reach the runtime unchanged.
+        assert_eq!(words("add_header X-Ülke Türkiye;"), ["add_header", "X-Ülke", "Türkiye"]);
+        assert_eq!(words("root /var/www/ürünler;"), ["root", "/var/www/ürünler"]);
+        assert_eq!(words(r#"add_header X "日本語";"#), ["add_header", "X", "日本語"]);
+    }
+
     #[test]
     fn unrecognised_escapes_keep_their_backslash() {
         assert_eq!(words(r"location ~ \.php$;"), ["location", "~", r"\.php$"]);

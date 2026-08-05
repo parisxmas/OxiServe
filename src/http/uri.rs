@@ -34,13 +34,18 @@ pub fn normalize(path: &str) -> Result<String, UriError> {
         return Err(UriError::NotAbsolute);
     }
     let b = path.as_bytes();
+    // Bytes, not chars. Percent-decoding works on bytes and a UTF-8 character
+    // spans several of them, so pushing `byte as char` would reinterpret each
+    // byte as a Latin-1 code point and re-encode it — mangling every non-ASCII
+    // path (`/ürünler/…` would stop resolving) and making normalisation
+    // non-idempotent. Found by fuzzing.
+    let mut out: Vec<u8> = Vec::with_capacity(path.len());
     // Segment start offsets within `out`, so `..` can truncate cheaply.
-    let mut out = String::with_capacity(path.len());
     let mut starts: Vec<usize> = Vec::with_capacity(16);
-    out.push('/');
+    out.push(b'/');
 
     let mut i = 1;
-    let mut seg = String::with_capacity(64);
+    let mut seg: Vec<u8> = Vec::with_capacity(64);
     let trailing_slash = b.len() > 1 && b[b.len() - 1] == b'/';
 
     loop {
@@ -65,20 +70,20 @@ pub fn normalize(path: &str) -> Result<String, UriError> {
             if c == 0 || c == b'/' {
                 return Err(UriError::Invalid);
             }
-            seg.push(c as char);
+            seg.push(c);
         }
 
-        match seg.as_str() {
-            "" | "." => {}
-            ".." => {
+        match seg.as_slice() {
+            b"" | b"." => {}
+            b".." => {
                 // Climbing above the root is an error, never a no-op.
                 let last = starts.pop().ok_or(UriError::Invalid)?;
                 out.truncate(last);
             }
             s => {
                 starts.push(out.len());
-                out.push_str(s);
-                out.push('/');
+                out.extend_from_slice(s);
+                out.push(b'/');
             }
         }
 
@@ -93,7 +98,12 @@ pub fn normalize(path: &str) -> Result<String, UriError> {
     if !trailing_slash && out.len() > 1 {
         out.pop();
     }
-    Ok(out)
+    // Everything downstream — the filesystem path, `$uri`, log lines — is
+    // `str`, so a path that decodes to invalid UTF-8 is rejected rather than
+    // silently repaired. Replacing the bad bytes would produce a path the
+    // client never asked for, and one that no longer matches what the security
+    // checks above examined.
+    String::from_utf8(out).map_err(|_| UriError::Invalid)
 }
 
 #[inline]
@@ -185,6 +195,38 @@ mod tests {
     fn percent_decoding() {
         assert_eq!(normalize("/a%20b").unwrap(), "/a b");
         assert_eq!(normalize("/%68%65%6c%6c%6f").unwrap(), "/hello");
+    }
+
+    #[test]
+    fn non_ascii_paths_survive_intact() {
+        // Regression, found by fuzzing: bytes were pushed as `byte as char`,
+        // which read each byte as a Latin-1 code point and re-encoded it. Any
+        // non-ASCII path was quietly corrupted and stopped resolving.
+        for p in ["/ürünler/kitap.html", "/日本語/ページ", "/Ā/x", "/café.png"] {
+            assert_eq!(normalize(p).unwrap(), p, "{p} must pass through unchanged");
+        }
+        // Percent-encoded UTF-8 must decode to the same thing.
+        assert_eq!(normalize("/%C3%BCr%C3%BCn").unwrap(), "/ürün");
+    }
+
+    #[test]
+    fn normalisation_is_idempotent() {
+        // A second pass anywhere in the pipeline must not produce a different
+        // path than the one the security checks examined.
+        for p in ["/a/b", "/ürün/x", "//a///b", "/a/./b/../c", "/tr/ç/", "/%C3%A7"] {
+            let once = normalize(p).unwrap();
+            let twice = normalize(&once).unwrap();
+            assert_eq!(once, twice, "normalising {p:?} twice changed it");
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_is_rejected_not_repaired() {
+        // %FF is not valid UTF-8. Everything downstream is `str`, so this is
+        // refused rather than turned into a replacement character — which
+        // would be a path the client never requested.
+        assert_eq!(normalize("/%FF"), Err(UriError::Invalid));
+        assert_eq!(normalize("/a/%C3%28"), Err(UriError::Invalid));
     }
 
     // The traversal suite. Every one of these must fail closed.
