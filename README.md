@@ -71,6 +71,14 @@ ETags, MIME types, `expires`, `add_header`, gzip, `error_page`, `return`,
 `rewrite` (all four flags), `if` (all condition forms), `set`, `map`,
 `limit_except`, `internal`.
 
+**FastCGI** — `fastcgi_pass` (responder role) to an address or `upstream`
+block, `fastcgi_param` with `if_not_empty`, `fastcgi_index`,
+`fastcgi_split_path_info`, timeouts, `fastcgi_keep_conn`,
+`fastcgi_hide_header`. Verified against real php-fpm (PHP 8.5): `$_GET`,
+`$_POST`, `PATH_INFO`, PHP-set status headers, the WordPress-style
+`try_files $uri $uri/ /index.php?$args` front-controller pattern, and
+300 KB responses spanning multiple records.
+
 **Proxying** — `proxy_pass` to upstreams or literal addresses, `upstream` blocks
 with `weight` / `backup` / `down` / `max_fails`, round-robin and `ip_hash`,
 `proxy_set_header`, `proxy_hide_header`, timeouts, chunked pass-through.
@@ -82,7 +90,9 @@ sharing a listener.
 `buffer=` / `flush=`, `error_log` with levels.
 
 **Variables** — ~50 including `$uri`, `$args`, `$arg_*`, `$http_*`, `$sent_http_*`,
-`$cookie_*`, `$upstream_*`, `$proxy_add_x_forwarded_for`, regex captures `$1`–`$9`.
+`$cookie_*`, `$upstream_*`, `$proxy_add_x_forwarded_for`,
+`$fastcgi_script_name`, `$fastcgi_path_info`, `$https`,
+regex captures `$1`–`$9`.
 
 ## Not implemented
 
@@ -90,7 +100,9 @@ sharing a listener.
 "unknown directive". Currently missing:
 
 - **HTTP/2 and HTTP/3** — `listen ... http2` is parsed and ignored (serves 1.1).
-- **FastCGI / uwsgi / SCGI / gRPC** — `fastcgi_pass` and friends.
+- **uwsgi / SCGI / gRPC** — `uwsgi_pass` and friends (FastCGI *is* supported).
+- **FastCGI response streaming** — responses are fully buffered
+  (`fastcgi_buffering on`, capped at 64 MB) rather than streamed.
 - **`proxy_cache`** and the content cache.
 - **`limit_req` / `limit_conn`** rate limiting.
 - **`auth_basic`**, `auth_request`.
