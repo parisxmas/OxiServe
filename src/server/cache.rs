@@ -224,7 +224,16 @@ pub fn decode_entry(buf: &[u8], key: &str) -> Result<Decoded, DecodeError> {
     let hdr_len = u32::from_be_bytes(buf[25..29].try_into().unwrap()) as usize;
     let body_len = u64::from_be_bytes(buf[29..37].try_into().unwrap()) as usize;
 
-    let total = HEADER_LEN + key_len + hdr_len + body_len;
+    // Checked, because these three lengths come off the disk and a corrupt
+    // file can claim any value it likes. `body_len` is a u64: with plain
+    // addition, a file claiming a length near u64::MAX wraps the sum to
+    // something small, the length check passes, and the slice below reads out
+    // of bounds. Found by fuzzing.
+    let total = HEADER_LEN
+        .checked_add(key_len)
+        .and_then(|t| t.checked_add(hdr_len))
+        .and_then(|t| t.checked_add(body_len))
+        .ok_or(DecodeError::Truncated)?;
     if buf.len() < total {
         return Err(DecodeError::Truncated);
     }
@@ -388,6 +397,25 @@ mod tests {
             );
         }
         assert!(decode_entry(&e, "k").is_ok());
+    }
+
+    #[test]
+    fn absurd_lengths_do_not_overflow_or_read_out_of_bounds() {
+        // A corrupt entry claiming a body of nearly u64::MAX. With unchecked
+        // addition the total wrapped to a small number, the length check
+        // passed, and the slice read past the end of the buffer.
+        let mut e = encode_entry("k", 200, &[], b"x", Duration::from_secs(1));
+        e[29..37].copy_from_slice(&u64::MAX.to_be_bytes());
+        assert_eq!(decode_entry(&e, "k"), Err(DecodeError::Truncated));
+
+        // The same through each length field.
+        let mut e2 = encode_entry("k", 200, &[], b"x", Duration::from_secs(1));
+        e2[25..29].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(decode_entry(&e2, "k").is_err());
+
+        let mut e3 = encode_entry("k", 200, &[], b"x", Duration::from_secs(1));
+        e3[23..25].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(decode_entry(&e3, "k").is_err());
     }
 
     #[test]
