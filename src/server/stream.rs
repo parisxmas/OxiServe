@@ -12,7 +12,6 @@
 //!
 //! [ADR-0001]: ../../docs/decisions/0001-load-balancer-scope.md
 
-use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
