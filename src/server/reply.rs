@@ -22,9 +22,11 @@ pub enum Body {
     /// A small file read directly into the connection's write buffer, so the
     /// head and body leave in a single `write`. Cheaper than mapping: `mmap` +
     /// `munmap` per request costs more than one `pread` at these sizes.
-    Inline { file: std::fs::File, offset: u64, len: u64 },
-    /// A file too large to map, read in chunks off the blocking pool.
-    File { file: std::fs::File, offset: u64, len: u64 },
+    /// `Arc` because the descriptor may be shared with the open-file cache;
+    /// all reads use explicit offsets, never the shared file position.
+    Inline { file: Arc<std::fs::File>, offset: u64, len: u64 },
+    /// A file too large to map, streamed (or `sendfile`d) in chunks.
+    File { file: Arc<std::fs::File>, offset: u64, len: u64 },
     /// A proxied upstream body. `pre` is whatever already arrived in the
     /// header read; `io` supplies the rest.
     Stream {
@@ -109,7 +111,7 @@ mod tests {
         assert_eq!(Body::Empty.known_len(), Some(0));
         assert_eq!(Body::Bytes(vec![1, 2, 3]).known_len(), Some(3));
         assert_eq!(
-            Body::File { file: std::fs::File::open("/dev/null").unwrap(), offset: 0, len: 99 }
+            Body::File { file: Arc::new(std::fs::File::open("/dev/null").unwrap()), offset: 0, len: 99 }
                 .known_len(),
             Some(99)
         );

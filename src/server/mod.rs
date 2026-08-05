@@ -13,6 +13,7 @@
 pub mod autoindex;
 pub mod conn;
 pub mod ctx;
+pub mod fcache;
 pub mod files;
 pub mod handler;
 pub mod log;

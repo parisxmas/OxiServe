@@ -108,6 +108,45 @@ pub enum ServerTokens {
     Build,
 }
 
+/// `open_file_cache` and its companion directives.
+///
+/// The cache lives per worker thread (as nginx's does) and keeps open file
+/// descriptors plus their `fstat` results, so a cache hit serves a request
+/// with **zero** filesystem syscalls. Profiling showed 3 of the ~5.5 syscalls
+/// per static request were path metadata — this is the directive that removes
+/// them. Defaults mirror nginx: disabled, `valid` 60s, `min_uses` 1,
+/// `errors` off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenFileCache {
+    pub enabled: bool,
+    /// Maximum cached entries per worker (`max=`).
+    pub max: usize,
+    /// Entries unused for this long are dropped (`inactive=`).
+    pub inactive: Duration,
+    /// How long a cached fstat result is trusted before re-validation
+    /// (`open_file_cache_valid`).
+    pub valid: Duration,
+    /// Entries used fewer times than this are preferred eviction victims
+    /// (`open_file_cache_min_uses`).
+    pub min_uses: u32,
+    /// Whether lookup failures (404 and friends) are cached too
+    /// (`open_file_cache_errors`).
+    pub errors: bool,
+}
+
+impl Default for OpenFileCache {
+    fn default() -> Self {
+        OpenFileCache {
+            enabled: false,
+            max: 0,
+            inactive: Duration::from_secs(60),
+            valid: Duration::from_secs(60),
+            min_uses: 1,
+            errors: false,
+        }
+    }
+}
+
 /// Directives that inherit down `http` → `server` → `location`.
 ///
 /// Every field is resolved (no `Option`) by the time a request sees it; the
@@ -150,6 +189,7 @@ pub struct CoreConf {
     pub limit_rate_after: u64,
     pub satisfy_any: bool,
     pub internal: bool,
+    pub open_file_cache: OpenFileCache,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -660,7 +660,7 @@ where
 /// [`files::MMAP_MAX`]: super::files::MMAP_MAX
 async fn stream_file<S>(
     sock: &mut S,
-    file: std::fs::File,
+    file: Arc<std::fs::File>,
     offset: u64,
     len: u64,
     buf_size: usize,
@@ -684,7 +684,6 @@ where
     let mut pos = offset;
     let chunk = buf_size.clamp(16 * 1024, 512 * 1024).min(len.max(1) as usize);
     let mut buf = vec![0u8; chunk];
-    let file = Arc::new(file);
 
     let _guard = StreamGuard::enter();
 

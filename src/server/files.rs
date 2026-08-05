@@ -5,15 +5,15 @@
 //! fall back to chunked reads on the blocking pool, because a page fault on a
 //! cold multi-megabyte file would otherwise stall the whole worker.
 
-use std::fs::Metadata;
+use std::fs::File;
 use std::io;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use memmap2::Mmap;
 
 use super::ctx::Ctx;
+use super::fcache::{self, Cached};
 use super::reply::{Body, Reply};
 use crate::config::model::{CoreConf, LocMatch, Location};
 use crate::http::date;
@@ -35,7 +35,7 @@ pub const MMAP_MAX: u64 = 256 * 1024;
 /// With `alias`, the matched location prefix is *replaced*; with `root` it is
 /// appended. Getting this backwards is the classic nginx misconfiguration, so
 /// the two paths are kept visibly distinct.
-pub fn map_path(ctx: &Ctx, core: &CoreConf, matcher: Option<&LocMatch>) -> PathBuf {
+pub fn map_path(ctx: &Ctx, core: &CoreConf, matcher: Option<&LocMatch>) -> String {
     if let Some(alias) = &core.alias {
         let base = alias.render(ctx);
         let prefix_len = match matcher {
@@ -55,13 +55,13 @@ pub fn map_path(ctx: &Ctx, core: &CoreConf, matcher: Option<&LocMatch>) -> PathB
             }
             p.push_str(rest);
         }
-        return PathBuf::from(p);
+        return p;
     }
 
     let mut p = core.root.render(ctx);
     // `uri` is already normalised and absolute, so this cannot escape `root`.
     p.push_str(&ctx.uri);
-    PathBuf::from(p)
+    p
 }
 
 /// Serves a file or directory for the matched location.
@@ -79,26 +79,27 @@ pub async fn serve(ctx: &mut Ctx<'_>, loc: Option<&Arc<Location>>) -> Result<Rep
         .unwrap_or_else(|| core.root.render(&*ctx));
 
     let path = map_path(ctx, core, matcher);
-    ctx.filename = path.to_string_lossy().into_owned();
+    ctx.filename = path.clone();
 
-    let meta = match std::fs::metadata(&path) {
-        Ok(m) => m,
-        Err(e) => return Err(io_status(&e)),
-    };
-
-    if meta.is_dir() {
-        // nginx redirects a directory request that lacks its trailing slash,
-        // so relative links inside the index page resolve correctly.
-        if !ctx.uri.ends_with('/') {
-            return Ok(dir_redirect(ctx, core));
+    // The single filesystem touch point: one open+fstat on a miss, zero
+    // syscalls on an open_file_cache hit.
+    match fcache::lookup(&path, &core.open_file_cache) {
+        Cached::Error(status) => Err(status),
+        Cached::Dir => {
+            // nginx redirects a directory request that lacks its trailing
+            // slash, so relative links inside the index page resolve.
+            if !ctx.uri.ends_with('/') {
+                return Ok(dir_redirect(ctx, core));
+            }
+            serve_directory(ctx, core, &path).await
         }
-        return serve_directory(ctx, core, &path).await;
+        Cached::File { file, size, mtime } => {
+            serve_file(ctx, core, &path, file, size, mtime).await
+        }
     }
-
-    serve_file(ctx, core, &path, &meta).await
 }
 
-async fn serve_directory(ctx: &mut Ctx<'_>, core: &CoreConf, dir: &Path) -> Result<Reply, u16> {
+async fn serve_directory(ctx: &mut Ctx<'_>, core: &CoreConf, dir: &str) -> Result<Reply, u16> {
     for idx in core.index.iter() {
         let name = idx.render(&*ctx);
         if name.is_empty() {
@@ -106,17 +107,25 @@ async fn serve_directory(ctx: &mut Ctx<'_>, core: &CoreConf, dir: &Path) -> Resu
         }
         // An absolute index is an internal redirect in nginx; we resolve it
         // against the root instead, which is equivalent for the common case.
-        let candidate = dir.join(name.trim_start_matches('/'));
-        if let Ok(m) = std::fs::metadata(&candidate) {
-            if m.is_file() {
-                ctx.filename = candidate.to_string_lossy().into_owned();
-                return serve_file(ctx, core, &candidate, &m).await;
-            }
+        let mut candidate = String::with_capacity(dir.len() + name.len() + 1);
+        candidate.push_str(dir);
+        if !candidate.ends_with('/') {
+            candidate.push('/');
+        }
+        candidate.push_str(name.trim_start_matches('/'));
+
+        // Index probes go through the cache too — with `errors on`, a missing
+        // index.html is cached as a miss exactly as nginx does.
+        if let Cached::File { file, size, mtime } =
+            fcache::lookup(&candidate, &core.open_file_cache)
+        {
+            ctx.filename = candidate.clone();
+            return serve_file(ctx, core, &candidate, file, size, mtime).await;
         }
     }
 
     if core.autoindex {
-        return super::autoindex::render(ctx, dir).await;
+        return super::autoindex::render(ctx, std::path::Path::new(dir)).await;
     }
     Err(403)
 }
@@ -155,18 +164,15 @@ fn dir_redirect(ctx: &Ctx, core: &CoreConf) -> Reply {
 async fn serve_file(
     ctx: &mut Ctx<'_>,
     core: &CoreConf,
-    path: &Path,
-    meta: &Metadata,
+    path: &str,
+    file: Arc<File>,
+    size: u64,
+    mtime: SystemTime,
 ) -> Result<Reply, u16> {
     if !ctx.req.method.is_safe() && ctx.req.method != crate::http::Method::Options {
         return Err(405);
     }
 
-    let size = meta.len();
-    let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
-    // Both validators are needed as strings for precondition comparison, so
-    // they are built once into a reusable scratch buffer on the context rather
-    // than through `format!` and a fresh `String` per request.
     let etag = make_etag(mtime, size);
 
     // Conditional requests short-circuit before any I/O on the body.
@@ -233,43 +239,42 @@ async fn serve_file(
         return Ok(r);
     }
 
-    let body = open_body(path, start, len, core.sendfile).map_err(|e| io_status(&e))?;
-    Ok(Reply::new(resp, body))
+    Ok(Reply::new(resp, make_body(file, start, len, core.sendfile)))
 }
 
-fn open_body(path: &Path, start: u64, len: u64, sendfile: bool) -> io::Result<Body> {
-    let file = std::fs::File::open(path)?;
+/// Chooses how an already-open file goes on the wire.
+fn make_body(file: Arc<File>, start: u64, len: u64, sendfile: bool) -> Body {
     if len == 0 {
-        return Ok(Body::Empty);
+        return Body::Empty;
     }
     // Small files: one `pread` into the write buffer beats mapping. `mmap` and
     // `munmap` are page-table operations, and at a few kilobytes their cost
     // dominates the copy they save.
     if len <= INLINE_MAX {
-        return Ok(Body::Inline { file, offset: start, len });
+        return Body::Inline { file, offset: start, len };
     }
-    // With `sendfile on`, the kernel can move the file to the socket without a
+    // With `sendfile on`, the kernel moves the file to the socket without a
     // mapping at all, so skip straight to the file path and let the write side
     // choose `sendfile(2)`.
     if !sendfile && len <= MMAP_MAX {
         // SAFETY: mapping a file another process may truncate can fault on
         // access. We accept the same exposure nginx has with sendfile, and
         // bound it by only mapping small, already-stat'd regular files.
-        let map = unsafe { Mmap::map(&file) }?;
-        let s = start as usize;
-        let e = (start + len) as usize;
-        if e <= map.len() {
-            return Ok(Body::Mmap { map: Arc::new(map), range: s..e });
+        if let Ok(map) = unsafe { Mmap::map(&*file) } {
+            let s = start as usize;
+            let e = (start + len) as usize;
+            if e <= map.len() {
+                return Body::Mmap { map: Arc::new(map), range: s..e };
+            }
         }
-        // The file shrank between stat and map; fall through to a plain read.
+        // Mapping failed or the file shrank: fall through to a plain read.
     }
-    Ok(Body::File { file, offset: start, len })
+    Body::File { file, offset: start, len }
 }
 
 /// Writes `Content-Type` directly into the response arena.
-fn write_content_type(resp: &mut Resp, ctx: &Ctx, core: &CoreConf, path: &Path) {
-    let name = path.to_string_lossy();
-    let base: &str = match ctx.http.mime.lookup(&name) {
+fn write_content_type(resp: &mut Resp, ctx: &Ctx, core: &CoreConf, path: &str) {
+    let base: &str = match ctx.http.mime.lookup(path) {
         Some(t) => t,
         None => &core.default_type,
     };

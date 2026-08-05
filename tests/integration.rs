@@ -783,3 +783,67 @@ http {
     }
     panic!("access log never contained the request");
 }
+
+#[test]
+fn open_file_cache_serves_hits_and_holds_within_valid() {
+    let s = Server::start(
+        "ofc",
+        &format!("{BASE}
+    open_file_cache max=64 inactive=10s;
+    open_file_cache_valid 5s;
+    server {{ listen {{PORT}}; root {{ROOT}}; }}
+}}"),
+        &[("a.txt", b"first")],
+    );
+
+    // Prime the cache, then serve from it repeatedly.
+    for _ in 0..3 {
+        let r = s.get("/a.txt");
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body_str(), "first");
+    }
+
+    // Replace the file ATOMICALLY (rename), the way deploys actually ship
+    // content. The cached descriptor still refers to the old inode, so within
+    // the validity window the old content is served intact — nginx's
+    // documented behaviour. (An in-place truncate-and-write would be visible
+    // through the cached fd on both servers; that hazard is why atomic
+    // replace is the deploy idiom in the first place.)
+    let tmp = s.dir.join("html/.a.txt.new");
+    std::fs::write(&tmp, b"second!").unwrap();
+    std::fs::rename(&tmp, s.dir.join("html/a.txt")).unwrap();
+    let r = s.get("/a.txt");
+    assert_eq!(r.body_str(), "first", "cache must serve the stale entry within valid");
+}
+
+#[test]
+fn without_open_file_cache_changes_appear_immediately() {
+    let s = Server::start(
+        "noofc",
+        &format!("{BASE}
+    server {{ listen {{PORT}}; root {{ROOT}}; }}
+}}"),
+        &[("b.txt", b"one")],
+    );
+    assert_eq!(s.get("/b.txt").body_str(), "one");
+    std::fs::write(s.dir.join("html/b.txt"), b"two!").unwrap();
+    assert_eq!(s.get("/b.txt").body_str(), "two!");
+}
+
+#[test]
+fn open_file_cache_missing_file_still_404s_and_appears_when_created() {
+    // errors off (the default): misses are not cached.
+    let s = Server::start(
+        "ofcmiss",
+        &format!("{BASE}
+    open_file_cache max=64 inactive=10s;
+    server {{ listen {{PORT}}; root {{ROOT}}; }}
+}}"),
+        &[],
+    );
+    assert_eq!(s.get("/late.txt").status, 404);
+    std::fs::write(s.dir.join("html/late.txt"), b"now").unwrap();
+    let r = s.get("/late.txt");
+    assert_eq!(r.status, 200, "with errors off, a created file must appear immediately");
+    assert_eq!(r.body_str(), "now");
+}

@@ -226,6 +226,7 @@ pub fn default_core() -> CoreConf {
         limit_rate_after: 0,
         satisfy_any: false,
         internal: false,
+        open_file_cache: OpenFileCache::default(),
     }
 }
 
@@ -272,6 +273,12 @@ struct CoreLayer {
     limit_rate: Option<u64>,
     limit_rate_after: Option<u64>,
     internal: Option<bool>,
+    // The four open_file_cache directives inherit independently, exactly like
+    // any other scalar; the struct is assembled at resolve time.
+    ofc: Option<OpenFileCache>,
+    ofc_valid: Option<Duration>,
+    ofc_min_uses: Option<u32>,
+    ofc_errors: Option<bool>,
     // proxy_* are accumulated rather than replaced, matching nginx's
     // per-directive inheritance for proxy_set_header et al.
     proxy_connect_timeout: Option<Duration>,
@@ -340,6 +347,23 @@ impl CoreLayer {
         }
         if let Some(v) = &self.add_headers {
             c.add_headers = Arc::new(v.clone());
+        }
+
+        if let Some(v) = self.ofc {
+            // `open_file_cache` sets enabled/max/inactive; the companion
+            // directives refine it, whichever order they appear in.
+            c.open_file_cache.enabled = v.enabled;
+            c.open_file_cache.max = v.max;
+            c.open_file_cache.inactive = v.inactive;
+        }
+        if let Some(v) = self.ofc_valid {
+            c.open_file_cache.valid = v;
+        }
+        if let Some(v) = self.ofc_min_uses {
+            c.open_file_cache.min_uses = v;
+        }
+        if let Some(v) = self.ofc_errors {
+            c.open_file_cache.errors = v;
         }
 
         let g = &mut c.gzip;
@@ -435,7 +459,6 @@ const KNOWN_UNIMPLEMENTED: &[&str] = &[
     "dav_methods", "mp4", "flv", "xslt_stylesheet", "image_filter",
     "stub_status", "perl", "js_content",
     "geo", "split_clients", "referer_hash_bucket_size",
-    "open_file_cache", "open_file_cache_valid", "open_file_cache_min_uses",
     "proxy_cache", "proxy_cache_path", "proxy_cache_valid", "proxy_cache_key",
 ];
 
@@ -1165,6 +1188,39 @@ impl Builder {
             "limit_rate" => c.limit_rate = Some(size_arg(d, 0)?),
             "limit_rate_after" => c.limit_rate_after = Some(size_arg(d, 0)?),
             "internal" => c.internal = Some(true),
+            "open_file_cache" => {
+                want_args_range(d, 1, 3)?;
+                if d.args[0] == "off" {
+                    c.ofc = Some(OpenFileCache { enabled: false, ..OpenFileCache::default() });
+                } else {
+                    let mut ofc = OpenFileCache { enabled: true, ..OpenFileCache::default() };
+                    for a in &d.args {
+                        if let Some(v) = a.strip_prefix("max=") {
+                            ofc.max = v.parse().map_err(|_| BuildError {
+                                msg: format!("invalid \"max\" value \"{v}\" in \"open_file_cache\""),
+                                loc: d.loc(),
+                            })?;
+                        } else if let Some(v) = a.strip_prefix("inactive=") {
+                            ofc.inactive = parse_time(v).ok_or_else(|| BuildError {
+                                msg: format!("invalid \"inactive\" value \"{v}\" in \"open_file_cache\""),
+                                loc: d.loc(),
+                            })?;
+                        } else {
+                            bail!(d, "invalid parameter \"{a}\" in \"open_file_cache\"");
+                        }
+                    }
+                    if ofc.max == 0 {
+                        bail!(d, "\"open_file_cache\" requires a non-zero \"max\" parameter");
+                    }
+                    c.ofc = Some(ofc);
+                }
+            }
+            "open_file_cache_valid" => c.ofc_valid = Some(time_arg(d, 0)?),
+            "open_file_cache_min_uses" => {
+                want_args(d, 1)?;
+                c.ofc_min_uses = d.args[0].parse().ok();
+            }
+            "open_file_cache_errors" => c.ofc_errors = Some(flag(d)?),
             "output_buffers" => {
                 want_args(d, 2)?;
                 c.output_buffers = Some((d.args[0].parse().unwrap_or(2), size_arg(d, 1)? as usize));
@@ -1785,6 +1841,34 @@ mod tests {
     fn bad_regex_gives_a_useful_error() {
         let e = build(&format!("{MIN} location ~ \"(?=foo)\" {{ }} }} }}")).unwrap_err();
         assert!(e.msg.contains("lookahead"), "{}", e.msg);
+    }
+
+    #[test]
+    fn open_file_cache_parses() {
+        let c = build(
+            "events {} http { open_file_cache max=500 inactive=20s; \
+             open_file_cache_valid 30s; open_file_cache_min_uses 2; \
+             open_file_cache_errors on; server { listen 80; } }",
+        )
+        .unwrap();
+        let ofc = &c.http.unwrap().servers[0].core.open_file_cache;
+        assert!(ofc.enabled);
+        assert_eq!(ofc.max, 500);
+        assert_eq!(ofc.inactive, Duration::from_secs(20));
+        assert_eq!(ofc.valid, Duration::from_secs(30));
+        assert_eq!(ofc.min_uses, 2);
+        assert!(ofc.errors);
+        // And it is no longer reported as unimplemented.
+        assert!(c.unsupported.is_empty(), "{:?}", c.unsupported);
+    }
+
+    #[test]
+    fn open_file_cache_off_and_bad_max_rejected() {
+        let c = build("events {} http { open_file_cache off; server { listen 80; } }").unwrap();
+        assert!(!c.http.unwrap().servers[0].core.open_file_cache.enabled);
+        let e = build("events {} http { open_file_cache inactive=20s; server { listen 80; } }")
+            .unwrap_err();
+        assert!(e.msg.contains("max"), "{}", e.msg);
     }
 
     #[test]
