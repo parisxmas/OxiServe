@@ -1275,3 +1275,152 @@ fn weighted_round_robin_splits_traffic() {
         "weight 3 should take far more: heavy={} light={}", heavy.hits(), light.hits()
     );
 }
+
+// ---- OxiDB UDP log sink ---------------------------------------------------
+
+/// Decodes the MessagePack subset the log sink emits, so the test asserts on
+/// real decoded fields rather than on a byte blob we produced ourselves.
+fn decode_msgpack_map(b: &[u8]) -> Vec<(String, String)> {
+    fn read_str(b: &[u8], i: &mut usize) -> String {
+        let n = match b[*i] {
+            v if v & 0xe0 == 0xa0 => { *i += 1; (v & 0x1f) as usize }
+            0xd9 => { let n = b[*i + 1] as usize; *i += 2; n }
+            0xda => { let n = u16::from_be_bytes([b[*i + 1], b[*i + 2]]) as usize; *i += 3; n }
+            other => panic!("not a string header: {other:#04x}"),
+        };
+        let s = String::from_utf8_lossy(&b[*i..*i + n]).into_owned();
+        *i += n;
+        s
+    }
+    fn read_val(b: &[u8], i: &mut usize) -> String {
+        match b[*i] {
+            v if v & 0x80 == 0 => { *i += 1; v.to_string() }          // positive fixint
+            v if v & 0xe0 == 0xa0 || v == 0xd9 || v == 0xda => read_str(b, i),
+            0xcc => { let v = b[*i + 1]; *i += 2; v.to_string() }
+            0xcd => { let v = u16::from_be_bytes([b[*i + 1], b[*i + 2]]); *i += 3; v.to_string() }
+            0xce => { let v = u32::from_be_bytes(b[*i+1..*i+5].try_into().unwrap()); *i += 5; v.to_string() }
+            0xcf => { let v = u64::from_be_bytes(b[*i+1..*i+9].try_into().unwrap()); *i += 9; v.to_string() }
+            0xcb => { let v = f64::from_be_bytes(b[*i+1..*i+9].try_into().unwrap()); *i += 9; format!("{v}") }
+            other => panic!("unexpected value header: {other:#04x}"),
+        }
+    }
+
+    let mut i = 0;
+    let n = match b[i] {
+        v if v & 0xf0 == 0x80 => { i += 1; (v & 0x0f) as usize }
+        0xde => { let n = u16::from_be_bytes([b[1], b[2]]) as usize; i = 3; n }
+        other => panic!("not a map header: {other:#04x}"),
+    };
+    (0..n).map(|_| (read_str(b, &mut i), read_val(b, &mut i))).collect()
+}
+
+#[test]
+fn access_log_sends_messagepack_to_oxidb_over_udp() {
+    let sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    sink.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let sink_addr = sink.local_addr().unwrap();
+
+    let s = Server::start(
+        "oxidblog",
+        &format!("
+worker_processes 1;
+error_log {{DIR}}/error.log crit;
+events {{ worker_connections 64; }}
+http {{
+    log_format structured '$remote_addr $request_method $uri $status $body_bytes_sent $http_user_agent';
+    access_log oxidb:server={sink_addr},db=telemetry main_placeholder;
+    server {{ listen {{PORT}}; root {{ROOT}}; location / {{ return 200 \"hello\"; }} }}
+}}").replace("main_placeholder", "structured"),
+        &[],
+    );
+
+    let r = s.raw("GET /some/path HTTP/1.1\r\nHost: x\r\nUser-Agent: probe/1\r\nConnection: close\r\n\r\n");
+    assert_eq!(r.status, 200);
+
+    let mut buf = [0u8; 65535];
+    let (n, _) = sink.recv_from(&mut buf).expect("a log datagram must arrive");
+    let fields = decode_msgpack_map(&buf[..n]);
+    let get = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+
+    // Field names match what the log_format wrote.
+    // `db` is the field OxiDB's ingest actually routes on.
+    assert_eq!(get("db"), Some("telemetry"), "db must be the routing field");
+    assert_eq!(get("request_method"), Some("GET"));
+    assert_eq!(get("uri"), Some("/some/path"));
+    assert_eq!(get("http_user_agent"), Some("probe/1"));
+    assert_eq!(get("remote_addr"), Some("127.0.0.1"));
+    // Numeric fields are encoded as numbers so OxiDB can range-query them.
+    assert_eq!(get("status"), Some("200"));
+    assert_eq!(get("body_bytes_sent"), Some("5"));
+}
+
+#[test]
+fn oxidb_log_sink_does_not_stall_when_nothing_listens() {
+    // The whole point of fire-and-forget: an absent collector must not slow a
+    // request down, let alone fail it.
+    let dead_port = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+    let s = Server::start(
+        "oxidbdead",
+        &format!("
+worker_processes 1;
+error_log {{DIR}}/error.log crit;
+events {{ worker_connections 64; }}
+http {{
+    log_format f '$status $uri';
+    access_log oxidb:server=127.0.0.1:{dead_port} f;
+    server {{ listen {{PORT}}; root {{ROOT}}; location / {{ return 200 \"ok\"; }} }}
+}}"),
+        &[],
+    );
+
+    let t = Instant::now();
+    for _ in 0..20 {
+        assert_eq!(s.get("/").status, 200, "requests must still succeed");
+    }
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "logging to a dead collector must not slow requests: took {:?}", t.elapsed()
+    );
+}
+
+#[test]
+fn oxidb_and_file_sinks_can_run_together() {
+    let sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    sink.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let addr = sink.local_addr().unwrap();
+
+    let s = Server::start(
+        "bothsinks",
+        &format!("
+worker_processes 1;
+error_log {{DIR}}/error.log crit;
+events {{ worker_connections 64; }}
+http {{
+    log_format f '$status $uri';
+    access_log {{DIR}}/access.log f;
+    access_log oxidb:server={addr} f;
+    server {{ listen {{PORT}}; root {{ROOT}}; location / {{ return 200 \"ok\"; }} }}
+}}"),
+        &[],
+    );
+
+    assert_eq!(s.get("/both").status, 200);
+
+    let mut buf = [0u8; 65535];
+    let (n, _) = sink.recv_from(&mut buf).expect("udp record");
+    let fields = decode_msgpack_map(&buf[..n]);
+    assert!(fields.iter().any(|(k, v)| k == "uri" && v == "/both"));
+
+    // And the file sink still got its line.
+    let path = s.dir.join("access.log");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(c) = std::fs::read_to_string(&path) {
+            if c.contains("/both") {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("file sink must still receive its line");
+}

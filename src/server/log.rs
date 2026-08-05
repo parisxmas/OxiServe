@@ -10,7 +10,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::config::model::{AccessLogConf, ErrorLogConf, LogLevel};
+use crate::config::model::{AccessLogConf, ErrorLogConf, LogLevel, LogSink};
 
 struct Sink {
     file: File,
@@ -66,8 +66,40 @@ impl Sink {
     }
 }
 
+/// Fire-and-forget UDP sink for OxiDB's MessagePack ingest.
+///
+/// `send_to` on a connectionless socket hands the datagram to the kernel and
+/// returns; there is no handshake, no ack, and no retry. A collector that is
+/// down or slow therefore cannot slow a request down — the packet is simply
+/// lost, which is the right trade for access logs and is what ADR-0002 means
+/// by keeping the store off the request path.
+struct UdpSink {
+    socket: std::net::UdpSocket,
+    addr: String,
+    /// Datagrams the kernel refused, so the loss is visible rather than silent.
+    dropped: u64,
+}
+
+impl UdpSink {
+    fn new(addr: &str) -> std::io::Result<UdpSink> {
+        // Bind to an ephemeral port on the matching family.
+        let bind: &str = if addr.starts_with('[') { "[::]:0" } else { "0.0.0.0:0" };
+        let socket = std::net::UdpSocket::bind(bind)?;
+        // Never block a worker: a full send buffer drops the record instead.
+        socket.set_nonblocking(true)?;
+        Ok(UdpSink { socket, addr: addr.to_string(), dropped: 0 })
+    }
+
+    fn send(&mut self, payload: &[u8]) {
+        if self.socket.send_to(payload, &self.addr).is_err() {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+}
+
 pub struct Logs {
     access: HashMap<PathBuf, Sink>,
+    udp: HashMap<String, UdpSink>,
     error: Option<Sink>,
     error_level: LogLevel,
     error_to_stderr: bool,
@@ -97,6 +129,7 @@ impl Logs {
         let error_to_stderr = !err.disabled && sink.is_none();
         Logs {
             access: HashMap::new(),
+            udp: HashMap::new(),
             error: sink,
             error_level: err.level,
             error_to_stderr,
@@ -108,24 +141,55 @@ impl Logs {
     /// does not pay for an open (and so a bad path fails at startup).
     pub fn open_access(&mut self, confs: &[AccessLogConf]) {
         for c in confs {
-            if self.access.contains_key(&c.path) {
-                continue;
-            }
-            match Sink::open(&c.path, c.buffer, c.flush) {
-                Ok(s) => {
-                    self.access.insert(c.path.clone(), s);
+            match &c.sink {
+                LogSink::File(path) => {
+                    if self.access.contains_key(path) {
+                        continue;
+                    }
+                    match Sink::open(path, c.buffer, c.flush) {
+                        Ok(s) => {
+                            self.access.insert(path.clone(), s);
+                        }
+                        Err(e) => {
+                            eprintln!("oxiserve: cannot open access log {}: {e}", path.display());
+                        }
+                    }
                 }
-                Err(e) => {
-                    eprintln!("oxiserve: cannot open access log {}: {e}", c.path.display());
+                LogSink::OxiDb { addr, .. } => {
+                    if self.udp.contains_key(&**addr) {
+                        continue;
+                    }
+                    match UdpSink::new(addr) {
+                        Ok(s) => {
+                            self.udp.insert(addr.to_string(), s);
+                        }
+                        Err(e) => {
+                            eprintln!("oxiserve: cannot open oxidb log socket {addr}: {e}");
+                        }
+                    }
                 }
             }
         }
     }
 
     pub fn access(&mut self, conf: &AccessLogConf, line: &str) {
-        if let Some(s) = self.access.get_mut(&conf.path) {
-            s.write_line(line.as_bytes());
+        if let LogSink::File(path) = &conf.sink {
+            if let Some(s) = self.access.get_mut(path) {
+                s.write_line(line.as_bytes());
+            }
         }
+    }
+
+    /// Sends an already-encoded MessagePack record to an OxiDB sink.
+    pub fn access_oxidb(&mut self, addr: &str, payload: &[u8]) {
+        if let Some(s) = self.udp.get_mut(addr) {
+            s.send(payload);
+        }
+    }
+
+    /// Datagrams dropped for a sink. Test and introspection hook.
+    pub fn dropped(&self, addr: &str) -> u64 {
+        self.udp.get(addr).map(|s| s.dropped).unwrap_or(0)
     }
 
     pub fn scratch(&mut self) -> &mut String {

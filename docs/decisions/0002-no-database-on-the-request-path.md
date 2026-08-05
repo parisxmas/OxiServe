@@ -68,7 +68,10 @@ This is where OxiDB earns its place, doing things a single process cannot:
 - **Cache metadata durability**, so a restart does not throw away a warm
   on-disk cache.
 - **Access log sink and analytics**, which is OxiDB playing to its strengths:
-  aggregation, full-text, time series.
+  aggregation, full-text, time series. **Implemented in v0.2.5** as
+  `access_log oxidb:server=…` — MessagePack over UDP, fire-and-forget, so the
+  request path hands a datagram to the kernel and never waits. This is the
+  shape Layer 2 work should take.
 
 ## Consequences
 

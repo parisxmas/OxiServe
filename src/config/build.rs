@@ -729,7 +729,7 @@ impl Builder {
         let http_error_pages = level.error_pages.clone().unwrap_or_default();
         let http_access_logs = level.access_logs.clone().unwrap_or_else(|| {
             vec![AccessLogConf {
-                path: self.abs("logs/access.log"),
+                sink: LogSink::File(self.abs("logs/access.log")),
                 format: self.log_formats["combined"].clone(),
                 buffer: 0,
                 flush: None,
@@ -1486,6 +1486,36 @@ impl Builder {
                     logs.clear();
                     return Ok(true);
                 }
+                // `oxidb:server=HOST:PORT[,collection=NAME]` selects the UDP
+                // sink; anything else is a file path, as in nginx.
+                let sink = match d.args[0].strip_prefix("oxidb:") {
+                    Some(params) => {
+                        let mut addr: Option<Arc<str>> = None;
+                        let mut db_name: Option<Arc<str>> = None;
+                        for p in params.split(',') {
+                            if let Some(v) = p.strip_prefix("server=") {
+                                if v.is_empty() {
+                                    bail!(d, "empty \"server=\" in \"access_log oxidb:\"");
+                                }
+                                // A bare host takes OxiDB's MessagePack port.
+                                addr = Some(if v.contains(':') {
+                                    Arc::from(v)
+                                } else {
+                                    Arc::from(format!("{v}:12202").as_str())
+                                });
+                            } else if let Some(v) = p.strip_prefix("db=") {
+                                db_name = Some(Arc::from(v));
+                            } else {
+                                bail!(d, "invalid parameter \"{p}\" in \"access_log oxidb:\"");
+                            }
+                        }
+                        match addr {
+                            Some(a) => LogSink::OxiDb { addr: a, db: db_name },
+                            None => bail!(d, "\"access_log oxidb:\" requires \"server=\""),
+                        }
+                    }
+                    None => LogSink::File(self.abs(&d.args[0])),
+                };
                 let fmt_name = d.arg(1).unwrap_or("combined");
                 let format = self.log_formats.get(fmt_name).cloned().ok_or_else(|| BuildError {
                     msg: format!("unknown log format \"{fmt_name}\""),
@@ -1500,7 +1530,7 @@ impl Builder {
                         flush = parse_time(v);
                     }
                 }
-                logs.push(AccessLogConf { path: self.abs(&d.args[0]), format, buffer, flush });
+                logs.push(AccessLogConf { sink, format, buffer, flush });
             }
             "error_page" => {
                 want_args_range(d, 2, 32)?;

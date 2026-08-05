@@ -103,7 +103,19 @@ Health is shared across workers; the pool is per worker.
 sharing a listener.
 
 **Logging** — `log_format` with the full variable set, `access_log` with
-`buffer=` / `flush=`, `error_log` with levels.
+`buffer=` / `flush=`, `error_log` with levels, and a structured sink into
+OxiDB:
+
+```nginx
+log_format structured '$remote_addr $request_method $uri $status $body_bytes_sent $request_time';
+access_log oxidb:server=127.0.0.1:12202[,db=tenant] structured;
+```
+
+Each `$variable` in the format becomes a field in a MessagePack document sent
+fire-and-forget over UDP to OxiDB's ingest listener — so records arrive
+queryable rather than as lines to re-parse, and `$status` / `$body_bytes_sent`
+arrive as numbers so they can be range-queried. A collector that is down or
+slow cannot stall a request ([ADR-0002](docs/decisions/0002-no-database-on-the-request-path.md)).
 
 **Variables** — ~50 including `$uri`, `$args`, `$arg_*`, `$http_*`, `$sent_http_*`,
 `$cookie_*`, `$upstream_*`, `$proxy_add_x_forwarded_for`,

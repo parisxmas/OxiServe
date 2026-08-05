@@ -91,14 +91,49 @@ impl Default for ErrorLogConf {
     }
 }
 
+/// Where an `access_log` writes.
+///
+/// nginx uses a prefix on the path for non-file destinations
+/// (`access_log syslog:server=...`); `oxidb:` follows that convention.
+#[derive(Debug, Clone)]
+pub enum LogSink {
+    File(PathBuf),
+    /// `access_log oxidb:server=127.0.0.1:12202[,db=name] fmt;`
+    ///
+    /// Fire-and-forget MessagePack over UDP into OxiDB's ingest listener.
+    /// Per ADR-0002 this is off the request path in the sense that matters:
+    /// a datagram is handed to the kernel and never waited on, so a slow or
+    /// absent collector cannot stall a request.
+    ///
+    /// `db=` sets the `db` field OxiDB's MessagePack ingest routes on, picking
+    /// the target database in a multi-tenant setup. The *collection* is fixed
+    /// server-side (`OXIDB_MSGPACK_COLLECTION`, default `_msgpack_logs`) and
+    /// cannot be chosen by the sender — an earlier `collection=` parameter
+    /// here was a guess that would have silently done nothing.
+    OxiDb {
+        addr: Arc<str>,
+        db: Option<Arc<str>>,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct AccessLogConf {
-    pub path: PathBuf,
+    pub sink: LogSink,
     pub format: Arc<Template>,
     /// Bytes of in-memory buffering before a flush; `buffer=` in nginx.
     pub buffer: usize,
     /// `flush=` — maximum time a buffered line may sit unwritten.
     pub flush: Option<Duration>,
+}
+
+impl AccessLogConf {
+    /// Key identifying the destination, for de-duplicating open sinks.
+    pub fn key(&self) -> String {
+        match &self.sink {
+            LogSink::File(p) => p.to_string_lossy().into_owned(),
+            LogSink::OxiDb { addr, .. } => format!("oxidb:{addr}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

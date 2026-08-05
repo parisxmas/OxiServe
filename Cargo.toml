@@ -1,6 +1,6 @@
 [package]
 name = "oxiserve"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 rust-version = "1.80"
 description = "A high-performance, nginx-config-compatible web server written in Rust"

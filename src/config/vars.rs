@@ -144,6 +144,69 @@ impl Var {
     }
 }
 
+impl Var {
+    /// The field name this variable becomes in a structured log record.
+    ///
+    /// Mirrors the name written in the config (`$remote_addr` → `remote_addr`)
+    /// so a `log_format` and the resulting OxiDB documents line up.
+    pub fn field_name(&self) -> String {
+        let fixed = match self {
+            Var::Uri => "uri",
+            Var::DocumentUri => "document_uri",
+            Var::RequestUri => "request_uri",
+            Var::Args => "args",
+            Var::IsArgs => "is_args",
+            Var::Host => "host",
+            Var::Hostname => "hostname",
+            Var::Scheme => "scheme",
+            Var::RequestMethod => "request_method",
+            Var::Request => "request",
+            Var::ServerProtocol => "server_protocol",
+            Var::ServerName => "server_name",
+            Var::ServerPort => "server_port",
+            Var::ServerAddr => "server_addr",
+            Var::RemoteAddr => "remote_addr",
+            Var::BinaryRemoteAddr => "binary_remote_addr",
+            Var::RemotePort => "remote_port",
+            Var::RemoteUser => "remote_user",
+            Var::Status => "status",
+            Var::BodyBytesSent => "body_bytes_sent",
+            Var::BytesSent => "bytes_sent",
+            Var::RequestLength => "request_length",
+            Var::RequestTime => "request_time",
+            Var::Msec => "msec",
+            Var::TimeLocal => "time_local",
+            Var::TimeIso8601 => "time_iso8601",
+            Var::DocumentRoot => "document_root",
+            Var::RequestFilename => "request_filename",
+            Var::ContentType => "content_type",
+            Var::ContentLength => "content_length",
+            Var::Connection => "connection",
+            Var::ConnectionRequests => "connection_requests",
+            Var::Pid => "pid",
+            Var::NginxVersion => "nginx_version",
+            Var::FastcgiScriptName => "fastcgi_script_name",
+            Var::FastcgiPathInfo => "fastcgi_path_info",
+            Var::Https => "https",
+            Var::ProxyHost => "proxy_host",
+            Var::ProxyPort => "proxy_port",
+            Var::ProxyAddXForwardedFor => "proxy_add_x_forwarded_for",
+            Var::UpstreamAddr => "upstream_addr",
+            Var::UpstreamStatus => "upstream_status",
+            Var::UpstreamResponseTime => "upstream_response_time",
+            Var::UpstreamConnectTime => "upstream_connect_time",
+            // The dynamic ones rebuild the name they were written with.
+            Var::Http(h) => return format!("http_{}", h.replace('-', "_")),
+            Var::SentHttp(h) => return format!("sent_http_{}", h.replace('-', "_")),
+            Var::Arg(a) => return format!("arg_{a}"),
+            Var::Cookie(c) => return format!("cookie_{c}"),
+            Var::Capture(i) => return format!("capture_{i}"),
+            Var::User(u) => return u.to_string(),
+        };
+        fixed.to_string()
+    }
+}
+
 fn header_name(s: &str) -> Arc<str> {
     let mut n = String::with_capacity(s.len());
     for c in s.chars() {
@@ -350,6 +413,19 @@ mod tests {
     #[test]
     fn regex_captures() {
         assert_eq!(Template::compile("/a/$1").render(&Fixed), "/a/cap1");
+    }
+
+    #[test]
+    fn field_names_match_what_the_config_wrote() {
+        assert_eq!(Var::parse("remote_addr").field_name(), "remote_addr");
+        assert_eq!(Var::parse("status").field_name(), "status");
+        // Header names are stored lowercased with dashes; the field name goes
+        // back to the underscore form the config used.
+        assert_eq!(Var::parse("http_user_agent").field_name(), "http_user_agent");
+        assert_eq!(Var::parse("http_x_forwarded_for").field_name(), "http_x_forwarded_for");
+        assert_eq!(Var::parse("arg_q").field_name(), "arg_q");
+        assert_eq!(Var::parse("cookie_sid").field_name(), "cookie_sid");
+        assert_eq!(Var::parse("my_var").field_name(), "my_var");
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub mod files;
 pub mod handler;
 pub mod limit_req;
 pub mod log;
+pub mod msgpack;
 pub mod proxy;
 pub mod reply;
 pub mod transport;

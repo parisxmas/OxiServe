@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::ctx::{Ctx, LogVars};
+use crate::config::vars::VarSource;
 use super::handler;
 use super::log::Logs;
 use super::reply::{Body, Reply};
@@ -826,6 +827,38 @@ where
     sock.flush().await
 }
 
+/// Encodes one access-log record as a MessagePack map.
+///
+/// The `log_format` supplies the field set: each `$variable` in it becomes a
+/// key, and the literal text between them is dropped. That gives OxiDB a
+/// structured document to query rather than a line to re-parse, while still
+/// letting the operator choose the fields with the directive they already know.
+fn encode_record(
+    out: &mut Vec<u8>,
+    format: &crate::config::vars::Template,
+    vars: &LogVars<'_, '_>,
+    db: Option<&str>,
+) {
+    use crate::server::msgpack as mp;
+    let n = format.vars().count() + usize::from(db.is_some());
+    mp::map_header(out, n);
+
+    if let Some(name) = db {
+        // OxiDB's MessagePack writer routes a record to a tenant database on
+        // exactly this field name; anything else is stored as ordinary data.
+        mp::write_str(out, "db");
+        mp::write_str(out, name);
+    }
+
+    let mut value = String::with_capacity(64);
+    for v in format.vars() {
+        mp::write_str(out, &v.field_name());
+        value.clear();
+        vars.var(v, &mut value);
+        mp::write_auto(out, &value);
+    }
+}
+
 fn log_request(
     logs: &Rc<RefCell<Logs>>,
     ctx: &Ctx<'_>,
@@ -841,10 +874,20 @@ fn log_request(
     }
     let vars = LogVars { ctx, resp, status, body_bytes, total_bytes };
     let mut logs = logs.borrow_mut();
+    let mut record = Vec::new();
     for c in confs {
-        let mut line = String::with_capacity(256);
-        c.format.render_into(&vars, &mut line);
-        logs.access(c, &line);
+        match &c.sink {
+            crate::config::model::LogSink::File(_) => {
+                let mut line = String::with_capacity(256);
+                c.format.render_into(&vars, &mut line);
+                logs.access(c, &line);
+            }
+            crate::config::model::LogSink::OxiDb { addr, db } => {
+                record.clear();
+                encode_record(&mut record, &c.format, &vars, db.as_deref());
+                logs.access_oxidb(addr, &record);
+            }
+        }
     }
 }
 
