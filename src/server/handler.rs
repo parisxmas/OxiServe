@@ -179,14 +179,19 @@ async fn route(ctx: &mut Ctx<'_>, internal: bool) -> Step {
         // No location at all: fall back to the server's own action or static.
         return match &ctx.server.action {
             Action::Return { status, body } => Step::Done(return_reply(ctx, *status, body.clone())),
-            _ => match files::serve(ctx, None).await {
-                Ok(r) => Step::Done(r),
-                Err(c) => Step::Fail(c),
-            },
+            _ => served_to_step(files::serve(ctx, None).await),
         };
     };
 
     dispatch(ctx, &loc, internal).await
+}
+
+fn served_to_step(s: files::Served) -> Step {
+    match s {
+        files::Served::Reply(r) => Step::Done(r),
+        files::Served::Internal(uri) => Step::Internal(uri),
+        files::Served::Status(c) => Step::Fail(c),
+    }
 }
 
 fn owned_captures(c: &regex::Captures<'_>) -> Vec<String> {
@@ -238,10 +243,7 @@ async fn dispatch(ctx: &mut Ctx<'_>, loc: &Arc<Location>, internal: bool) -> Ste
             Ok(r) => Step::Done(r),
             Err(c) => Step::Fail(c),
         },
-        Action::Static => match files::serve(ctx, Some(loc)).await {
-            Ok(r) => Step::Done(r),
-            Err(c) => Step::Fail(c),
-        },
+        Action::Static => served_to_step(files::serve(ctx, Some(loc)).await),
     }
 }
 

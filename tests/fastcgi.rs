@@ -535,3 +535,51 @@ fn serve_fcgi_unix(
     let _ = s.write_all(&resp);
     let _ = s.flush();
 }
+
+#[test]
+fn index_reaches_the_php_handler_instead_of_leaking_source() {
+    // The regression this pins: nginx treats an `index` match as an internal
+    // redirect, so location selection runs again and `/` lands on the PHP
+    // handler. Serving the index file in place instead would send the client
+    // raw PHP source — which is what happened on the first WordPress attempt.
+    let (fp, rx) = start_fcgi(|_| b"Content-Type: text/html\r\n\r\n<h1>rendered</h1>".to_vec());
+    let s = Server::start(
+        "indexphp",
+        &format!("
+worker_processes 1;
+error_log {{DIR}}/error.log crit;
+events {{ worker_connections 64; }}
+http {{
+    access_log off;
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        index index.php;
+        location / {{ try_files $uri $uri/ /index.php?$args; }}
+        location ~ \\.php$ {{
+            fastcgi_pass 127.0.0.1:{fp};
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            fastcgi_param SCRIPT_NAME     $fastcgi_script_name;
+            fastcgi_param QUERY_STRING    $query_string;
+            fastcgi_param REQUEST_METHOD  $request_method;
+            fastcgi_param CONTENT_TYPE    $content_type;
+            fastcgi_param CONTENT_LENGTH  $content_length;
+        }}
+    }}
+}}"),
+        // A real index.php on disk, with recognisable source in it.
+        &[("index.php", b"<?php $secret = 'DB_PASSWORD'; echo 'hi';")],
+    );
+
+    let (status, _, body) = s.get("/");
+    assert_eq!(status, 200);
+    assert_eq!(body, "<h1>rendered</h1>", "index must be executed, not served");
+    assert!(
+        !body.contains("<?php") && !body.contains("DB_PASSWORD"),
+        "PHP source leaked to the client: {body}"
+    );
+    // And the handler really did receive it as a script.
+    let params = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let script = params.iter().find(|(n, _)| n == "SCRIPT_NAME").map(|(_, v)| v.as_str());
+    assert_eq!(script, Some("/index.php"));
+}

@@ -64,11 +64,18 @@ pub fn map_path(ctx: &Ctx, core: &CoreConf, matcher: Option<&LocMatch>) -> Strin
     p
 }
 
+/// What the static handler decided.
+pub enum Served {
+    Reply(Reply),
+    /// An `index` match must re-enter location selection rather than be served
+    /// in place — see [`serve_directory`].
+    Internal(String),
+    /// A status the caller should turn into an error page (404, 403, 405, …).
+    Status(u16),
+}
+
 /// Serves a file or directory for the matched location.
-///
-/// Returns `Err(status)` for anything the caller should turn into an error
-/// page (404, 403, 405, …).
-pub async fn serve(ctx: &mut Ctx<'_>, loc: Option<&Arc<Location>>) -> Result<Reply, u16> {
+pub async fn serve(ctx: &mut Ctx<'_>, loc: Option<&Arc<Location>>) -> Served {
     let core = loc.map(|l| &l.core).unwrap_or(&ctx.server.core);
     let matcher = loc.map(|l| &l.matcher);
 
@@ -84,29 +91,37 @@ pub async fn serve(ctx: &mut Ctx<'_>, loc: Option<&Arc<Location>>) -> Result<Rep
     // The single filesystem touch point: one open+fstat on a miss, zero
     // syscalls on an open_file_cache hit.
     match fcache::lookup(&path, &core.open_file_cache) {
-        Cached::Error(status) => Err(status),
+        Cached::Error(status) => Served::Status(status),
         Cached::Dir => {
             // nginx redirects a directory request that lacks its trailing
             // slash, so relative links inside the index page resolve.
             if !ctx.uri.ends_with('/') {
-                return Ok(dir_redirect(ctx, core));
+                return Served::Reply(dir_redirect(ctx, core));
             }
             serve_directory(ctx, core, &path).await
         }
         Cached::File { file, size, mtime } => {
-            serve_file(ctx, core, &path, file, size, mtime).await
+            match serve_file(ctx, core, &path, file, size, mtime).await {
+                Ok(r) => Served::Reply(r),
+                Err(c) => Served::Status(c),
+            }
         }
     }
 }
 
-async fn serve_directory(ctx: &mut Ctx<'_>, core: &CoreConf, dir: &str) -> Result<Reply, u16> {
+/// Resolves `index` for a directory request.
+///
+/// A found index is returned as an **internal redirect**, not served in place.
+/// This matters: nginx re-runs location selection for the index URI, which is
+/// how `index index.php` reaches a `location ~ \.php$` handler. Serving the
+/// file directly would hand the client PHP source — the exact failure this
+/// distinction prevents.
+async fn serve_directory(ctx: &mut Ctx<'_>, core: &CoreConf, dir: &str) -> Served {
     for idx in core.index.iter() {
         let name = idx.render(&*ctx);
         if name.is_empty() {
             continue;
         }
-        // An absolute index is an internal redirect in nginx; we resolve it
-        // against the root instead, which is equivalent for the common case.
         let mut candidate = String::with_capacity(dir.len() + name.len() + 1);
         candidate.push_str(dir);
         if !candidate.ends_with('/') {
@@ -116,18 +131,24 @@ async fn serve_directory(ctx: &mut Ctx<'_>, core: &CoreConf, dir: &str) -> Resul
 
         // Index probes go through the cache too — with `errors on`, a missing
         // index.html is cached as a miss exactly as nginx does.
-        if let Cached::File { file, size, mtime } =
-            fcache::lookup(&candidate, &core.open_file_cache)
-        {
-            ctx.filename = candidate.clone();
-            return serve_file(ctx, core, &candidate, file, size, mtime).await;
+        if let Cached::File { .. } = fcache::lookup(&candidate, &core.open_file_cache) {
+            let mut uri = String::with_capacity(ctx.uri.len() + name.len());
+            uri.push_str(&ctx.uri);
+            if !uri.ends_with('/') {
+                uri.push('/');
+            }
+            uri.push_str(name.trim_start_matches('/'));
+            return Served::Internal(uri);
         }
     }
 
     if core.autoindex {
-        return super::autoindex::render(ctx, std::path::Path::new(dir)).await;
+        return match super::autoindex::render(ctx, std::path::Path::new(dir)).await {
+            Ok(r) => Served::Reply(r),
+            Err(c) => Served::Status(c),
+        };
     }
-    Err(403)
+    Served::Status(403)
 }
 
 fn dir_redirect(ctx: &Ctx, core: &CoreConf) -> Reply {
