@@ -296,6 +296,9 @@ struct CoreLayer {
     cache_min_uses: Option<u32>,
     cache_bypass: Option<Vec<Arc<Template>>>,
     cache_no_cache: Option<Vec<Arc<Template>>>,
+    cache_use_stale: Option<Vec<crate::server::cache::StaleWhen>>,
+    cache_lock: Option<bool>,
+    cache_lock_timeout: Option<Duration>,
     limit_reqs: Option<Vec<LimitReq>>,
     limit_req_status: Option<u16>,
     ofc_min_uses: Option<u32>,
@@ -407,6 +410,15 @@ impl CoreLayer {
         }
         if let Some(v) = &self.cache_no_cache {
             c.proxy_cache.no_cache = Arc::new(v.clone());
+        }
+        if let Some(v) = &self.cache_use_stale {
+            c.proxy_cache.use_stale = Arc::new(v.clone());
+        }
+        if let Some(v) = self.cache_lock {
+            c.proxy_cache.lock = v;
+        }
+        if let Some(v) = self.cache_lock_timeout {
+            c.proxy_cache.lock_timeout = v;
         }
 
         // `limit_req` follows the list rule: a level that declares any replaces
@@ -1439,9 +1451,26 @@ impl Builder {
                     d.args.iter().map(|a| Arc::new(Template::compile(a))).collect(),
                 );
             }
-            "proxy_cache_use_stale" | "proxy_cache_lock" | "proxy_cache_lock_timeout"
-            | "proxy_cache_background_update" | "proxy_cache_revalidate"
-            | "proxy_cache_convert_head" => {}
+            "proxy_cache_use_stale" => {
+                want_args_range(d, 1, 32)?;
+                let mut conds = Vec::new();
+                for a in &d.args {
+                    match crate::server::cache::StaleWhen::parse(a) {
+                        Some(c) => conds.push(c),
+                        // `off` disables the whole directive.
+                        None if a == "off" => {
+                            conds.clear();
+                            break;
+                        }
+                        None => bail!(d, "invalid condition \"{a}\" in \"proxy_cache_use_stale\""),
+                    }
+                }
+                c.cache_use_stale = Some(conds);
+            }
+            "proxy_cache_lock" => c.cache_lock = Some(flag(d)?),
+            "proxy_cache_lock_timeout" => c.cache_lock_timeout = Some(time_arg(d, 0)?),
+            "proxy_cache_lock_age" | "proxy_cache_background_update"
+            | "proxy_cache_revalidate" | "proxy_cache_convert_head" => {}
             "limit_req" => {
                 want_args_range(d, 1, 4)?;
                 let mut lr = LimitReq {

@@ -46,18 +46,58 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
     // Done before a connection is even considered: a hit must not cost an
     // upstream round trip, which is the entire point.
     let cache = cache_context(ctx, loc);
+    // An expired entry is kept in hand: `proxy_cache_use_stale` may let it
+    // answer if the refresh fails, which is the difference between a stale
+    // page and a 502.
+    let mut stale: Option<cache::Decoded> = None;
+    // Never read, and that is the point: this binding holds the fetch lock for
+    // the rest of the function and releases it on drop, whether the fetch
+    // succeeds, fails, or returns early. The leading underscore keeps the
+    // compiler quiet without shortening its life (a bare `_` would drop it
+    // immediately and silently disable the thundering-herd protection).
+    let mut _fetch_lock: Option<cache::FetchLock> = None;
+
     if let Some(cc) = &cache {
         if cc.bypassed {
             ctx.cache_status = Some(cache::CacheStatus::Bypass);
-        } else if let Some((entry, status)) = cache::load(&cc.zone, &cc.key, cc.hash) {
-            if status == cache::CacheStatus::Hit {
-                ctx.cache_status = Some(status);
-                return Ok(cached_reply(entry));
-            }
-            // Expired: fall through and revalidate by fetching again.
-            ctx.cache_status = Some(cache::CacheStatus::Expired);
         } else {
-            ctx.cache_status = Some(cache::CacheStatus::Miss);
+            match cache::load(&cc.zone, &cc.key, cc.hash) {
+                Some((entry, cache::CacheStatus::Hit)) => {
+                    ctx.cache_status = Some(cache::CacheStatus::Hit);
+                    return Ok(cached_reply(entry));
+                }
+                Some((entry, _)) => {
+                    ctx.cache_status = Some(cache::CacheStatus::Expired);
+                    stale = Some(entry);
+                }
+                None => ctx.cache_status = Some(cache::CacheStatus::Miss),
+            }
+
+            if cc.conf.lock {
+                match cache::try_lock(&cc.zone.name, cc.hash) {
+                    // We own the refresh.
+                    Some(l) => _fetch_lock = Some(l),
+                    None => {
+                        // Someone else is already fetching this key. With
+                        // `use_stale updating` we answer from the old copy
+                        // immediately rather than queueing — that is the whole
+                        // point of the combination.
+                        if let Some(entry) = stale.take() {
+                            if cache::stale_allowed(&cc.conf.use_stale, cache::StaleWhen::Updating) {
+                                ctx.cache_status = Some(cache::CacheStatus::Stale);
+                                return Ok(cached_reply(entry));
+                            }
+                            stale = Some(entry);
+                        }
+                        // Otherwise wait for the winner to populate the entry.
+                        if let Some(r) = wait_for_fetch(ctx, cc).await {
+                            return Ok(r);
+                        }
+                        // Timed out waiting: fetch it ourselves rather than
+                        // failing, accepting a duplicate upstream request.
+                    }
+                }
+            }
         }
     }
 
@@ -117,6 +157,10 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
                 // A refused or timed-out connection is exactly what passive
                 // health tracking exists to notice.
                 note_failure(chosen, ctx);
+                // An old copy beats an error page, when the config says so.
+                if let Some(r) = try_stale(ctx, &cache, &mut stale, cache::StaleWhen::Error) {
+                    return Ok(r);
+                }
                 return Err(502);
             }
         },
@@ -230,6 +274,12 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
                 if !(reused && buf.is_empty()) {
                     note_failure(chosen, ctx);
                 }
+                // A backend that accepts and then closes without answering is
+                // a common way for one to die, and it is an `error` for
+                // use_stale exactly like a refused connection.
+                if let Some(r) = try_stale(ctx, &cache, &mut stale, cache::StaleWhen::Error) {
+                    return Ok(r);
+                }
                 return Err(502);
             }
             Ok(Ok(n)) => n,
@@ -237,10 +287,16 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
                 if !(reused && buf.is_empty()) {
                     note_failure(chosen, ctx);
                 }
+                if let Some(r) = try_stale(ctx, &cache, &mut stale, cache::StaleWhen::Error) {
+                    return Ok(r);
+                }
                 return Err(502);
             }
             Err(_) => {
                 note_failure(chosen, ctx);
+                if let Some(r) = try_stale(ctx, &cache, &mut stale, cache::StaleWhen::Timeout) {
+                    return Ok(r);
+                }
                 return Err(504);
             }
         };
@@ -289,6 +345,11 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
             }
             Err(_) => {
                 note_failure(chosen, ctx);
+                if let Some(r) =
+                    try_stale(ctx, &cache, &mut stale, cache::StaleWhen::InvalidHeader)
+                {
+                    return Ok(r);
+                }
                 return Err(502);
             }
         }
@@ -305,6 +366,14 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
         u.health[i].record_success();
     }
     ctx.upstream_status = status;
+
+    // `proxy_cache_use_stale http_5xx` — a working backend returning an error
+    // is still a reason to prefer the last good copy.
+    if status >= 400 {
+        if let Some(r) = try_stale(ctx, &cache, &mut stale, cache::StaleWhen::Status(status)) {
+            return Ok(r);
+        }
+    }
     ctx.upstream_time = started.elapsed().as_secs_f64();
 
     let mut resp = Resp::new();
@@ -545,4 +614,49 @@ fn cached_reply(entry: cache::Decoded) -> Reply {
     }
     resp.framing = Framing::Length(entry.body.len() as u64);
     Reply::new(resp, Body::Bytes(entry.body))
+}
+
+/// Serves the retained stale entry when `proxy_cache_use_stale` covers this
+/// outcome. Returns `None` to let the caller surface the error normally.
+fn try_stale(
+    ctx: &mut Ctx<'_>,
+    cache: &Option<CacheCtx>,
+    stale: &mut Option<cache::Decoded>,
+    outcome: cache::StaleWhen,
+) -> Option<Reply> {
+    let cc = cache.as_ref()?;
+    if !cache::stale_allowed(&cc.conf.use_stale, outcome) {
+        return None;
+    }
+    let entry = stale.take()?;
+    ctx.cache_status = Some(cache::CacheStatus::Stale);
+    Some(cached_reply(entry))
+}
+
+/// Waits for whoever holds the fetch lock to populate the entry.
+///
+/// Polls rather than using a condition variable: a cache fill takes
+/// milliseconds, the wait is bounded by `proxy_cache_lock_timeout`, and
+/// polling keeps the lock table free of per-key wakers. Returns the response
+/// once it appears, or `None` on timeout so the caller fetches it itself —
+/// a slow refresh must not turn into a failed request.
+async fn wait_for_fetch(ctx: &mut Ctx<'_>, cc: &CacheCtx) -> Option<Reply> {
+    const POLL: Duration = Duration::from_millis(10);
+    let deadline = Instant::now() + cc.conf.lock_timeout;
+
+    while Instant::now() < deadline {
+        tokio::time::sleep(POLL).await;
+        if !cache::is_locked(&cc.zone.name, cc.hash) {
+            // The holder finished; the entry should be there now.
+            if let Some((entry, cache::CacheStatus::Hit)) =
+                cache::load(&cc.zone, &cc.key, cc.hash)
+            {
+                ctx.cache_status = Some(cache::CacheStatus::Hit);
+                return Some(cached_reply(entry));
+            }
+            // It released without storing (an error, or uncacheable). Fetch.
+            return None;
+        }
+    }
+    None
 }

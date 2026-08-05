@@ -1728,3 +1728,312 @@ fn dir_bytes(p: &std::path::Path) -> u64 {
     }
     total
 }
+
+// ---- proxy_cache_use_stale / proxy_cache_lock -----------------------------
+
+/// A backend that can be switched from healthy to failing mid-test.
+fn switchable_backend() -> (u16, std::sync::Arc<std::sync::atomic::AtomicBool>,
+                            std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+    let healthy = std::sync::Arc::new(AtomicBool::new(true));
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let (h, c) = (healthy.clone(), hits.clone());
+    let l = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    std::thread::spawn(move || {
+        for conn in l.incoming().flatten() {
+            let (h, c) = (h.clone(), c.clone());
+            std::thread::spawn(move || {
+                let mut conn = conn;
+                let mut b = [0u8; 4096];
+                if conn.read(&mut b).is_err() {
+                    return;
+                }
+                c.fetch_add(1, Ordering::SeqCst);
+                if h.load(Ordering::SeqCst) {
+                    let _ = conn.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\ngood-body");
+                } else {
+                    // A backend that is up but broken.
+                    let _ = conn.write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 5\r\n\r\nbroke");
+                }
+            });
+        }
+    });
+    (port, healthy, hits)
+}
+
+fn stale_conf(port: u16, cache_extra: &str) -> String {
+    format!("
+worker_processes 1;
+error_log {{DIR}}/error.log crit;
+events {{ worker_connections 64; }}
+http {{
+    access_log off;
+    proxy_cache_path {{DIR}}/cache levels=1:2 keys_zone=st:10m inactive=10m;
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        location / {{
+            proxy_pass http://127.0.0.1:{port};
+            proxy_cache st;
+            proxy_cache_valid 200 1s;
+            add_header X-Cache-Status $upstream_cache_status always;
+            {cache_extra}
+        }}
+    }}
+}}")
+}
+
+#[test]
+fn use_stale_serves_the_old_copy_when_the_backend_breaks() {
+    let (port, healthy, _hits) = switchable_backend();
+    let s = Server::start(
+        "usestale",
+        &stale_conf(port, "proxy_cache_use_stale error timeout http_503;"),
+        &[],
+    );
+
+    // Populate the cache while the backend is healthy.
+    let first = s.get("/page");
+    assert_eq!(first.status, 200);
+    assert_eq!(first.body_str(), "good-body");
+
+    // Let it expire, then break the backend.
+    std::thread::sleep(Duration::from_millis(1200));
+    healthy.store(false, Ordering::SeqCst);
+
+    let r = s.get("/page");
+    assert_eq!(r.status, 200, "a stale hit must not surface the 503");
+    assert_eq!(r.body_str(), "good-body", "the old copy must be served");
+    assert_eq!(r.header("X-Cache-Status"), Some("STALE"));
+}
+
+#[test]
+fn without_use_stale_the_error_is_surfaced() {
+    // The same scenario with the directive absent must NOT hide the failure.
+    let (port, healthy, _hits) = switchable_backend();
+    let s = Server::start("nostale", &stale_conf(port, ""), &[]);
+
+    assert_eq!(s.get("/page").body_str(), "good-body");
+    std::thread::sleep(Duration::from_millis(1200));
+    healthy.store(false, Ordering::SeqCst);
+
+    let r = s.get("/page");
+    assert_eq!(r.status, 503, "without use_stale the backend error must show");
+}
+
+#[test]
+fn use_stale_only_covers_the_listed_conditions() {
+    // Configured for `timeout` only; a 503 is not covered, so it must pass
+    // through rather than being quietly masked.
+    let (port, healthy, _hits) = switchable_backend();
+    let s = Server::start(
+        "stalenarrow",
+        &stale_conf(port, "proxy_cache_use_stale timeout;"),
+        &[],
+    );
+
+    assert_eq!(s.get("/p").body_str(), "good-body");
+    std::thread::sleep(Duration::from_millis(1200));
+    healthy.store(false, Ordering::SeqCst);
+    assert_eq!(s.get("/p").status, 503, "an unlisted condition must not serve stale");
+}
+
+#[test]
+fn use_stale_covers_a_backend_that_stops_accepting() {
+    // The `error` condition: the backend is gone, not merely returning an
+    // error status. Proving it needs the SAME cache directory before and
+    // after the failure, so the backend is killed rather than the server
+    // being restarted against a different one.
+    use std::sync::atomic::AtomicBool;
+    let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+    let alive = std::sync::Arc::new(AtomicBool::new(true));
+    let a = alive.clone();
+    let l = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            let a = a.clone();
+            std::thread::spawn(move || {
+                let mut c = c;
+                let mut b = [0u8; 4096];
+                if c.read(&mut b).is_err() {
+                    return;
+                }
+                if !a.load(Ordering::SeqCst) {
+                    // Close without answering: what a crashed backend does.
+                    return;
+                }
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\ngood-body");
+            });
+        }
+    });
+
+    let s = Server::start(
+        "staledead",
+        &stale_conf(port, "proxy_cache_use_stale error timeout;"),
+        &[],
+    );
+    assert_eq!(s.get("/x").body_str(), "good-body");
+    std::thread::sleep(Duration::from_millis(1200));
+
+    alive.store(false, Ordering::SeqCst);
+    let r = s.get("/x");
+    assert_eq!(r.status, 200, "a dead backend must be covered by use_stale error");
+    assert_eq!(r.body_str(), "good-body");
+    assert_eq!(r.header("X-Cache-Status"), Some("STALE"));
+}
+
+#[test]
+fn cache_lock_collapses_a_stampede_into_one_upstream_request() {
+    // A slow backend plus many simultaneous misses is the thundering herd
+    // proxy_cache_lock exists to prevent.
+    use std::sync::atomic::AtomicUsize;
+    let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let l = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            let h = h.clone();
+            std::thread::spawn(move || {
+                let mut c = c;
+                let mut b = [0u8; 4096];
+                if c.read(&mut b).is_err() {
+                    return;
+                }
+                h.fetch_add(1, Ordering::SeqCst);
+                // Slow enough that every waiter piles up behind this one.
+                std::thread::sleep(Duration::from_millis(300));
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nslow!!");
+            });
+        }
+    });
+
+    let s = Server::start(
+        "cachelock",
+        &format!("
+worker_processes 1;
+error_log {{DIR}}/error.log crit;
+events {{ worker_connections 64; }}
+http {{
+    access_log off;
+    proxy_cache_path {{DIR}}/cache levels=1:2 keys_zone=lk:10m inactive=10m;
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        location / {{
+            proxy_pass http://127.0.0.1:{port};
+            proxy_cache lk;
+            proxy_cache_valid 200 60s;
+            proxy_cache_lock on;
+            proxy_cache_lock_timeout 5s;
+        }}
+    }}
+}}"),
+        &[],
+    );
+
+    let port_of = s.port;
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        handles.push(std::thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port_of)).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            c.write_all(b"GET /hot HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+            let mut buf = Vec::new();
+            let _ = c.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        }));
+    }
+    let bodies: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    for (i, b) in bodies.iter().enumerate() {
+        assert!(b.contains("slow!!"), "waiter {i} must still get the content: {b:?}");
+    }
+    let n = hits.load(Ordering::SeqCst);
+    // One worker, so the lock should let exactly one request through and the
+    // other seven should be served from the entry it stored.
+    assert_eq!(
+        n, 1,
+        "the lock must collapse 8 simultaneous misses into 1 upstream request, got {n}"
+    );
+}
+
+#[test]
+fn use_stale_updating_answers_immediately_while_another_refreshes() {
+    // With `updating`, a waiter must not queue behind the refresh at all —
+    // it gets the old copy straight away.
+    use std::sync::atomic::AtomicUsize;
+    let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let l = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            let h = h.clone();
+            std::thread::spawn(move || {
+                let mut c = c;
+                let mut b = [0u8; 4096];
+                if c.read(&mut b).is_err() { return; }
+                let n = h.fetch_add(1, Ordering::SeqCst);
+                // The refresh is slow; the first fill is fast.
+                if n > 0 { std::thread::sleep(Duration::from_millis(800)); }
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfresh");
+            });
+        }
+    });
+
+    let s = Server::start(
+        "staleupdating",
+        &format!("
+worker_processes 1;
+error_log {{DIR}}/error.log crit;
+events {{ worker_connections 64; }}
+http {{
+    access_log off;
+    proxy_cache_path {{DIR}}/cache levels=1:2 keys_zone=up:10m inactive=10m;
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        location / {{
+            proxy_pass http://127.0.0.1:{port};
+            proxy_cache up;
+            proxy_cache_valid 200 1s;
+            proxy_cache_lock on;
+            proxy_cache_use_stale updating;
+            add_header X-Cache-Status $upstream_cache_status always;
+        }}
+    }}
+}}"),
+        &[],
+    );
+
+    assert_eq!(s.get("/u").body_str(), "fresh");
+    std::thread::sleep(Duration::from_millis(1200));
+
+    // One request starts the slow refresh...
+    let p = s.port;
+    let refresher = std::thread::spawn(move || {
+        let mut c = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        c.write_all(b"GET /u HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+        let mut buf = Vec::new();
+        let _ = c.read_to_end(&mut buf);
+    });
+    std::thread::sleep(Duration::from_millis(100));
+
+    // ...and a second must be answered instantly from the stale copy.
+    let t = Instant::now();
+    let r = s.get("/u");
+    let waited = t.elapsed();
+    refresher.join().unwrap();
+
+    assert_eq!(r.status, 200);
+    assert!(
+        waited < Duration::from_millis(400),
+        "with use_stale updating the waiter must not queue: waited {waited:?}"
+    );
+    assert_eq!(r.header("X-Cache-Status"), Some("STALE"));
+}

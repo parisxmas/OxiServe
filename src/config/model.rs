@@ -228,6 +228,12 @@ pub struct ProxyCacheConf {
     pub bypass: Arc<Vec<Arc<Template>>>,
     /// `proxy_no_cache` — non-empty, non-"0" means do not store the response.
     pub no_cache: Arc<Vec<Arc<Template>>>,
+    /// `proxy_cache_use_stale` — when an expired entry beats an error.
+    pub use_stale: Arc<Vec<crate::server::cache::StaleWhen>>,
+    /// `proxy_cache_lock` — only one request populates a key at a time.
+    pub lock: bool,
+    /// How long a waiting request queues before giving up and fetching itself.
+    pub lock_timeout: Duration,
 }
 
 impl Default for ProxyCacheConf {
@@ -241,6 +247,9 @@ impl Default for ProxyCacheConf {
             min_uses: 1,
             bypass: Arc::new(Vec::new()),
             no_cache: Arc::new(Vec::new()),
+            use_stale: Arc::new(Vec::new()),
+            lock: false,
+            lock_timeout: Duration::from_secs(5),
         }
     }
 }

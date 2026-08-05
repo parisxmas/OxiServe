@@ -831,3 +831,155 @@ fn touch_if_stale(path: &Path, mtime: u64) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Cache lock (proxy_cache_lock)
+// ---------------------------------------------------------------------------
+
+use std::sync::Mutex;
+
+/// Keys currently being fetched.
+///
+/// Global rather than per worker: a popular URL expiring is exactly when every
+/// worker misses at once, so a per-worker lock would still let one request per
+/// worker through. One process means one map suffices — nginx needs shared
+/// memory for the same job because its workers are separate processes.
+///
+/// Held only long enough to insert or remove; never across an await.
+static FETCHING: Mutex<Option<std::collections::HashSet<(Box<str>, KeyHash)>>> = Mutex::new(None);
+
+/// Proof that this task owns the right to fetch a key. Releases on drop, so a
+/// failed fetch cannot leave a key locked forever.
+pub struct FetchLock {
+    zone: Box<str>,
+    key: KeyHash,
+}
+
+impl Drop for FetchLock {
+    fn drop(&mut self) {
+        if let Ok(mut g) = FETCHING.lock() {
+            if let Some(set) = g.as_mut() {
+                set.remove(&(self.zone.clone(), self.key));
+            }
+        }
+    }
+}
+
+/// Claims the right to populate `key`, or reports that someone else has it.
+pub fn try_lock(zone: &str, key: KeyHash) -> Option<FetchLock> {
+    let mut g = FETCHING.lock().ok()?;
+    let set = g.get_or_insert_with(Default::default);
+    if set.insert((zone.into(), key)) {
+        Some(FetchLock { zone: zone.into(), key })
+    } else {
+        None
+    }
+}
+
+/// True while another task is fetching this key.
+pub fn is_locked(zone: &str, key: KeyHash) -> bool {
+    FETCHING
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|s| s.contains(&(zone.into(), key))))
+        .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// proxy_cache_use_stale
+// ---------------------------------------------------------------------------
+
+/// When a stale entry may be served instead of an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleWhen {
+    /// The upstream could not be reached or the connection failed.
+    Error,
+    /// The upstream timed out.
+    Timeout,
+    /// The upstream sent something that is not a response.
+    InvalidHeader,
+    /// Another request is already refreshing this entry — serve the old copy
+    /// rather than queueing behind it.
+    Updating,
+    /// A specific upstream status, e.g. `http_503`.
+    Status(u16),
+}
+
+impl StaleWhen {
+    pub fn parse(s: &str) -> Option<StaleWhen> {
+        Some(match s {
+            "error" => StaleWhen::Error,
+            "timeout" => StaleWhen::Timeout,
+            "invalid_header" => StaleWhen::InvalidHeader,
+            "updating" => StaleWhen::Updating,
+            "off" => return None,
+            other => {
+                let code = other.strip_prefix("http_")?.parse().ok()?;
+                StaleWhen::Status(code)
+            }
+        })
+    }
+}
+
+/// Whether a set of `proxy_cache_use_stale` conditions covers this outcome.
+pub fn stale_allowed(conds: &[StaleWhen], outcome: StaleWhen) -> bool {
+    conds.iter().any(|c| *c == outcome)
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn only_one_holder_at_a_time() {
+        let k = KeyHash::of("/contended");
+        let first = try_lock("z", k).expect("first caller wins");
+        assert!(try_lock("z", k).is_none(), "second caller must be refused");
+        assert!(is_locked("z", k));
+        drop(first);
+        assert!(!is_locked("z", k), "releasing must clear the lock");
+        assert!(try_lock("z", k).is_some(), "and let the next caller through");
+    }
+
+    #[test]
+    fn locks_are_per_key_and_per_zone() {
+        let a = try_lock("z", KeyHash::of("/a")).unwrap();
+        // A different key in the same zone is unaffected.
+        let b = try_lock("z", KeyHash::of("/b")).unwrap();
+        // As is the same key in a different zone.
+        let c = try_lock("other", KeyHash::of("/a")).unwrap();
+        drop((a, b, c));
+    }
+
+    #[test]
+    fn a_dropped_lock_cannot_deadlock_the_key() {
+        // A fetch that fails must not leave the key locked forever.
+        let k = KeyHash::of("/failing");
+        {
+            let _l = try_lock("z", k).unwrap();
+            // ...fetch fails here and we return early.
+        }
+        assert!(!is_locked("z", k), "an early return must still release");
+    }
+
+    #[test]
+    fn stale_conditions_parse() {
+        assert_eq!(StaleWhen::parse("error"), Some(StaleWhen::Error));
+        assert_eq!(StaleWhen::parse("timeout"), Some(StaleWhen::Timeout));
+        assert_eq!(StaleWhen::parse("updating"), Some(StaleWhen::Updating));
+        assert_eq!(StaleWhen::parse("http_503"), Some(StaleWhen::Status(503)));
+        assert_eq!(StaleWhen::parse("off"), None);
+        assert_eq!(StaleWhen::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn stale_matching_is_exact() {
+        let conds = vec![StaleWhen::Error, StaleWhen::Status(503)];
+        assert!(stale_allowed(&conds, StaleWhen::Error));
+        assert!(stale_allowed(&conds, StaleWhen::Status(503)));
+        // A condition that was not listed must not open the door.
+        assert!(!stale_allowed(&conds, StaleWhen::Timeout));
+        assert!(!stale_allowed(&conds, StaleWhen::Status(500)));
+        assert!(!stale_allowed(&[], StaleWhen::Error), "empty means never");
+    }
+}

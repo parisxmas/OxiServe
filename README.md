@@ -93,8 +93,15 @@ block, `fastcgi_param` with `if_not_empty`, `fastcgi_index`,
 `inactive=`, `max_size=`, enforced by a background cache manager),
 `proxy_cache`, `proxy_cache_key`,
 `proxy_cache_valid`, `proxy_cache_methods`, `proxy_cache_min_uses`,
-`proxy_cache_bypass`, `proxy_no_cache`, and `$upstream_cache_status`
-(MISS/HIT/EXPIRED/BYPASS). The index every request consults is in-process;
+`proxy_cache_bypass`, `proxy_no_cache`, `proxy_cache_use_stale`,
+`proxy_cache_lock` (+ `_timeout`), and `$upstream_cache_status`
+(MISS/HIT/EXPIRED/BYPASS/STALE).
+
+`proxy_cache_lock` collapses a stampede: when a popular entry expires, one
+request refreshes it and the rest wait for that result instead of each opening
+its own upstream connection. `proxy_cache_use_stale` decides when a expired
+copy beats an error — including `updating`, where a waiter is answered from
+the old copy immediately rather than queueing behind the refresh at all. The index every request consults is in-process;
 only bodies touch the disk. Each entry stores its own cache key and it is
 compared on every read, so a digest collision cannot serve one URL's response
 for another.
@@ -148,8 +155,8 @@ regex captures `$1`–`$9`.
 - **uwsgi / SCGI / gRPC** — `uwsgi_pass` and friends (FastCGI *is* supported).
 - **FastCGI response streaming** — responses are fully buffered
   (`fastcgi_buffering on`, capped at 64 MB) rather than streamed.
-- **`proxy_cache_use_stale` / `proxy_cache_lock` / background revalidation** —
-  parsed and ignored; the cache is fetch-on-expiry with no stale serving.
+- **`proxy_cache_background_update` / `proxy_cache_revalidate`** — parsed and
+  ignored; a refresh is always a full fetch, never a conditional revalidation.
 - **`limit_conn`** connection limiting (`limit_req` is implemented).
 - **`auth_basic`**, `auth_request`.
 - **Unix domain sockets** in `listen`.
