@@ -364,6 +364,25 @@ Architecture decisions are recorded in [`docs/decisions/`](docs/decisions/):
   store, not even an embedded one, sits on the per-request path, with the
   measurements that overturned my earlier claim.
 
+## Testing
+
+```console
+$ cargo test                                   # 315 tests
+$ cargo +nightly miri test --lib http::request # UB checking on the unsafe code
+$ cargo +nightly fuzz run uri_normalize        # 5 targets under fuzz/
+```
+
+Five libFuzzer targets cover the parsers that read attacker-influenced input:
+the HTTP request parser, URI normalisation, the cache entry decoder, FastCGI
+records, and the config lexer. They assert properties rather than just
+absence of panics — that normalisation output is absolute and dot-free, that
+`Transfer-Encoding` and `Content-Length` are never both accepted, that a cache
+entry decoded under one key is refused under another.
+
+That pass found two real bugs: UTF-8 corruption in path handling, and an
+integer overflow decoding a corrupt cache file. Miri reports no undefined
+behaviour across the modules containing `unsafe`.
+
 ## Building
 
 ```console
