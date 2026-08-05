@@ -1,0 +1,812 @@
+//! The runtime configuration model.
+//!
+//! The AST is what nginx *said*; this is what the server *does*. Everything
+//! here is resolved at load time — regexes compiled, templates compiled,
+//! inherited directives flattened into each location — so the request path
+//! never re-interprets configuration.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use regex::Regex;
+
+use super::vars::{Template, Var};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerProcesses {
+    Auto,
+    N(usize),
+}
+
+impl WorkerProcesses {
+    pub fn resolve(self) -> usize {
+        match self {
+            WorkerProcesses::Auto => std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+            WorkerProcesses::N(n) => n.max(1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Notice,
+    Warn,
+    Error,
+    Crit,
+    Alert,
+    Emerg,
+}
+
+impl LogLevel {
+    pub fn parse(s: &str) -> Option<LogLevel> {
+        Some(match s {
+            "debug" => LogLevel::Debug,
+            "info" => LogLevel::Info,
+            "notice" => LogLevel::Notice,
+            "warn" => LogLevel::Warn,
+            "error" => LogLevel::Error,
+            "crit" => LogLevel::Crit,
+            "alert" => LogLevel::Alert,
+            "emerg" => LogLevel::Emerg,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Notice => "notice",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+            LogLevel::Crit => "crit",
+            LogLevel::Alert => "alert",
+            LogLevel::Emerg => "emerg",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ErrorLogConf {
+    pub path: PathBuf,
+    pub level: LogLevel,
+    /// `error_log /dev/null;` or `off`
+    pub disabled: bool,
+}
+
+impl Default for ErrorLogConf {
+    fn default() -> Self {
+        ErrorLogConf {
+            path: PathBuf::from("logs/error.log"),
+            level: LogLevel::Error,
+            disabled: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AccessLogConf {
+    pub path: PathBuf,
+    pub format: Arc<Template>,
+    /// Bytes of in-memory buffering before a flush; `buffer=` in nginx.
+    pub buffer: usize,
+    /// `flush=` — maximum time a buffered line may sit unwritten.
+    pub flush: Option<Duration>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerTokens {
+    On,
+    Off,
+    Build,
+}
+
+/// Directives that inherit down `http` → `server` → `location`.
+///
+/// Every field is resolved (no `Option`) by the time a request sees it; the
+/// builder carries a parallel `Option`-valued struct while merging.
+#[derive(Debug, Clone)]
+pub struct CoreConf {
+    pub root: Arc<Template>,
+    pub alias: Option<Arc<Template>>,
+    pub index: Arc<Vec<Template>>,
+    pub autoindex: bool,
+    pub default_type: Arc<str>,
+    pub charset: Option<Arc<str>>,
+    pub sendfile: bool,
+    pub tcp_nopush: bool,
+    pub tcp_nodelay: bool,
+    pub keepalive_timeout: Duration,
+    pub keepalive_requests: u64,
+    pub client_header_timeout: Duration,
+    pub client_body_timeout: Duration,
+    pub send_timeout: Duration,
+    pub client_max_body_size: u64,
+    pub client_header_buffer_size: usize,
+    pub large_client_header_buffers: (usize, usize),
+    pub server_tokens: ServerTokens,
+    pub etag: bool,
+    pub msie_padding: bool,
+    pub gzip: GzipConf,
+    pub add_headers: Arc<Vec<AddHeader>>,
+    pub expires: Option<Expires>,
+    pub proxy: Arc<ProxyConf>,
+    pub output_buffers: (usize, usize),
+    pub directio: Option<u64>,
+    pub log_not_found: bool,
+    pub absolute_redirect: bool,
+    pub port_in_redirect: bool,
+    pub server_name_in_redirect: bool,
+    pub if_modified_since: IfModifiedSince,
+    pub max_ranges: Option<usize>,
+    pub limit_rate: u64,
+    pub limit_rate_after: u64,
+    pub satisfy_any: bool,
+    pub internal: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IfModifiedSince {
+    Off,
+    Exact,
+    Before,
+}
+
+#[derive(Debug, Clone)]
+pub struct GzipConf {
+    pub enabled: bool,
+    pub level: u32,
+    pub min_length: u64,
+    pub types: Arc<Vec<Box<str>>>,
+    pub vary: bool,
+    /// `gzip_proxied` — simplified to on/off/any for now.
+    pub proxied_any: bool,
+    pub http_version_1_0: bool,
+    pub disable_msie6: bool,
+}
+
+impl Default for GzipConf {
+    fn default() -> Self {
+        GzipConf {
+            enabled: false,
+            level: 1,
+            min_length: 20,
+            types: Arc::new(vec![Box::from("text/html")]),
+            vary: false,
+            proxied_any: false,
+            http_version_1_0: false,
+            disable_msie6: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AddHeader {
+    pub name: Arc<str>,
+    pub value: Arc<Template>,
+    /// `always` — emit even on error responses.
+    pub always: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expires {
+    Off,
+    Epoch,
+    Max,
+    /// Seconds; negative means "already expired".
+    Secs(i64),
+    /// `@12h` — next occurrence of a wall-clock time.
+    Daily(i64),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProxyConf {
+    pub connect_timeout: Option<Duration>,
+    pub read_timeout: Option<Duration>,
+    pub send_timeout: Option<Duration>,
+    pub set_headers: Vec<(Arc<str>, Arc<Template>)>,
+    pub hide_headers: Vec<Box<str>>,
+    pub pass_headers: Vec<Box<str>>,
+    pub buffering: bool,
+    pub http_version_11: bool,
+    pub next_upstream_tries: u32,
+    pub ssl_server_name: bool,
+    pub set_body: Option<Arc<Template>>,
+}
+
+/// How a `location` was written, which drives nginx's matching order.
+#[derive(Debug, Clone)]
+pub enum LocMatch {
+    /// `location = /exact`
+    Exact(Box<str>),
+    /// `location /prefix`
+    Prefix(Box<str>),
+    /// `location ^~ /prefix` — wins over regexes when it is the longest match.
+    PrefixNoRegex(Box<str>),
+    /// `location ~ re` / `location ~* re`
+    Regex { re: Box<Regex>, ci: bool },
+    /// `location @name` — only reachable via `error_page` / `try_files`.
+    Named(Box<str>),
+}
+
+impl LocMatch {
+    pub fn prefix(&self) -> Option<&str> {
+        match self {
+            LocMatch::Exact(p) | LocMatch::Prefix(p) | LocMatch::PrefixNoRegex(p) => Some(p),
+            _ => None,
+        }
+    }
+}
+
+/// What a location does once matched.
+#[derive(Debug, Clone)]
+pub enum Action {
+    /// Serve from the filesystem (`root`/`alias` + `index`).
+    Static,
+    /// `return code [text|url];`
+    Return { status: u16, body: Option<Arc<Template>> },
+    /// `proxy_pass http://backend;`
+    Proxy(Arc<ProxyPass>),
+    /// A location that only exists to hold configuration (e.g. `internal;`).
+    None,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyPass {
+    /// Named upstream, or a literal host to dial.
+    pub target: ProxyTarget,
+    /// URI portion of `proxy_pass`; `None` means "pass $uri through unchanged".
+    pub uri: Option<Arc<Template>>,
+    pub tls: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProxyTarget {
+    Upstream(Arc<str>),
+    Addr { host: Arc<str>, port: u16 },
+    /// `proxy_pass $backend;` — resolved per request.
+    Dynamic(Arc<Template>),
+}
+
+#[derive(Debug, Clone)]
+pub struct TryFiles {
+    pub items: Vec<Arc<Template>>,
+    pub fallback: TryFallback,
+}
+
+#[derive(Debug, Clone)]
+pub enum TryFallback {
+    /// `try_files $uri =404;`
+    Status(u16),
+    /// `try_files $uri /index.html;` — internal redirect.
+    Uri(Arc<Template>),
+    /// `try_files $uri @named;`
+    Named(Arc<str>),
+}
+
+#[derive(Debug, Clone)]
+pub struct Rewrite {
+    pub re: Box<Regex>,
+    pub replacement: Arc<Template>,
+    pub flag: RewriteFlag,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewriteFlag {
+    None,
+    Last,
+    Break,
+    Redirect,
+    Permanent,
+}
+
+#[derive(Debug, Clone)]
+pub struct IfBlock {
+    pub cond: Cond,
+    pub actions: Vec<IfAction>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Cond {
+    /// Unconditional. A bare `set` outside any `if` is modelled as an
+    /// always-true block so both forms run through one evaluator.
+    Always,
+    /// Truthy test: non-empty and not "0".
+    Truthy(Var),
+    Eq(Var, Arc<Template>),
+    Ne(Var, Arc<Template>),
+    Match { var: Var, re: Box<Regex>, negate: bool },
+    FileExists { t: Arc<Template>, negate: bool },
+    DirExists { t: Arc<Template>, negate: bool },
+    AnyExists { t: Arc<Template>, negate: bool },
+    Executable { t: Arc<Template>, negate: bool },
+}
+
+#[derive(Debug, Clone)]
+pub enum IfAction {
+    Return { status: u16, body: Option<Arc<Template>> },
+    Rewrite(Rewrite),
+    Set { var: Arc<str>, value: Arc<Template> },
+    AddHeader(AddHeader),
+    Break,
+}
+
+#[derive(Debug, Clone)]
+pub struct ErrorPage {
+    pub codes: Vec<u16>,
+    /// `error_page 404 =200 /empty.gif;`
+    pub replace_status: Option<u16>,
+    pub target: ErrorTarget,
+}
+
+#[derive(Debug, Clone)]
+pub enum ErrorTarget {
+    Uri(Arc<Template>),
+    Named(Arc<str>),
+    /// An absolute URL causes a redirect rather than an internal jump.
+    Redirect(Arc<Template>),
+}
+
+#[derive(Debug)]
+pub struct Location {
+    pub matcher: LocMatch,
+    pub core: CoreConf,
+    pub action: Action,
+    pub try_files: Option<TryFiles>,
+    pub rewrites: Vec<Rewrite>,
+    pub ifs: Vec<IfBlock>,
+    pub error_pages: Vec<ErrorPage>,
+    pub access_logs: Vec<AccessLogConf>,
+    /// Nested `location` blocks, searched only after this one matches.
+    pub nested: Option<Box<LocSet>>,
+    /// Methods permitted, `None` = all. From `limit_except`.
+    pub allowed_methods: Option<Vec<Box<str>>>,
+    pub raw_line: u32,
+}
+
+/// Locations grouped by match kind so lookup follows nginx's documented order.
+#[derive(Debug, Default)]
+pub struct LocSet {
+    /// `=` matches, sorted by path for binary search.
+    pub exact: Vec<Arc<Location>>,
+    /// Prefix matches, sorted longest-first so the first hit is the best hit.
+    pub prefix: Vec<Arc<Location>>,
+    /// Regex matches in configuration order — first match wins.
+    pub regex: Vec<Arc<Location>>,
+    /// `@name` locations, reachable only by internal redirect.
+    pub named: HashMap<Box<str>, Arc<Location>>,
+}
+
+impl LocSet {
+    /// nginx's location search:
+    ///   1. an `=` match ends the search immediately;
+    ///   2. remember the longest prefix match;
+    ///   3. if that prefix was `^~`, use it and skip regexes;
+    ///   4. otherwise try regexes in order, first match wins;
+    ///   5. fall back to the remembered prefix.
+    ///
+    /// Returns the matched location plus regex captures, if any.
+    pub fn find<'s, 'u>(
+        &'s self,
+        uri: &'u str,
+    ) -> Option<(&'s Arc<Location>, Option<regex::Captures<'u>>)> {
+        if let Ok(i) = self
+            .exact
+            .binary_search_by(|l| l.matcher.prefix().unwrap_or("").cmp(uri))
+        {
+            return Some((&self.exact[i], None));
+        }
+
+        let best_prefix = self
+            .prefix
+            .iter()
+            .find(|l| uri.starts_with(l.matcher.prefix().unwrap_or("")));
+
+        if let Some(l) = best_prefix {
+            if matches!(l.matcher, LocMatch::PrefixNoRegex(_)) {
+                return Some((l, None));
+            }
+        }
+
+        for l in &self.regex {
+            if let LocMatch::Regex { re, .. } = &l.matcher {
+                if let Some(c) = re.captures(uri) {
+                    return Some((l, Some(c)));
+                }
+            }
+        }
+
+        best_prefix.map(|l| (l, None))
+    }
+}
+
+/// A parsed `server_name` entry. nginx resolves these in a fixed priority
+/// order, which is why they are separated rather than kept as one list.
+#[derive(Debug, Clone)]
+pub enum ServerName {
+    Exact(Box<str>),
+    /// `*.example.com` — also matches the bare `example.com`.
+    LeadingWildcard(Box<str>),
+    /// `www.example.*`
+    TrailingWildcard(Box<str>),
+    Regex(Box<Regex>),
+    /// An empty `server_name ""`, matching requests with no Host header.
+    Empty,
+}
+
+#[derive(Debug)]
+pub struct ServerConf {
+    pub names: Vec<ServerName>,
+    pub core: CoreConf,
+    pub locations: LocSet,
+    pub rewrites: Vec<Rewrite>,
+    pub ifs: Vec<IfBlock>,
+    pub error_pages: Vec<ErrorPage>,
+    pub access_logs: Vec<AccessLogConf>,
+    /// `return` written directly in the server block.
+    pub action: Action,
+    pub tls: Option<Arc<TlsConf>>,
+    pub listens: Vec<ListenSpec>,
+    pub raw_line: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct TlsConf {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    pub protocols: Vec<Box<str>>,
+    pub alpn_h2: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListenSpec {
+    pub addr: SocketAddr,
+    pub default_server: bool,
+    pub ssl: bool,
+    pub http2: bool,
+    pub reuseport: bool,
+    pub backlog: Option<i32>,
+    pub rcvbuf: Option<usize>,
+    pub sndbuf: Option<usize>,
+    pub ipv6_only: bool,
+    pub deferred: bool,
+}
+
+/// One bound socket, plus every server that can be selected on it.
+#[derive(Debug)]
+pub struct Listener {
+    pub addr: SocketAddr,
+    pub backlog: i32,
+    pub reuseport: bool,
+    pub ssl: bool,
+    pub http2: bool,
+    pub ipv6_only: bool,
+    pub deferred: bool,
+    pub rcvbuf: Option<usize>,
+    pub sndbuf: Option<usize>,
+    pub servers: Vec<Arc<ServerConf>>,
+    /// Index into `servers` used when no `server_name` matches.
+    pub default_server: usize,
+}
+
+impl Listener {
+    /// Picks a server by `Host`, following nginx's precedence:
+    /// exact → longest leading wildcard → longest trailing wildcard →
+    /// first matching regex → default server.
+    pub fn match_host(&self, host: &str) -> &Arc<ServerConf> {
+        let host = host.trim_end_matches('.');
+        let mut best_lead: Option<(usize, &Arc<ServerConf>)> = None;
+        let mut best_trail: Option<(usize, &Arc<ServerConf>)> = None;
+
+        for s in &self.servers {
+            for n in &s.names {
+                match n {
+                    ServerName::Exact(e) => {
+                        if host.eq_ignore_ascii_case(e) {
+                            return s;
+                        }
+                    }
+                    ServerName::LeadingWildcard(suffix) => {
+                        // `*.example.com` matches `a.example.com` and `example.com`.
+                        let m = host.len() > suffix.len()
+                            && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+                            && host[host.len() - suffix.len()..].eq_ignore_ascii_case(suffix);
+                        if m && best_lead.map_or(true, |(l, _)| suffix.len() > l) {
+                            best_lead = Some((suffix.len(), s));
+                        }
+                    }
+                    ServerName::TrailingWildcard(pre) => {
+                        let m = host.len() > pre.len()
+                            && host.as_bytes()[pre.len()] == b'.'
+                            && host[..pre.len()].eq_ignore_ascii_case(pre);
+                        if m && best_trail.map_or(true, |(l, _)| pre.len() > l) {
+                            best_trail = Some((pre.len(), s));
+                        }
+                    }
+                    ServerName::Empty => {
+                        if host.is_empty() {
+                            return s;
+                        }
+                    }
+                    ServerName::Regex(_) => {}
+                }
+            }
+        }
+
+        if let Some((_, s)) = best_lead {
+            return s;
+        }
+        if let Some((_, s)) = best_trail {
+            return s;
+        }
+        for s in &self.servers {
+            for n in &s.names {
+                if let ServerName::Regex(re) = n {
+                    if re.is_match(host) {
+                        return s;
+                    }
+                }
+            }
+        }
+        &self.servers[self.default_server]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LbMethod {
+    RoundRobin,
+    LeastConn,
+    IpHash,
+    Random,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpstreamServer {
+    pub addr: Box<str>,
+    pub weight: u32,
+    pub max_fails: u32,
+    pub fail_timeout: Duration,
+    pub backup: bool,
+    pub down: bool,
+    pub max_conns: Option<u32>,
+}
+
+#[derive(Debug)]
+pub struct Upstream {
+    pub name: Box<str>,
+    pub servers: Vec<UpstreamServer>,
+    pub method: LbMethod,
+    /// `keepalive N;` — idle upstream connections to retain per worker.
+    pub keepalive: usize,
+}
+
+/// A compiled `map $in $out { ... }`.
+#[derive(Debug)]
+pub struct MapConf {
+    pub source: Var,
+    pub target: Arc<str>,
+    pub exact: HashMap<Box<str>, Arc<Template>>,
+    pub wildcards: Vec<(Box<str>, Arc<Template>, bool)>,
+    pub regexes: Vec<(Box<Regex>, Arc<Template>)>,
+    pub default: Option<Arc<Template>>,
+    pub hostnames: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct MimeTypes {
+    by_ext: HashMap<Box<str>, Arc<str>>,
+}
+
+impl MimeTypes {
+    pub fn insert(&mut self, ext: &str, ty: &str) {
+        self.by_ext
+            .insert(ext.to_ascii_lowercase().into_boxed_str(), Arc::from(ty));
+    }
+
+    pub fn lookup(&self, path: &str) -> Option<&Arc<str>> {
+        let ext = path.rsplit('.').next()?;
+        if ext.len() == path.len() {
+            return None;
+        }
+        // Extensions are stored lowercased; avoid allocating for the common
+        // case where the request path is already lowercase.
+        if ext.bytes().any(|b| b.is_ascii_uppercase()) {
+            self.by_ext.get(ext.to_ascii_lowercase().as_str())
+        } else {
+            self.by_ext.get(ext)
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_ext.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_ext.is_empty()
+    }
+}
+
+#[derive(Debug)]
+pub struct Http {
+    pub listeners: Vec<Arc<Listener>>,
+    pub upstreams: HashMap<Box<str>, Arc<Upstream>>,
+    pub maps: Vec<Arc<MapConf>>,
+    pub mime: Arc<MimeTypes>,
+    pub servers: Vec<Arc<ServerConf>>,
+}
+
+#[derive(Debug)]
+pub struct Config {
+    pub worker_processes: WorkerProcesses,
+    pub worker_connections: usize,
+    pub worker_rlimit_nofile: Option<u64>,
+    pub error_log: ErrorLogConf,
+    pub pid: Option<PathBuf>,
+    pub daemon: bool,
+    pub user: Option<(Box<str>, Option<Box<str>>)>,
+    pub prefix: PathBuf,
+    pub http: Option<Http>,
+    /// Directives we parsed but do not implement, kept so `-t` can report them.
+    pub unsupported: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn loc(m: LocMatch) -> Arc<Location> {
+        Arc::new(Location {
+            matcher: m,
+            core: crate::config::build::default_core(),
+            action: Action::Static,
+            try_files: None,
+            rewrites: vec![],
+            ifs: vec![],
+            error_pages: vec![],
+            access_logs: vec![],
+            nested: None,
+            allowed_methods: None,
+            raw_line: 0,
+        })
+    }
+
+    fn set(mut locs: Vec<Arc<Location>>) -> LocSet {
+        let mut s = LocSet::default();
+        for l in locs.drain(..) {
+            match &l.matcher {
+                LocMatch::Exact(_) => s.exact.push(l),
+                LocMatch::Prefix(_) | LocMatch::PrefixNoRegex(_) => s.prefix.push(l),
+                LocMatch::Regex { .. } => s.regex.push(l),
+                LocMatch::Named(n) => {
+                    s.named.insert(n.clone(), l);
+                }
+            }
+        }
+        s.exact.sort_by(|a, b| a.matcher.prefix().cmp(&b.matcher.prefix()));
+        s.prefix.sort_by_key(|l| std::cmp::Reverse(l.matcher.prefix().unwrap_or("").len()));
+        s
+    }
+
+    #[test]
+    fn exact_beats_everything() {
+        let s = set(vec![
+            loc(LocMatch::Exact("/a".into())),
+            loc(LocMatch::Prefix("/a".into())),
+            loc(LocMatch::Regex { re: Box::new(Regex::new("^/a$").unwrap()), ci: false }),
+        ]);
+        let (m, _) = s.find("/a").unwrap();
+        assert!(matches!(m.matcher, LocMatch::Exact(_)));
+    }
+
+    #[test]
+    fn longest_prefix_wins() {
+        let s = set(vec![
+            loc(LocMatch::Prefix("/".into())),
+            loc(LocMatch::Prefix("/img/".into())),
+            loc(LocMatch::Prefix("/img/big/".into())),
+        ]);
+        let (m, _) = s.find("/img/big/x.png").unwrap();
+        assert_eq!(m.matcher.prefix(), Some("/img/big/"));
+    }
+
+    #[test]
+    fn regex_beats_plain_prefix_but_not_caret_tilde() {
+        let plain = set(vec![
+            loc(LocMatch::Prefix("/img/".into())),
+            loc(LocMatch::Regex { re: Box::new(Regex::new(r"\.png$").unwrap()), ci: false }),
+        ]);
+        assert!(matches!(plain.find("/img/a.png").unwrap().0.matcher, LocMatch::Regex { .. }));
+
+        let caret = set(vec![
+            loc(LocMatch::PrefixNoRegex("/img/".into())),
+            loc(LocMatch::Regex { re: Box::new(Regex::new(r"\.png$").unwrap()), ci: false }),
+        ]);
+        assert!(matches!(caret.find("/img/a.png").unwrap().0.matcher, LocMatch::PrefixNoRegex(_)));
+    }
+
+    #[test]
+    fn first_regex_in_config_order_wins() {
+        let s = set(vec![
+            loc(LocMatch::Regex { re: Box::new(Regex::new(r"^/a").unwrap()), ci: false }),
+            loc(LocMatch::Regex { re: Box::new(Regex::new(r"\.png$").unwrap()), ci: false }),
+        ]);
+        let (m, _) = s.find("/a/x.png").unwrap();
+        if let LocMatch::Regex { re, .. } = &m.matcher {
+            assert_eq!(re.as_str(), "^/a");
+        } else {
+            panic!("expected regex");
+        }
+    }
+
+    fn srv(names: Vec<ServerName>) -> Arc<ServerConf> {
+        Arc::new(ServerConf {
+            names,
+            core: crate::config::build::default_core(),
+            locations: LocSet::default(),
+            rewrites: vec![],
+            ifs: vec![],
+            error_pages: vec![],
+            access_logs: vec![],
+            action: Action::None,
+            tls: None,
+            listens: vec![],
+            raw_line: 0,
+        })
+    }
+
+    fn listener(servers: Vec<Arc<ServerConf>>) -> Listener {
+        Listener {
+            addr: "0.0.0.0:80".parse().unwrap(),
+            backlog: 511,
+            reuseport: false,
+            ssl: false,
+            http2: false,
+            ipv6_only: true,
+            deferred: false,
+            rcvbuf: None,
+            sndbuf: None,
+            servers,
+            default_server: 0,
+        }
+    }
+
+    #[test]
+    fn host_matching_precedence() {
+        let default = srv(vec![ServerName::Exact("default".into())]);
+        let exact = srv(vec![ServerName::Exact("www.example.com".into())]);
+        let lead = srv(vec![ServerName::LeadingWildcard("example.com".into())]);
+        let re = srv(vec![ServerName::Regex(Box::new(Regex::new(r"^\d+\.example\.com$").unwrap()))]);
+        let l = listener(vec![default.clone(), exact.clone(), lead.clone(), re.clone()]);
+
+        assert!(Arc::ptr_eq(l.match_host("www.example.com"), &exact));
+        assert!(Arc::ptr_eq(l.match_host("api.example.com"), &lead));
+        assert!(Arc::ptr_eq(l.match_host("42.example.com"), &lead)); // wildcard outranks regex
+        assert!(Arc::ptr_eq(l.match_host("nope.org"), &default));
+        // A trailing dot in Host is stripped before matching.
+        assert!(Arc::ptr_eq(l.match_host("www.example.com."), &exact));
+    }
+
+    #[test]
+    fn regex_host_used_when_no_wildcard_matches() {
+        let default = srv(vec![ServerName::Exact("d".into())]);
+        let re = srv(vec![ServerName::Regex(Box::new(Regex::new(r"^\d+\.test$").unwrap()))]);
+        let l = listener(vec![default, re.clone()]);
+        assert!(Arc::ptr_eq(l.match_host("42.test"), &re));
+    }
+
+    #[test]
+    fn mime_lookup_is_case_insensitive_on_extension() {
+        let mut m = MimeTypes::default();
+        m.insert("PNG", "image/png");
+        assert_eq!(&**m.lookup("/a/b.png").unwrap(), "image/png");
+        assert_eq!(&**m.lookup("/a/b.PNG").unwrap(), "image/png");
+        assert!(m.lookup("/a/noext").is_none());
+    }
+}

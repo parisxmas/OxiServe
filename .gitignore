@@ -1,0 +1,9 @@
+/target
+*.pem
+*.key
+logs/
+bench/results/
+.DS_Store
+bench/work/
+html/1k.html
+html/assets/big.txt
