@@ -6,12 +6,11 @@ OxiServe reads your existing `nginx.conf` — the real grammar, includes, variab
 `server_name` and `location` matching semantics included — and serves it from a
 thread-per-core data plane.
 
-The original goal was to beat nginx on the static hot path. **On a realistic
-Linux benchmark it does not** — nginx is 1.4–2× faster depending on payload
-size (see [Benchmarks](#benchmarks)). The macOS numbers that suggested
-otherwise were an artifact of the test conditions. `sendfile(2)` is now
-implemented and an optimisation pass has closed part of the gap, but not all
-of it; the remaining work is profiling the per-request path.
+The goal is to beat nginx on the static hot path. Current standing on a fair
+Linux benchmark (see [Benchmarks](#benchmarks) for the full history, including
+one measurement bug in each direction that had to be found and corrected):
+**+33% at 1 KiB, statistical tie at 0 B, 100 KiB and 10 MiB.** `sendfile(2)`
+is implemented; the next lever is `open_file_cache`.
 
 ```console
 $ oxiserve -t -c /etc/nginx/nginx.conf
@@ -111,38 +110,52 @@ keepalive, access logging off on both, page cache warmed before each
 measurement — across four payload sizes chosen to exercise different paths.
 It requires `nginx` and one of `wrk` / `oha` / `bombardier`.
 
-### Linux — the result that counts
+### Linux — the corrected result
 
-Debian 12, kernel 6.1, 4 cores, `wrk -t2 -c16`, nginx 1.22.1. Both servers and
-the load generator pinned to 2 cores (a shared box; this bounds the blast
-radius and handicaps both equally), `sendfile on` for both.
+The first Linux comparison reported here said nginx wins at every size. **That
+conclusion was wrong, and the error was ours**: the benchmark pinned OxiServe's
+workers to 2 of the 4 cores, but the same pinning command only ever matched
+nginx's *master* process — its workers (forked earlier, cmdline `nginx: worker
+process`, unmatched by the pgrep pattern) kept all 4 cores. Every previous
+Linux table gave nginx twice the CPU.
 
-| Payload | OxiServe | nginx | ratio | vs. first Linux run |
-|---|---:|---:|---:|---:|
-| 0 B | 43,176 rps | 82,767 rps | 0.52× | — |
-| 1 KiB | 41,202 rps | 55,987 rps | **0.74×** | **+55%** |
-| 100 KiB | 13,910 rps | 31,365 rps | 0.44× | +11% |
-| 10 MiB | ~228 rps | 506 rps | 0.45× | **+82%** |
+With both servers verified onto the same 2 cores (`taskset -cp` checked on the
+actual worker PIDs) and wrk isolated on the other 2, three alternating rounds,
+Debian 12 / kernel 6.1 / nginx 1.22.1, `sendfile on` both:
 
-**nginx is still faster at every size.** An optimisation pass moved 1 KiB by
-55% and 10 MiB by 82%, and did not move 0 B at all. What that pass established:
+| Payload | OxiServe (avg) | nginx (avg) | verdict |
+|---|---:|---:|---|
+| 0 B | 83,092 rps | 81,896 rps | tie (lead flips run to run) |
+| 1 KiB | **75,418 rps** | 56,466 rps | **OxiServe +33%, consistent** |
+| 100 KiB | 30,082 rps | 29,689 rps | tie |
+| 10 MiB | 540 rps | 529 rps | tie (both sendfile) |
 
-- **`sendfile(2)` works and matters.** Measured directly by A/B-ing the
-  directive on the same binary: 10 MiB runs at 228 rps with it and 132 without,
-  a 1.7× gain. It is not enough to reach nginx.
-- **Allocations were worth fixing, but are no longer the limit.** Removing the
-  per-request header `Vec`, the regex-deep-copying directive clones, two
-  redundant location searches, and the `Last-Modified` / `ETag` /
-  `Content-Type` strings bought the 1 KiB gain. A further pass removing three
-  more allocations changed nothing measurable — so the remaining gap is
-  elsewhere.
-- **The 0 B case is the honest signal.** It has no body to send and no
-  compression to do, so it measures pure per-request cost, and it did not
-  improve. At ~0.5× nginx, the request path itself is roughly twice as
-  expensive. That is the next thing to profile, not guess at.
+**Where the 1 KiB win comes from.** Syscall traces (2,000 keep-alive requests
+under `strace -c`) show both servers make ~5.5 syscalls per request, but they
+spend them differently. For a small file nginx issues `writev(head)` +
+`sendfile(body)` — two body-path syscalls; OxiServe reads the file into the
+per-connection write buffer and emits head+body in a **single `sendto`**. One
+syscall instead of two, and no sendfile setup cost on a file that fits in one
+segment anyway.
 
-Measurements on this box carry ±5% run-to-run noise (10 MiB repeated four
-times: 216, 221, 233, 241), so single-run differences under ~10% mean nothing.
+**Why the earlier optimisation conclusions still stand.** The +55% (1 KiB) and
++82% (10 MiB) gains from the allocation/sendfile pass were measured
+OxiServe-vs-OxiServe under identical conditions, so the pinning bug does not
+touch them — without that pass, today's numbers would be losses.
+
+**What profiling established** (perf, 0 B path, 8s sample): 88.5% of CPU is in
+the kernel, 8% in OxiServe's own code, and the top kernel entries are path
+lookup (`strncpy_from_user`, `link_path_walk`) from the per-request
+`stat`+`open`+`close`. Two consequences:
+
+- Optimising user-space further is fighting over 8% of the pie. Stop.
+- The next real lever is **`open_file_cache`**: 3 of our ~5.5 syscalls per
+  request are filesystem metadata that a cache removes entirely. nginx ships
+  this directive but defaults it off; implementing it would honour existing
+  configs and is the clearest route from "tie" to "win" on small files.
+
+Single-run noise on this box is ±5%; the tables above are means of three
+alternating rounds.
 
 ### macOS — where the story began, and why it misled
 
@@ -156,8 +169,9 @@ macOS 15, M-series, 10 cores, unloaded, `wrk -t10 -c128`, nginx 1.31.3,
 | 100 KiB | 74,087 rps | 37,273 rps | 1.99× |
 | 10 MiB | 667 rps | 703 rps | 0.95× |
 
-These looked like wins. They were mostly artifacts, and the Linux run above is
-why I no longer trust them:
+These early numbers looked like large wins. They were partly artifacts, and
+they are kept here because both of this project's measurement lessons live in
+this table:
 
 - **`sendfile off` was hiding nginx's best trick.** It was forced off because
   macOS's `sendfile` has a pathology (nginx collapses to ~100 MB/s). But
@@ -168,9 +182,10 @@ why I no longer trust them:
   contended Linux cores it dominates.
 - Loopback benchmarks measure the server and the kernel, not a network.
 
-The honest summary: **OxiServe is correct and reasonably fast, but it does not
-beat nginx on Linux today.** The name of the game now is closing that gap, not
-claiming it is closed.
+Between this table and the Linux one sits the whole story: a benchmark setup
+error first flattered OxiServe (macOS, sendfile off), then a different one
+flattered nginx (Linux, workers never actually pinned). Both had to be found
+before the numbers meant anything. Trust measurements you have tried to break.
 
 ### Large files (macOS tuning notes)
 
