@@ -1,7 +1,7 @@
 # ADR 0001 — Load balancer scope: what "HAProxy-like" would require
 
 **Status:** Accepted — all five items implemented (1–3 in v0.2.4, 5 in v0.2.9,
-4 in v0.2.12)
+4 in v0.2.12). `ssl_preread`, listed below as a follow-on, shipped in v0.2.13.
 **Date:** 2026-08-06
 **Related:** README "Not implemented"; `src/server/proxy.rs`; `src/config/model.rs` (`Upstream`, `LbMethod`).
 

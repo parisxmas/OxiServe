@@ -301,6 +301,11 @@ impl<'a> Ctx<'a> {
                     push_secs(out, self.upstream_time);
                 }
             }
+            // Set only inside a `stream` block, where the TLS ClientHello is
+            // preread. An HTTP request has already been decrypted (or was
+            // never TLS), so there is nothing to report and nginx leaves them
+            // empty here too.
+            Var::SslPrereadServerName | Var::SslPrereadAlpnProtocols | Var::SslPrereadProtocol => {}
             Var::User(name) => self.user_var(name, out, depth),
             // Resolved only once a response exists; see `LogVars`.
             Var::Status | Var::BodyBytesSent | Var::BytesSent | Var::SentHttp(_) => {}
@@ -351,7 +356,9 @@ impl VarSource for LogVars<'_, '_> {
     }
 }
 
-fn map_lookup<'m>(
+/// Shared with the `stream` block, which runs the same `map` lookup against a
+/// TLS ClientHello instead of a request.
+pub(crate) fn map_lookup<'m>(
     m: &'m MapConf,
     key: &str,
 ) -> Option<&'m Arc<crate::config::vars::Template>> {

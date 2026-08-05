@@ -915,6 +915,17 @@ pub struct StreamServer {
     /// closed. Measured between reads, not from the start, so a long-lived but
     /// busy connection is never cut off.
     pub timeout: Duration,
+    /// `ssl_preread on;` — inspect the TLS ClientHello before choosing a
+    /// backend, so `proxy_pass` can route on `$ssl_preread_server_name`.
+    pub ssl_preread: bool,
+    /// `preread_buffer_size` — the cap on how much we will hold while waiting
+    /// for a complete ClientHello. A client that never sends one costs this
+    /// much memory and no more.
+    pub preread_buffer_size: usize,
+    /// `preread_timeout` — how long to wait for it. On expiry the connection
+    /// is proxied with empty preread variables rather than dropped: a client
+    /// that is slow is not a client that is wrong.
+    pub preread_timeout: Duration,
     pub raw_line: u32,
 }
 
@@ -933,6 +944,11 @@ pub struct StreamListener {
 pub struct StreamConf {
     pub listeners: Vec<Arc<StreamListener>>,
     pub upstreams: HashMap<Box<str>, Arc<Upstream>>,
+    /// `map` blocks declared inside `stream { }`. Kept separate from the HTTP
+    /// ones because the two scopes have different variables available — an
+    /// `$ssl_preread_server_name` map means nothing to a request, and a
+    /// `$http_host` map means nothing to a raw TCP connection.
+    pub maps: Vec<Arc<MapConf>>,
 }
 
 #[derive(Debug)]

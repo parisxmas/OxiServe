@@ -358,3 +358,270 @@ fn a_server_without_proxy_pass_is_rejected() {
     let err = oxiserve::config::load(&f, dir).unwrap_err().to_string();
     assert!(err.contains("proxy_pass"), "got: {err}");
 }
+
+// ---- ssl_preread ----------------------------------------------------------
+
+/// Records the exact bytes a backend received, then replies with its tag.
+///
+/// The byte-for-byte record is the point: `ssl_preread` reads the handshake
+/// but must not consume it, and only the backend can prove that.
+struct Recorder {
+    port: u16,
+    got: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+}
+
+impl Recorder {
+    fn start(tag: &str) -> Recorder {
+        let port = port();
+        let got: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (g, t) = (got.clone(), tag.to_string());
+        let l = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        std::thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                let (g, t) = (g.clone(), t.clone());
+                std::thread::spawn(move || {
+                    let mut c = c;
+                    c.set_read_timeout(Some(Duration::from_millis(700))).ok();
+                    let mut seen = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    // Read until the client stops sending; a TLS client would
+                    // now wait for a ServerHello it is never going to get.
+                    while let Ok(n) = c.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        seen.extend_from_slice(&buf[..n]);
+                        if seen.len() > 64 * 1024 {
+                            break;
+                        }
+                    }
+                    let _ = c.write_all(t.as_bytes());
+                    if !seen.is_empty() {
+                        g.lock().unwrap().push(seen);
+                    }
+                });
+            }
+        });
+        Recorder { port, got }
+    }
+
+    /// Connections that carried data, oldest first.
+    fn received(&self) -> Vec<Vec<u8>> {
+        self.got.lock().unwrap().clone()
+    }
+}
+
+/// A minimal but structurally valid TLS 1.3 ClientHello.
+fn client_hello(sni: &str, alpn: &[&str]) -> Vec<u8> {
+    fn u16b(n: usize) -> [u8; 2] {
+        (n as u16).to_be_bytes()
+    }
+    let mut ext = Vec::new();
+    if !sni.is_empty() {
+        let mut entry = vec![0u8]; // host_name
+        entry.extend_from_slice(&u16b(sni.len()));
+        entry.extend_from_slice(sni.as_bytes());
+        ext.extend_from_slice(&[0x00, 0x00]); // server_name
+        ext.extend_from_slice(&u16b(entry.len() + 2));
+        ext.extend_from_slice(&u16b(entry.len()));
+        ext.extend_from_slice(&entry);
+    }
+    if !alpn.is_empty() {
+        let mut list = Vec::new();
+        for p in alpn {
+            list.push(p.len() as u8);
+            list.extend_from_slice(p.as_bytes());
+        }
+        ext.extend_from_slice(&[0x00, 0x10]); // alpn
+        ext.extend_from_slice(&u16b(list.len() + 2));
+        ext.extend_from_slice(&u16b(list.len()));
+        ext.extend_from_slice(&list);
+    }
+    // supported_versions: TLS 1.3
+    ext.extend_from_slice(&[0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04]);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]); // legacy_version = TLS 1.2
+    body.extend_from_slice(&[0x42; 32]); // random
+    body.push(0); // no session id
+    body.extend_from_slice(&u16b(2)); // one cipher suite
+    body.extend_from_slice(&[0x13, 0x01]);
+    body.extend_from_slice(&[1, 0]); // one compression method: null
+    body.extend_from_slice(&u16b(ext.len()));
+    body.extend_from_slice(&ext);
+
+    let mut hs = vec![0x01u8]; // client_hello
+    hs.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+    hs.extend_from_slice(&body);
+
+    let mut rec = vec![0x16u8, 0x03, 0x01];
+    rec.extend_from_slice(&u16b(hs.len()));
+    rec.extend_from_slice(&hs);
+    rec
+}
+
+/// Opens a raw connection to the proxy, sends `bytes`, returns the reply.
+fn send_raw(port: u16, bytes: &[u8]) -> String {
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    c.write_all(bytes).unwrap();
+    c.flush().unwrap();
+    let mut buf = [0u8; 1024];
+    match c.read(&mut buf) {
+        Ok(n) => String::from_utf8_lossy(&buf[..n]).into_owned(),
+        Err(_) => String::new(),
+    }
+}
+
+#[test]
+fn sni_selects_the_backend() {
+    let a = Recorder::start("alpha");
+    let b = Recorder::start("bravo");
+    let d = Recorder::start("default");
+
+    let s = Server::start(
+        "sni",
+        &conf(&format!("
+    map $ssl_preread_server_name $pick {{
+        a.example.com   back_a;
+        b.example.com   back_b;
+        default         back_d;
+    }}
+    upstream back_a {{ server 127.0.0.1:{}; }}
+    upstream back_b {{ server 127.0.0.1:{}; }}
+    upstream back_d {{ server 127.0.0.1:{}; }}
+    server {{
+        listen {{PORT}};
+        ssl_preread on;
+        proxy_pass $pick;
+    }}", a.port, b.port, d.port)),
+    );
+
+    assert_eq!(send_raw(s.port, &client_hello("a.example.com", &[])), "alpha");
+    assert_eq!(send_raw(s.port, &client_hello("b.example.com", &[])), "bravo");
+    assert_eq!(send_raw(s.port, &client_hello("other.example.com", &[])), "default");
+    // No SNI at all is not an error; it falls to the default like any other
+    // unmatched key.
+    assert_eq!(send_raw(s.port, &client_hello("", &[])), "default");
+}
+
+#[test]
+fn the_backend_receives_the_handshake_byte_for_byte() {
+    // The property that makes this a preread rather than a TLS terminator: we
+    // inspect the ClientHello and still hand over every byte of it, so the
+    // backend completes the handshake against untouched input. Losing or
+    // reordering one byte breaks TLS in a way that looks like a backend fault.
+    let back = Recorder::start("b");
+    let s = Server::start(
+        "intact",
+        &conf(&format!("
+    map $ssl_preread_server_name $pick {{ default only; }}
+    upstream only {{ server 127.0.0.1:{}; }}
+    server {{ listen {{PORT}}; ssl_preread on; proxy_pass $pick; }}", back.port)),
+    );
+
+    let hello = client_hello("intact.example.com", &["h2", "http/1.1"]);
+    // Trailing application bytes, to prove the preread does not swallow what
+    // follows the handshake either.
+    let mut sent = hello.clone();
+    sent.extend_from_slice(b"AFTER-THE-HANDSHAKE");
+    send_raw(s.port, &sent);
+
+    std::thread::sleep(Duration::from_millis(400));
+    let got = back.received();
+    let full = got
+        .iter()
+        .find(|r| r.len() >= sent.len())
+        .unwrap_or_else(|| panic!("backend saw {} connection(s), none complete", got.len()));
+    assert_eq!(&full[..], &sent[..], "the backend must see exactly what the client sent");
+}
+
+#[test]
+fn alpn_and_protocol_are_readable_as_variables() {
+    let h2 = Recorder::start("h2-backend");
+    let other = Recorder::start("other-backend");
+    let s = Server::start(
+        "alpn",
+        &conf(&format!("
+    map $ssl_preread_alpn_protocols $pick {{
+        ~\\bh2\\b   grpcish;
+        default    plain;
+    }}
+    upstream grpcish {{ server 127.0.0.1:{}; }}
+    upstream plain {{ server 127.0.0.1:{}; }}
+    server {{ listen {{PORT}}; ssl_preread on; proxy_pass $pick; }}", h2.port, other.port)),
+    );
+
+    assert_eq!(send_raw(s.port, &client_hello("x.test", &["h2", "http/1.1"])), "h2-backend");
+    assert_eq!(send_raw(s.port, &client_hello("x.test", &["http/1.1"])), "other-backend");
+}
+
+#[test]
+fn non_tls_traffic_still_gets_proxied_and_arrives_intact() {
+    // A port with ssl_preread on may still receive something that is not TLS.
+    // Such a connection must be proxied with empty variables, not dropped —
+    // and the bytes the parser looked at must still reach the backend.
+    let back = Recorder::start("plain");
+    let s = Server::start(
+        "nontls",
+        &conf(&format!("
+    map $ssl_preread_server_name $pick {{ default only; }}
+    upstream only {{ server 127.0.0.1:{}; }}
+    server {{ listen {{PORT}}; ssl_preread on; proxy_pass $pick; }}", back.port)),
+    );
+
+    let payload = b"PING hello world\n";
+    assert_eq!(send_raw(s.port, payload), "plain");
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        back.received().iter().any(|r| r == payload),
+        "non-TLS bytes must reach the backend unchanged: {:?}",
+        back.received()
+    );
+}
+
+#[test]
+fn a_client_that_sends_nothing_does_not_hang_forever() {
+    // preread_timeout bounds the wait. Past it the connection is proxied with
+    // empty variables rather than dropped: slow is not the same as wrong.
+    let back = Recorder::start("late");
+    let s = Server::start(
+        "timeout",
+        &conf(&format!("
+    map $ssl_preread_server_name $pick {{ default only; }}
+    upstream only {{ server 127.0.0.1:{}; }}
+    server {{
+        listen {{PORT}};
+        ssl_preread on;
+        preread_timeout 300ms;
+        proxy_pass $pick;
+    }}", back.port)),
+    );
+
+    let started = Instant::now();
+    let mut c = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut buf = [0u8; 64];
+    let n = c.read(&mut buf).unwrap_or(0);
+    let waited = started.elapsed();
+    assert_eq!(&buf[..n], b"late", "the connection must still be proxied");
+    assert!(waited < Duration::from_secs(3), "waited {waited:?}, preread_timeout was 300ms");
+}
+
+#[test]
+fn routing_on_a_preread_variable_without_enabling_it_is_a_config_error() {
+    // Otherwise every connection quietly takes the map's default and the
+    // config looks like it works until traffic lands on the wrong backend.
+    let dir = std::env::temp_dir().join(format!("oxiserve-preread-bad-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("bad.conf");
+    std::fs::write(
+        &f,
+        "events {} stream { map $ssl_preread_server_name $p { default u; } \
+         upstream u { server 127.0.0.1:1; } \
+         server { listen 19399; proxy_pass $p; } }",
+    )
+    .unwrap();
+    let err = oxiserve::config::load(&f, dir).unwrap_err().to_string();
+    assert!(err.contains("ssl_preread"), "got: {err}");
+}

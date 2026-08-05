@@ -75,6 +75,15 @@ pub enum Var {
     UpstreamConnectTime,
     /// `$cookie_sessionid`
     Cookie(Arc<str>),
+    /// `$ssl_preread_server_name` — the SNI from the client's TLS
+    /// ClientHello, read without terminating TLS. Only ever set inside a
+    /// `stream` block; empty everywhere else.
+    SslPrereadServerName,
+    /// `$ssl_preread_alpn_protocols` — the offered ALPN identifiers, joined
+    /// with commas.
+    SslPrereadAlpnProtocols,
+    /// `$ssl_preread_protocol` — the highest TLS version the client offers.
+    SslPrereadProtocol,
     /// `$1` … `$9`, captured by a regex `location` or `if`.
     Capture(u8),
     /// A `set`-defined or otherwise user-declared variable.
@@ -142,6 +151,9 @@ impl Var {
             "upstream_cache_status" => Var::UpstreamCacheStatus,
             "upstream_response_time" => Var::UpstreamResponseTime,
             "upstream_connect_time" => Var::UpstreamConnectTime,
+            "ssl_preread_server_name" => Var::SslPrereadServerName,
+            "ssl_preread_alpn_protocols" => Var::SslPrereadAlpnProtocols,
+            "ssl_preread_protocol" => Var::SslPrereadProtocol,
             _ => Var::User(Arc::from(name)),
         }
     }
@@ -199,6 +211,9 @@ impl Var {
             Var::UpstreamCacheStatus => "upstream_cache_status",
             Var::UpstreamResponseTime => "upstream_response_time",
             Var::UpstreamConnectTime => "upstream_connect_time",
+            Var::SslPrereadServerName => "ssl_preread_server_name",
+            Var::SslPrereadAlpnProtocols => "ssl_preread_alpn_protocols",
+            Var::SslPrereadProtocol => "ssl_preread_protocol",
             // The dynamic ones rebuild the name they were written with.
             Var::Http(h) => return format!("http_{}", h.replace('-', "_")),
             Var::SentHttp(h) => return format!("sent_http_{}", h.replace('-', "_")),

@@ -127,8 +127,28 @@ selection, passive health and `least_conn` with the HTTP proxy; `proxy_timeout`
 is an *idle* timeout, so a long-lived session is never severed for being long.
 `listen unix:` works here too.
 
+**`ssl_preread`** — route TLS on SNI without terminating it. The ClientHello is
+read and *not consumed*: every byte, including the ones inspected, is forwarded,
+so the backend completes the handshake against untouched input and we never hold
+a key or a certificate. `$ssl_preread_server_name`,
+`$ssl_preread_alpn_protocols` and `$ssl_preread_protocol` feed a `stream`-level
+`map`, with `preread_buffer_size` and `preread_timeout` bounding the wait.
+Traffic that is not TLS is proxied unchanged rather than dropped — important
+because it shares the port with protocols where the server speaks first.
+
+```nginx
+stream {
+    map $ssl_preread_server_name $backend {
+        api.example.com   api_pool;
+        git.example.com   git_pool;
+        default           web_pool;
+    }
+    server { listen 443; ssl_preread on; proxy_pass $backend; }
+}
+```
+
 > **Still missing for a true HAProxy replacement:** UDP in `stream`,
-> `ssl_preread`, cookie-based sticky sessions, a stats endpoint.
+> cookie-based sticky sessions, a stats endpoint.
 > Scope and order: [ADR-0001](docs/decisions/0001-load-balancer-scope.md).
 
 **TLS** — rustls, `ssl_certificate` / `ssl_certificate_key`, SNI across servers
@@ -168,7 +188,7 @@ regex captures `$1`–`$9`.
 - **`limit_conn`** connection limiting (`limit_req` is implemented).
 - **`auth_basic`**, `auth_request`.
 - **Unix domain sockets** in `listen`.
-- **`mail`** block; **UDP** and `ssl_preread` inside `stream`.
+- **`mail`** block; **UDP** inside `stream` (`ssl_preread` is implemented).
 - **PCRE-only regex** — lookaround and backreferences are rejected with a clear
   error rather than silently mismatching (Rust's `regex` has neither).
 

@@ -45,3 +45,9 @@ path = "fuzz_targets/config_lexer.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "tls_preread"
+path = "fuzz_targets/tls_preread.rs"
+test = false
+doc = false

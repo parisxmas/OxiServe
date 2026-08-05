@@ -22,6 +22,7 @@ pub mod handler;
 pub mod limit_req;
 pub mod log;
 pub mod msgpack;
+pub mod preread;
 pub mod proxy;
 pub mod reply;
 pub mod stream;
@@ -615,7 +616,7 @@ async fn stream_accept_loop(
     sc: Arc<crate::config::model::StreamConf>,
 ) {
     loop {
-        let (sock, _peer) = match listener.accept().await {
+        let (sock, peer) = match listener.accept().await {
             Ok(p) => p,
             Err(e) => {
                 if matches!(
@@ -636,7 +637,7 @@ async fn stream_accept_loop(
         let srv = conf.server.clone();
         let sc = sc.clone();
         tokio::task::spawn_local(async move {
-            stream::serve(sock, srv, sc).await;
+            stream::serve(sock, srv, sc, peer).await;
         });
     }
 }

@@ -2046,7 +2046,6 @@ struct ProbedBackend {
     port: u16,
     healthy: std::sync::Arc<std::sync::atomic::AtomicBool>,
     probes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    tag: &'static str,
 }
 
 impl ProbedBackend {
@@ -2085,7 +2084,7 @@ impl ProbedBackend {
                 });
             }
         });
-        ProbedBackend { port, healthy, probes, tag }
+        ProbedBackend { port, healthy, probes }
     }
     fn probes(&self) -> usize { self.probes.load(Ordering::SeqCst) }
     fn set_healthy(&self, v: bool) { self.healthy.store(v, Ordering::SeqCst); }

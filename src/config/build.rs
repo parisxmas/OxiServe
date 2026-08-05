@@ -2603,6 +2603,12 @@ impl Builder {
     fn stream(&mut self, d: &Directive) -> R<StreamConf> {
         let mut upstreams: HashMap<Box<str>, Arc<Upstream>> = HashMap::new();
         let mut servers: Vec<Arc<StreamServer>> = Vec::new();
+        let mut maps: Vec<Arc<MapConf>> = Vec::new();
+        // stream-level defaults, inherited by every server that does not
+        // override them — the same two-level shape as the HTTP block.
+        let mut preread_buffer_size = 16384usize;
+        let mut preread_timeout = Duration::from_secs(30);
+        let mut stream_dirs: Vec<&Directive> = Vec::new();
 
         for c in d.children() {
             match c.name.as_str() {
@@ -2611,14 +2617,27 @@ impl Builder {
                     let u = self.upstream(c)?;
                     upstreams.insert(c.args[0].as_str().into(), Arc::new(u));
                 }
-                "server" => servers.push(Arc::new(self.stream_server(c)?)),
+                // Servers are built after the whole block is read, so a
+                // `preread_timeout` written below a `server` still reaches it.
+                "server" => stream_dirs.push(c),
+                "map" => maps.push(Arc::new(self.map(c)?)),
+                "preread_buffer_size" => preread_buffer_size = size_arg(c, 0)? as usize,
+                "preread_timeout" => preread_timeout = time_arg(c, 0)?,
                 // Logging inside stream uses a different variable set than
                 // HTTP; accepted and ignored rather than silently misapplied.
-                "access_log" | "error_log" | "log_format" | "preread_buffer_size"
-                | "preread_timeout" | "tcp_nodelay" | "resolver" | "resolver_timeout"
+                "access_log" | "error_log" | "log_format" | "tcp_nodelay"
+                | "resolver" | "resolver_timeout"
                 | "variables_hash_bucket_size" | "variables_hash_max_size" => {}
                 _ => self.note_unsupported(c),
             }
+        }
+        for c in stream_dirs {
+            servers.push(Arc::new(self.stream_server(
+                c,
+                &maps,
+                preread_buffer_size,
+                preread_timeout,
+            )?));
         }
 
         if servers.is_empty() {
@@ -2651,12 +2670,19 @@ impl Builder {
             }
         }
 
-        Ok(StreamConf { listeners, upstreams })
+        Ok(StreamConf { listeners, upstreams, maps })
     }
 
-    fn stream_server(&mut self, d: &Directive) -> R<StreamServer> {
+    fn stream_server(
+        &mut self,
+        d: &Directive,
+        maps: &[Arc<MapConf>],
+        mut preread_buffer_size: usize,
+        mut preread_timeout: Duration,
+    ) -> R<StreamServer> {
         let mut listens = Vec::new();
         let mut target: Option<ProxyTarget> = None;
+        let mut ssl_preread = false;
         let mut connect_timeout = Duration::from_secs(60);
         // nginx's default proxy_timeout is 10 minutes: stream connections are
         // long-lived by nature (databases, message brokers).
@@ -2672,9 +2698,12 @@ impl Builder {
                 }
                 "proxy_connect_timeout" => connect_timeout = time_arg(c, 0)?,
                 "proxy_timeout" => timeout = time_arg(c, 0)?,
+                "ssl_preread" => ssl_preread = flag(c)?,
+                "preread_buffer_size" => preread_buffer_size = size_arg(c, 0)? as usize,
+                "preread_timeout" => preread_timeout = time_arg(c, 0)?,
                 "proxy_protocol" | "proxy_buffer_size" | "proxy_socket_keepalive"
                 | "proxy_next_upstream" | "proxy_next_upstream_tries"
-                | "proxy_next_upstream_timeout" | "ssl_preread" => {}
+                | "proxy_next_upstream_timeout" => {}
                 _ => self.note_unsupported(c),
             }
         }
@@ -2691,6 +2720,62 @@ impl Builder {
             }
         }
 
-        Ok(StreamServer { listens, target, connect_timeout, timeout, raw_line: d.line })
+        // Routing on a preread variable without turning preread on would
+        // silently send every connection to whatever the map's default is —
+        // a misconfiguration that looks like a working config until traffic
+        // lands on the wrong backend.
+        if let ProxyTarget::Dynamic(t) = &target {
+            if !ssl_preread && uses_preread_var(t, maps, 0) {
+                bail!(
+                    d,
+                    "\"proxy_pass\" uses an $ssl_preread_ variable but \"ssl_preread\" is off"
+                );
+            }
+        }
+        if preread_buffer_size == 0 {
+            bail!(d, "\"preread_buffer_size\" must be greater than 0");
+        }
+
+        Ok(StreamServer {
+            listens,
+            target,
+            connect_timeout,
+            timeout,
+            ssl_preread,
+            preread_buffer_size,
+            preread_timeout,
+            raw_line: d.line,
+        })
+    }
+}
+
+/// True when a template depends on an `$ssl_preread_*` variable, directly or
+/// through any chain of `map` blocks.
+///
+/// The direct form (`proxy_pass $ssl_preread_server_name;`) is not how anyone
+/// writes this. The real shape is `map $ssl_preread_server_name $backend` and
+/// then `proxy_pass $backend`, so a check that only looked at the template's
+/// own variables would miss every realistic config — which is the whole point
+/// of the check.
+fn uses_preread_var(t: &Template, maps: &[Arc<MapConf>], depth: u32) -> bool {
+    // Maps may legally reference each other; the same cap the runtime uses
+    // keeps a cycle from spinning here at config-load time.
+    if depth > 8 {
+        return false;
+    }
+    t.vars().any(|v| var_uses_preread(v, maps, depth))
+}
+
+fn var_uses_preread(v: &Var, maps: &[Arc<MapConf>], depth: u32) -> bool {
+    match v {
+        Var::SslPrereadServerName | Var::SslPrereadAlpnProtocols | Var::SslPrereadProtocol => true,
+        Var::User(name) => maps.iter().filter(|m| *m.target == **name).any(|m| {
+            var_uses_preread(&m.source, maps, depth + 1)
+                || m.exact.values().any(|t| uses_preread_var(t, maps, depth + 1))
+                || m.wildcards.iter().any(|(_, t, _)| uses_preread_var(t, maps, depth + 1))
+                || m.regexes.iter().any(|(_, t)| uses_preread_var(t, maps, depth + 1))
+                || m.default.as_ref().is_some_and(|t| uses_preread_var(t, maps, depth + 1))
+        }),
+        _ => false,
     }
 }
