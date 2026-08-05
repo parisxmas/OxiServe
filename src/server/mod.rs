@@ -221,6 +221,31 @@ fn worker(
             }));
         }
 
+        // Active health checks, on ONE worker only. Every worker probing the
+        // same backend would multiply the load on it by the worker count for
+        // no extra information, and the health state is shared anyway.
+        if id == 0 {
+            let mut probed: Vec<Arc<crate::config::model::Upstream>> = Vec::new();
+            probed.extend(http.upstreams.values().cloned());
+            if let Some(sc) = &stream_conf {
+                probed.extend(sc.upstreams.values().cloned());
+            }
+            for up in probed {
+                let Some(hc) = up.health_check.clone() else { continue };
+                tasks.push(tokio::task::spawn_local(async move {
+                    // Probe once at startup so a backend that is already down
+                    // is known before the first request rather than after it.
+                    crate::server::upstream::probe_round(&up, &hc).await;
+                    let mut tick = tokio::time::interval(hc.interval);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tick.tick().await;
+                        crate::server::upstream::probe_round(&up, &hc).await;
+                    }
+                }));
+            }
+        }
+
         // The cache manager runs on ONE worker only. Every worker shares the
         // same directory, so several of them pruning at once would race to
         // delete the same files and each see a different total size. Worker 0

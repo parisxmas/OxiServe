@@ -113,8 +113,10 @@ directories `levels=` leaves behind. It walks the filesystem rather than
 trusting the in-process index, because that index is per worker and empty
 after a restart — the same reason nginx runs a separate cache loader.
 
-**Load balancing** — passive health checks (`max_fails` / `fail_timeout`, with
-ejection and automatic recovery), `backup` failover, weighted round-robin, real
+**Load balancing** — active health checks (`health_check interval= fails=
+passes= uri= status=`, HTTP or plain TCP, with hysteresis in both directions),
+passive health checks (`max_fails` / `fail_timeout`, with ejection and
+automatic recovery), `backup` failover, weighted round-robin, real
 `least_conn` (in-flight counts, weight-aware), `ip_hash`, and an upstream
 `keepalive` pool that probes a connection for liveness before reusing it.
 Health is shared across workers; the pool is per worker.
@@ -125,8 +127,8 @@ selection, passive health and `least_conn` with the HTTP proxy; `proxy_timeout`
 is an *idle* timeout, so a long-lived session is never severed for being long.
 `listen unix:` works here too.
 
-> **Still missing for a true HAProxy replacement:** active health checks, UDP
-> in `stream`, `ssl_preread`, cookie-based sticky sessions, a stats endpoint.
+> **Still missing for a true HAProxy replacement:** UDP in `stream`,
+> `ssl_preread`, cookie-based sticky sessions, a stats endpoint.
 > Scope and order: [ADR-0001](docs/decisions/0001-load-balancer-scope.md).
 
 **TLS** — rustls, `ssl_certificate` / `ssl_certificate_key`, SNI across servers

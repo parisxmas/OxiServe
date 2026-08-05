@@ -796,6 +796,40 @@ pub struct UpstreamServer {
     pub max_conns: Option<u32>,
 }
 
+/// `health_check` — active probing, run whether or not traffic is flowing.
+///
+/// This is the difference from passive tracking: passive health only learns a
+/// peer is dead when a real request fails on it, so a backend that dies during
+/// a quiet period is discovered by the first unlucky visitor. Active checks
+/// find it first. Open-source nginx has no equivalent (it is an nginx Plus
+/// feature), so this is a capability gained rather than parity.
+#[derive(Debug, Clone)]
+pub struct HealthCheck {
+    pub interval: Duration,
+    /// Consecutive failures before a peer is taken out.
+    pub fails: u32,
+    /// Consecutive successes before it is put back.
+    pub passes: u32,
+    /// `uri=` makes it an HTTP probe; without one it is a plain TCP connect,
+    /// which is all that is meaningful for a `stream` upstream.
+    pub uri: Option<Arc<str>>,
+    pub expect_status: u16,
+    pub timeout: Duration,
+}
+
+impl Default for HealthCheck {
+    fn default() -> Self {
+        HealthCheck {
+            interval: Duration::from_secs(5),
+            fails: 1,
+            passes: 1,
+            uri: None,
+            expect_status: 200,
+            timeout: Duration::from_secs(5),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Upstream {
     pub name: Box<str>,
@@ -808,6 +842,8 @@ pub struct Upstream {
     pub health: Vec<crate::server::upstream::PeerHealth>,
     /// Reference point for the millisecond timestamps in `health`.
     pub origin: std::time::Instant,
+    /// `health_check` in this upstream block, if any.
+    pub health_check: Option<HealthCheck>,
 }
 
 /// A compiled `map $in $out { ... }`.

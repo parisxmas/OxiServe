@@ -1,7 +1,7 @@
 # ADR 0001 — Load balancer scope: what "HAProxy-like" would require
 
-**Status:** Accepted — items 1–3 (v0.2.4) and 5 (v0.2.9) implemented; item 4
-(active health checks) outstanding
+**Status:** Accepted — all five items implemented (1–3 in v0.2.4, 5 in v0.2.9,
+4 in v0.2.12)
 **Date:** 2026-08-06
 **Related:** README "Not implemented"; `src/server/proxy.rs`; `src/config/model.rs` (`Upstream`, `LbMethod`).
 
@@ -70,6 +70,13 @@ which is why it comes third rather than first.
 timeout and rise/fall thresholds. Deliberately after (1): passive tracking
 already prevents the worst outcome, and open-source nginx has no active checks
 at all, so this differentiates against nginx *and* moves toward HAProxy.
+
+*Shipped in v0.2.12.* Two design points worth recording: probes run on one
+worker only (several would multiply load on the backend for no extra
+information, and the health state is shared regardless), and `probe_down` is
+kept separate from the passive `down_until_ms` because it must NOT expire — an
+active checker has a live opinion, so a peer stays out until the probes say
+otherwise rather than drifting back in on a timeout.
 
 **5. `stream` block (L4 TCP/UDP)** — accept and splice, no HTTP parsing. The
 largest piece and HAProxy's core competence, but genuinely simpler than the

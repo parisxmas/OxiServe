@@ -16,7 +16,8 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::config::model::{LbMethod, Upstream};
@@ -33,6 +34,14 @@ pub struct PeerHealth {
     window_start_ms: AtomicU64,
     /// Requests in flight right now — the number `least_conn` balances on.
     in_flight: AtomicU32,
+    /// Consecutive failed active probes.
+    probe_fails: AtomicU32,
+    /// Consecutive successful active probes.
+    probe_passes: AtomicU32,
+    /// Set by the active checker. Separate from `down_until_ms` because it has
+    /// no expiry: a peer failing its probes stays out until the probes say
+    /// otherwise, rather than drifting back in after a timeout.
+    probe_down: AtomicBool,
 }
 
 impl PeerHealth {
@@ -41,8 +50,42 @@ impl PeerHealth {
     }
 
     pub fn is_down(&self, now_ms: u64) -> bool {
+        if self.probe_down.load(Ordering::Relaxed) {
+            return true;
+        }
         let until = self.down_until_ms.load(Ordering::Relaxed);
         until != 0 && now_ms < until
+    }
+
+    /// Records the result of one active probe.
+    ///
+    /// The counters are consecutive, and each result clears the other's: a
+    /// peer must fail `fails` times in a row to go down and pass `passes`
+    /// times in a row to come back. That hysteresis is the whole point — a
+    /// single blip should not flap a peer in or out of rotation.
+    pub fn record_probe(&self, ok: bool, fails: u32, passes: u32) {
+        if ok {
+            self.probe_fails.store(0, Ordering::Relaxed);
+            let p = self.probe_passes.fetch_add(1, Ordering::Relaxed) + 1;
+            if p >= passes.max(1) {
+                self.probe_down.store(false, Ordering::Relaxed);
+                // A peer the probes have vouched for should not stay out on
+                // stale passive failures either.
+                self.fails.store(0, Ordering::Relaxed);
+                self.down_until_ms.store(0, Ordering::Relaxed);
+            }
+        } else {
+            self.probe_passes.store(0, Ordering::Relaxed);
+            let f = self.probe_fails.fetch_add(1, Ordering::Relaxed) + 1;
+            if f >= fails.max(1) {
+                self.probe_down.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Whether the active checker currently considers this peer down.
+    pub fn probe_says_down(&self) -> bool {
+        self.probe_down.load(Ordering::Relaxed)
     }
 
     /// Records a failed attempt. Once `max_fails` failures land inside one
@@ -276,6 +319,7 @@ mod tests {
             keepalive: 0,
             health,
             origin: Instant::now(),
+            health_check: None,
         }
     }
 
@@ -426,5 +470,203 @@ mod tests {
         for _ in 0..10 {
             assert_eq!(select(&up, now, Some(12345), 0), first, "same client must be sticky");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Active health checks
+// ---------------------------------------------------------------------------
+
+use crate::config::model::HealthCheck;
+
+/// Probes every peer of an upstream once and records the results.
+///
+/// Runs on one worker only. Several workers probing the same backend would
+/// multiply the load on it by the worker count for no extra information, and
+/// the health state they write to is shared anyway.
+pub async fn probe_round(up: &Arc<Upstream>, hc: &HealthCheck) {
+    for (i, server) in up.servers.iter().enumerate() {
+        if server.down {
+            continue; // administratively disabled; nothing to learn
+        }
+        let addr = if server.addr.starts_with("unix:") || server.addr.contains(':') {
+            server.addr.to_string()
+        } else {
+            format!("{}:80", server.addr)
+        };
+        let ok = probe_one(&addr, hc).await;
+        up.health[i].record_probe(ok, hc.fails, hc.passes);
+    }
+}
+
+/// One probe: connect, and for an HTTP check also send a request and read the
+/// status line.
+async fn probe_one(addr: &str, hc: &HealthCheck) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let connect = tokio::time::timeout(hc.timeout, super::transport::Stream::connect(addr));
+    let Ok(Ok(mut sock)) = connect.await else {
+        return false;
+    };
+
+    let Some(uri) = &hc.uri else {
+        // A TCP check: being able to connect is the whole test. That is all
+        // that is meaningful in front of a database or a message broker.
+        return true;
+    };
+
+    let host = addr.strip_prefix("unix:").unwrap_or(addr);
+    let req = format!(
+        "GET {uri} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: oxiserve-health\r\n\
+         Connection: close\r\n\r\n"
+    );
+    if tokio::time::timeout(hc.timeout, sock.write_all(req.as_bytes()))
+        .await
+        .map(|r| r.is_err())
+        .unwrap_or(true)
+    {
+        return false;
+    }
+
+    // Only the status line is needed, so read once rather than draining the
+    // whole response — a probe should be cheap for the backend too.
+    let mut buf = [0u8; 256];
+    let n = match tokio::time::timeout(hc.timeout, sock.read(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => n,
+        _ => return false,
+    };
+
+    parse_status(&buf[..n]) == Some(hc.expect_status)
+}
+
+/// Extracts the status code from a status line, without a full HTTP parse.
+fn parse_status(buf: &[u8]) -> Option<u16> {
+    let line = buf.split(|&b| b == b'\r' || b == b'\n').next()?;
+    let mut parts = line.split(|&b| b == b' ');
+    let version = parts.next()?;
+    if !version.starts_with(b"HTTP/") {
+        return None;
+    }
+    std::str::from_utf8(parts.next()?).ok()?.parse().ok()
+}
+
+#[cfg(test)]
+mod health_check_tests {
+    use super::*;
+    use crate::config::model::UpstreamServer;
+    use std::time::Duration;
+
+    fn health() -> PeerHealth {
+        PeerHealth::default()
+    }
+
+    #[test]
+    fn status_line_parsing() {
+        assert_eq!(parse_status(b"HTTP/1.1 200 OK\r\n"), Some(200));
+        assert_eq!(parse_status(b"HTTP/1.0 503 Service Unavailable\r\n"), Some(503));
+        assert_eq!(parse_status(b"HTTP/1.1 404\r\n"), Some(404));
+        // Anything that is not a status line must not be read as a success.
+        assert_eq!(parse_status(b"garbage"), None);
+        assert_eq!(parse_status(b""), None);
+        assert_eq!(parse_status(b"+OK redis\r\n"), None);
+    }
+
+    #[test]
+    fn a_peer_goes_down_only_after_consecutive_failures() {
+        let h = health();
+        // fails=3: two failures are not enough.
+        h.record_probe(false, 3, 1);
+        h.record_probe(false, 3, 1);
+        assert!(!h.probe_says_down(), "two of three failures must not eject");
+        h.record_probe(false, 3, 1);
+        assert!(h.probe_says_down(), "the third must");
+    }
+
+    #[test]
+    fn a_success_resets_the_failure_streak() {
+        // The counters are consecutive: a blip between failures must not
+        // accumulate towards ejection.
+        let h = health();
+        h.record_probe(false, 3, 1);
+        h.record_probe(false, 3, 1);
+        h.record_probe(true, 3, 1);
+        h.record_probe(false, 3, 1);
+        h.record_probe(false, 3, 1);
+        assert!(!h.probe_says_down(), "the streak must have restarted");
+    }
+
+    #[test]
+    fn recovery_needs_consecutive_passes() {
+        let h = health();
+        h.record_probe(false, 1, 3);
+        assert!(h.probe_says_down());
+        h.record_probe(true, 1, 3);
+        h.record_probe(true, 1, 3);
+        assert!(h.probe_says_down(), "two of three passes must not restore");
+        h.record_probe(true, 1, 3);
+        assert!(!h.probe_says_down(), "the third must");
+    }
+
+    #[test]
+    fn a_failure_during_recovery_restarts_the_count() {
+        let h = health();
+        h.record_probe(false, 1, 3);
+        h.record_probe(true, 1, 3);
+        h.record_probe(true, 1, 3);
+        h.record_probe(false, 1, 3); // blip
+        h.record_probe(true, 1, 3);
+        h.record_probe(true, 1, 3);
+        assert!(h.probe_says_down(), "recovery must start over after a failure");
+    }
+
+    #[test]
+    fn probe_down_has_no_expiry_unlike_passive_ejection() {
+        // Passive ejection lapses after fail_timeout; an active check has a
+        // live opinion, so it must not drift back in on its own.
+        let h = health();
+        h.record_probe(false, 1, 1);
+        assert!(h.is_down(0));
+        assert!(h.is_down(u64::MAX / 2), "must stay down until the probes say otherwise");
+        h.record_probe(true, 1, 1);
+        assert!(!h.is_down(0));
+    }
+
+    #[test]
+    fn a_vouched_peer_is_cleared_of_stale_passive_failures() {
+        // Passive tracking may have ejected a peer that has since recovered.
+        // Once probes vouch for it, that stale penalty must not keep it out.
+        let h = health();
+        h.record_failure(0, 1, 60_000); // passive: down until t=60s
+        assert!(h.is_down(1000));
+        h.record_probe(true, 1, 1);
+        assert!(!h.is_down(1000), "an active pass must clear a passive ejection");
+    }
+
+    #[test]
+    fn administratively_down_servers_are_not_probed() {
+        // `server ... down;` means the operator took it out; probing it would
+        // be load on a machine nobody asked us to talk to.
+        let servers = vec![UpstreamServer {
+            addr: "127.0.0.1:1".into(),
+            weight: 1,
+            max_fails: 1,
+            fail_timeout: Duration::from_secs(10),
+            backup: false,
+            down: true,
+            max_conns: None,
+        }];
+        let up = Arc::new(Upstream {
+            name: "t".into(),
+            servers,
+            method: LbMethod::RoundRobin,
+            keepalive: 0,
+            health: vec![PeerHealth::default()],
+            origin: Instant::now(),
+            health_check: None,
+        });
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(probe_round(&up, &HealthCheck::default()));
+        // No probe ran, so nothing was recorded either way.
+        assert!(!up.health[0].probe_says_down());
     }
 }

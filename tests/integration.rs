@@ -2037,3 +2037,147 @@ http {{
     );
     assert_eq!(r.header("X-Cache-Status"), Some("STALE"));
 }
+
+// ---- active health checks (ADR-0001 item 4) -------------------------------
+
+/// A backend whose /health endpoint can be flipped independently of its normal
+/// responses — so a test can make it *look* unhealthy without it going away.
+struct ProbedBackend {
+    port: u16,
+    healthy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    probes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tag: &'static str,
+}
+
+impl ProbedBackend {
+    fn start(tag: &'static str) -> ProbedBackend {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+        let healthy = std::sync::Arc::new(AtomicBool::new(true));
+        let probes = std::sync::Arc::new(AtomicUsize::new(0));
+        let (h, pr) = (healthy.clone(), probes.clone());
+        let l = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        std::thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                let (h, pr) = (h.clone(), pr.clone());
+                std::thread::spawn(move || {
+                    let mut c = c;
+                    let mut buf = [0u8; 2048];
+                    let Ok(n) = c.read(&mut buf) else { return };
+                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let is_probe = req.starts_with("GET /health");
+                    if is_probe {
+                        pr.fetch_add(1, Ordering::SeqCst);
+                        let r = if h.load(Ordering::SeqCst) {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+                        } else {
+                            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 3\r\n\r\nbad"
+                        };
+                        let _ = c.write_all(r.as_bytes());
+                    } else {
+                        // Normal traffic always succeeds: only the probe knows
+                        // this backend is unwell, which is the point.
+                        let _ = c.write_all(format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                            tag.len(), tag
+                        ).as_bytes());
+                    }
+                });
+            }
+        });
+        ProbedBackend { port, healthy, probes, tag }
+    }
+    fn probes(&self) -> usize { self.probes.load(Ordering::SeqCst) }
+    fn set_healthy(&self, v: bool) { self.healthy.store(v, Ordering::SeqCst); }
+}
+
+#[test]
+fn active_checks_eject_a_peer_without_any_traffic() {
+    // The capability passive tracking cannot provide: a backend that fails
+    // while nobody is looking is found by the probes, not by an unlucky user.
+    let a = ProbedBackend::start("alpha");
+    let b = ProbedBackend::start("bravo");
+
+    let s = Server::start(
+        "activehc",
+        &format!("{BASE}
+    upstream pool {{
+        server 127.0.0.1:{};
+        server 127.0.0.1:{};
+        health_check interval=300ms fails=2 passes=2 uri=/health status=200;
+    }}
+    server {{ listen {{PORT}}; root {{ROOT}};
+        location / {{ proxy_pass http://pool; }} }}
+}}", a.port, b.port),
+        &[],
+    );
+
+    // Probing starts on its own, with no request ever sent.
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(a.probes() >= 2, "probes must run unprompted, got {}", a.probes());
+    assert!(b.probes() >= 2);
+
+    // Both healthy: traffic reaches both.
+    let mut seen: Vec<String> = (0..6).map(|_| s.get("/").body_str()).collect();
+    assert!(seen.iter().any(|x| x == "alpha") && seen.iter().any(|x| x == "bravo"),
+            "both peers should serve while healthy: {seen:?}");
+
+    // Make alpha fail its probe. Note its NORMAL responses still succeed, so
+    // passive tracking would never notice.
+    a.set_healthy(false);
+    std::thread::sleep(Duration::from_millis(1200));
+
+    seen = (0..10).map(|_| s.get("/").body_str()).collect();
+    assert!(
+        seen.iter().all(|x| x == "bravo"),
+        "an actively-unhealthy peer must be ejected even though its normal \
+         responses are fine: {seen:?}"
+    );
+
+    // And it comes back once it passes again.
+    a.set_healthy(true);
+    std::thread::sleep(Duration::from_millis(1500));
+    seen = (0..10).map(|_| s.get("/").body_str()).collect();
+    assert!(seen.iter().any(|x| x == "alpha"), "recovered peer must return: {seen:?}");
+}
+
+#[test]
+fn a_tcp_health_check_needs_no_uri() {
+    // Without uri=, the probe is a plain connect — all that is meaningful in
+    // front of a database or broker.
+    let dead = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+    let live = ProbedBackend::start("live");
+
+    let s = Server::start(
+        "tcphc",
+        &format!("{BASE}
+    upstream pool {{
+        server 127.0.0.1:{dead};
+        server 127.0.0.1:{};
+        health_check interval=300ms fails=1 passes=1;
+    }}
+    server {{ listen {{PORT}}; root {{ROOT}};
+        location / {{ proxy_pass http://pool; }} }}
+}}", live.port),
+        &[],
+    );
+
+    std::thread::sleep(Duration::from_millis(800));
+    let seen: Vec<String> = (0..8).map(|_| s.get("/").body_str()).collect();
+    assert!(
+        seen.iter().all(|x| x == "live"),
+        "a peer that refuses connections must be probed out: {seen:?}"
+    );
+    assert_eq!(live.probes(), 0, "a TCP check must not send an HTTP request");
+}
+
+#[test]
+fn health_check_config_is_validated() {
+    let dir = std::env::temp_dir().join(format!("oxiserve-badhc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("bad.conf");
+    std::fs::write(&f, "events {} http { upstream u { server 1.2.3.4:80; \
+        health_check nonsense=1; } server { listen 80; location / { proxy_pass http://u; } } }").unwrap();
+    let err = oxiserve::config::load(&f, dir).unwrap_err().to_string();
+    assert!(err.contains("health_check"), "got: {err}");
+}

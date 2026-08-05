@@ -850,6 +850,7 @@ impl Builder {
         let mut servers = Vec::new();
         let mut method = LbMethod::RoundRobin;
         let mut keepalive = 0;
+        let mut health_check: Option<HealthCheck> = None;
 
         for c in d.children() {
             match c.name.as_str() {
@@ -893,6 +894,44 @@ impl Builder {
                     want_args(c, 1)?;
                     keepalive = c.args[0].parse().unwrap_or(0);
                 }
+                "health_check" => {
+                    want_args_range(c, 0, 12)?;
+                    let mut h = HealthCheck::default();
+                    for a in &c.args {
+                        if let Some(v) = a.strip_prefix("interval=") {
+                            h.interval = parse_time(v).ok_or_else(|| BuildError {
+                                msg: format!("invalid \"interval\" value \"{v}\""),
+                                loc: c.loc(),
+                            })?;
+                        } else if let Some(v) = a.strip_prefix("fails=") {
+                            h.fails = v.parse().unwrap_or(1);
+                        } else if let Some(v) = a.strip_prefix("passes=") {
+                            h.passes = v.parse().unwrap_or(1);
+                        } else if let Some(v) = a.strip_prefix("uri=") {
+                            h.uri = Some(Arc::from(v));
+                        } else if let Some(v) = a.strip_prefix("status=") {
+                            h.expect_status = v.parse().map_err(|_| BuildError {
+                                msg: format!("invalid \"status\" value \"{v}\""),
+                                loc: c.loc(),
+                            })?;
+                        } else if let Some(v) = a.strip_prefix("timeout=") {
+                            h.timeout = parse_time(v).ok_or_else(|| BuildError {
+                                msg: format!("invalid \"timeout\" value \"{v}\""),
+                                loc: c.loc(),
+                            })?;
+                        } else if a == "match" || a.starts_with("match=") || a == "mandatory"
+                            || a == "persistent" || a.starts_with("port=")
+                        {
+                            // nginx Plus parameters we accept and ignore.
+                        } else {
+                            bail!(c, "invalid parameter \"{a}\" in \"health_check\"");
+                        }
+                    }
+                    if h.interval.is_zero() {
+                        bail!(c, "\"health_check\" interval must be greater than zero");
+                    }
+                    health_check = Some(h);
+                }
                 "keepalive_requests" | "keepalive_timeout" | "zone" | "queue" => {}
                 _ => self.note_unsupported(c),
             }
@@ -911,6 +950,7 @@ impl Builder {
             keepalive,
             health,
             origin: std::time::Instant::now(),
+            health_check,
         })
     }
 
