@@ -7,10 +7,11 @@ OxiServe reads your existing `nginx.conf` — the real grammar, includes, variab
 thread-per-core data plane.
 
 The goal is to beat nginx on the static hot path. Current standing on a fair
-Linux benchmark (see [Benchmarks](#benchmarks) for the full history, including
-one measurement bug in each direction that had to be found and corrected):
-**+33% at 1 KiB, statistical tie at 0 B, 100 KiB and 10 MiB.** `sendfile(2)`
-is implemented; the next lever is `open_file_cache`.
+Linux benchmark, both servers configured identically with `open_file_cache`
+(see [Benchmarks](#benchmarks) for the full history, including one measurement
+bug in each direction that had to be found and corrected): **+63% at 1 KiB,
++10% at 0 B, tie at 100 KiB and 10 MiB.** `sendfile(2)` and `open_file_cache`
+are implemented; a cache hit serves a request with zero filesystem syscalls.
 
 ```console
 $ oxiserve -t -c /etc/nginx/nginx.conf
@@ -89,7 +90,6 @@ sharing a listener.
 "unknown directive". Currently missing:
 
 - **HTTP/2 and HTTP/3** — `listen ... http2` is parsed and ignored (serves 1.1).
-- **`open_file_cache`** — every request re-opens and re-stats the file.
 - **FastCGI / uwsgi / SCGI / gRPC** — `fastcgi_pass` and friends.
 - **`proxy_cache`** and the content cache.
 - **`limit_req` / `limit_conn`** rate limiting.
@@ -156,6 +156,31 @@ lookup (`strncpy_from_user`, `link_path_walk`) from the per-request
 
 Single-run noise on this box is ±5%; the tables above are means of three
 alternating rounds.
+
+### With `open_file_cache` — the current standing
+
+`open_file_cache` is now implemented (per-worker, fd + fstat cached, zero
+filesystem syscalls on a hit — verified with `strace`: `statx`/`openat`/`close`
+vanish from the trace, ~5.5 → ~3.5 syscalls per 1 KiB request). Same method,
+both servers configured with `open_file_cache max=1000; open_file_cache_valid
+60s;`, three alternating rounds, per-round ratios:
+
+| Payload | round ratios (OxiServe / nginx) | mean | verdict |
+|---|---|---:|---|
+| 0 B | 0.94× / 1.15× / 1.21× | **1.10×** | OxiServe ahead 2 of 3 |
+| 1 KiB | 1.91× / 1.48× / 1.59× | **1.63×** | **OxiServe, decisively** |
+| 100 KiB | 0.87× / 1.07× / 1.06× | 1.00× | tie |
+| 10 MiB | — | ~1× | tie (both `sendfile` from cached fd) |
+
+Why the 1 KiB gap widened: with metadata syscalls gone on both sides, what
+remains is the data path — nginx spends `writev(head)` + `sendfile(body)` per
+small file, OxiServe one `pread` + one `sendto`. The same two-vs-one syscall
+difference is now a larger share of a smaller total.
+
+Cache semantics match nginx's documented behaviour: entries are trusted for
+`open_file_cache_valid`, so deploys should replace files atomically (`rename`)
+— the cached descriptor then serves the old content intact until revalidation.
+An in-place truncate writes through any fd-caching server, nginx included.
 
 ### macOS — where the story began, and why it misled
 
