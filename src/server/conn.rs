@@ -28,11 +28,18 @@ use crate::http::{uri, Method};
 const READ_BUF_INIT: usize = 8 * 1024;
 
 /// Chunk size for streaming large files off the blocking pool.
-const FILE_CHUNK: usize = 128 * 1024;
+const FILE_CHUNK: usize = 512 * 1024;
 
 pub struct ConnState {
     pub read: Vec<u8>,
     pub write: Vec<u8>,
+    /// The decoded request body. Chunked encoding is resolved here, so
+    /// handlers only ever see plain bytes.
+    pub body: Vec<u8>,
+    /// Bytes of `read` belonging to the current request (head + body).
+    /// Draining is deferred until the response is written, because the parsed
+    /// request holds byte ranges into `read` for its whole lifetime.
+    pub consumed: usize,
     pub req: Req,
 }
 
@@ -41,6 +48,8 @@ impl Default for ConnState {
         ConnState {
             read: Vec::with_capacity(READ_BUF_INIT),
             write: Vec::with_capacity(READ_BUF_INIT),
+            body: Vec::new(),
+            consumed: 0,
             req: Req::new(),
         }
     }
@@ -67,7 +76,7 @@ pub async fn serve<S>(
     let default_server = &listener.servers[listener.default_server];
 
     loop {
-        st.read.clear();
+        // `read` is NOT cleared here: it may already hold a pipelined request.
         st.write.clear();
 
         let core = &default_server.core;
@@ -117,16 +126,25 @@ pub async fn serve<S>(
             }
         };
 
-        // A body we are not going to consume makes the connection unreusable.
-        let body_len = match st.req.body {
-            crate::http::request::Body::Length(n) => n,
-            _ => 0,
-        };
-        let body_fits = body_len <= server.core.client_max_body_size;
+        // ---- read the request body -----------------------------------------
+        // nginx buffers the request body before proxying (`proxy_request_buffering
+        // on`, the default). Buffering it here means handlers see a complete body
+        // and the connection is left correctly positioned for the next request.
+        st.body.clear();
+        let body_result = read_body(
+            &mut sock,
+            &mut st,
+            server.core.client_max_body_size,
+            server.core.client_body_timeout,
+        )
+        .await;
+
+        let body_status = body_result.err();
 
         let mut ctx = Ctx::new(
             &st.read,
             &st.req,
+            &st.body,
             http,
             server,
             normalised,
@@ -138,21 +156,20 @@ pub async fn serve<S>(
         );
 
         let started = Instant::now();
-        let mut reply = if !body_fits {
-            handler::error_reply(&ctx, 413)
-        } else {
-            handler::handle(&mut ctx).await
+        let mut reply = match body_status {
+            Some(code) => handler::error_reply(&ctx, code),
+            None => handler::handle(&mut ctx).await,
         };
 
         // ---- decide whether the connection survives ------------------------
         let client_wants_keepalive = st.req.keep_alive;
         let over_request_limit = requests >= server.core.keepalive_requests;
-        let body_unread = body_len as usize > st.read.len().saturating_sub(st.req.head_len);
 
         reply.resp.keep_alive = reply.resp.keep_alive
             && client_wants_keepalive
             && !over_request_limit
-            && !body_unread
+            // A body we could not finish reading leaves the stream misaligned.
+            && body_status.is_none()
             && server.core.keepalive_timeout > Duration::ZERO;
 
         let http11 = st.req.minor == 1;
@@ -188,16 +205,238 @@ pub async fn serve<S>(
             let _ = sock.shutdown().await;
             return;
         }
-
-        // Carry over any pipelined bytes that arrived with the last request.
-        let consumed = st.req.head_len + (body_len as usize).min(st.read.len() - st.req.head_len);
-        if consumed < st.read.len() {
-            st.read.copy_within(consumed.., 0);
-            st.read.truncate(st.read.len() - consumed);
-        } else {
+        // Now that nothing borrows `read` any more, drop this request's bytes
+        // and keep whatever a pipelined next request already sent.
+        let consumed = st.consumed.min(st.read.len());
+        if consumed >= st.read.len() {
             st.read.clear();
+        } else {
+            st.read.copy_within(consumed.., 0);
+            let left = st.read.len() - consumed;
+            st.read.truncate(left);
         }
     }
+}
+
+/// Reads and decodes the request body into `st.body`, recording in
+/// `st.consumed` how much of `st.read` belongs to this request.
+///
+/// Returns `Err(status)` for a body that is too large (413), malformed (400),
+/// or that never arrives (408).
+async fn read_body<S>(
+    sock: &mut S,
+    st: &mut ConnState,
+    max: u64,
+    timeout: Duration,
+) -> Result<(), u16>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use crate::http::request::Body as ReqBody;
+
+    let head_len = st.req.head_len;
+    let mut pos = head_len;
+
+    let result = match st.req.body {
+        ReqBody::None => Ok(()),
+        ReqBody::Length(n) => {
+            if n > max {
+                Err(413)
+            } else {
+                // 100-continue must be answered before the client will send.
+                if st.req.expects_continue(&st.read) {
+                    let _ = sock.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+                    let _ = sock.flush().await;
+                }
+                read_exact_body(sock, st, &mut pos, n, timeout).await
+            }
+        }
+        ReqBody::Chunked => {
+            if st.req.expects_continue(&st.read) {
+                let _ = sock.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+                let _ = sock.flush().await;
+            }
+            read_chunked_body(sock, st, &mut pos, max, timeout).await
+        }
+    };
+
+    // The buffer itself is drained only after the response is written: the
+    // parsed request holds byte ranges into it until then.
+    st.consumed = pos;
+    result
+}
+
+async fn read_exact_body<S>(
+    sock: &mut S,
+    st: &mut ConnState,
+    pos: &mut usize,
+    n: u64,
+    timeout: Duration,
+) -> Result<(), u16>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let n = n as usize;
+    st.body.reserve(n);
+
+    // Take whatever already arrived alongside the head.
+    let have = (st.read.len() - *pos).min(n);
+    st.body.extend_from_slice(&st.read[*pos..*pos + have]);
+    *pos += have;
+
+    while st.body.len() < n {
+        let start = st.body.len();
+        st.body.resize(n, 0);
+        let got = match tokio::time::timeout(timeout, sock.read(&mut st.body[start..])).await {
+            Ok(Ok(0)) => {
+                st.body.truncate(start);
+                return Err(400); // client vanished mid-body
+            }
+            Ok(Ok(g)) => g,
+            Ok(Err(_)) => {
+                st.body.truncate(start);
+                return Err(400);
+            }
+            Err(_) => {
+                st.body.truncate(start);
+                return Err(408);
+            }
+        };
+        st.body.truncate(start + got);
+    }
+    Ok(())
+}
+
+/// Decodes `Transfer-Encoding: chunked` into `st.body`.
+async fn read_chunked_body<S>(
+    sock: &mut S,
+    st: &mut ConnState,
+    pos: &mut usize,
+    max: u64,
+    timeout: Duration,
+) -> Result<(), u16>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        // Ensure a full chunk-size line is buffered.
+        let line_end = loop {
+            if let Some(i) = find_crlf(&st.read[*pos..]) {
+                break *pos + i;
+            }
+            if st.read.len() - *pos > 1024 {
+                return Err(400); // absurd chunk header
+            }
+            fill(sock, st, timeout).await?;
+        };
+
+        let line = &st.read[*pos..line_end];
+        // A chunk extension (`;name=value`) follows the size and is ignored.
+        let size_str = match line.iter().position(|&c| c == b';') {
+            Some(i) => &line[..i],
+            None => line,
+        };
+        let size = parse_hex(size_str).ok_or(400u16)?;
+        *pos = line_end + 2;
+
+        if size == 0 {
+            // Trailers, then the final CRLF.
+            loop {
+                let end = loop {
+                    if let Some(i) = find_crlf(&st.read[*pos..]) {
+                        break *pos + i;
+                    }
+                    fill(sock, st, timeout).await?;
+                };
+                let is_blank = end == *pos;
+                *pos = end + 2;
+                if is_blank {
+                    return Ok(());
+                }
+            }
+        }
+
+        if st.body.len() as u64 + size > max {
+            return Err(413);
+        }
+
+        // Buffer the chunk data plus its trailing CRLF.
+        let need = size as usize + 2;
+        while st.read.len() - *pos < need {
+            fill(sock, st, timeout).await?;
+        }
+        st.body
+            .extend_from_slice(&st.read[*pos..*pos + size as usize]);
+        *pos += size as usize;
+        if &st.read[*pos..*pos + 2] != b"\r\n" {
+            return Err(400);
+        }
+        *pos += 2;
+    }
+}
+
+/// Appends more bytes from the socket into the read buffer.
+async fn fill<S>(sock: &mut S, st: &mut ConnState, timeout: Duration) -> Result<(), u16>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let start = st.read.len();
+    st.read.resize(start + 8192, 0);
+    let n = match tokio::time::timeout(timeout, sock.read(&mut st.read[start..])).await {
+        Ok(Ok(n)) => n,
+        Ok(Err(_)) => {
+            st.read.truncate(start);
+            return Err(400);
+        }
+        Err(_) => {
+            st.read.truncate(start);
+            return Err(408);
+        }
+    };
+    st.read.truncate(start + n);
+    if n == 0 {
+        return Err(400);
+    }
+    Ok(())
+}
+
+fn find_crlf(b: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i + 1 < b.len() {
+        match memchr::memchr(b'\r', &b[i..]) {
+            Some(off) => {
+                let p = i + off;
+                if p + 1 < b.len() {
+                    if b[p + 1] == b'\n' {
+                        return Some(p);
+                    }
+                    i = p + 1;
+                } else {
+                    return None;
+                }
+            }
+            None => return None,
+        }
+    }
+    None
+}
+
+fn parse_hex(b: &[u8]) -> Option<u64> {
+    if b.is_empty() || b.len() > 16 {
+        return None;
+    }
+    let mut n: u64 = 0;
+    for &c in b {
+        let d = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            b'A'..=b'F' => c - b'A' + 10,
+            b' ' | b'\t' => continue,
+            _ => return None,
+        };
+        n = n.checked_mul(16)?.checked_add(d as u64)?;
+    }
+    Some(n)
 }
 
 enum HeadError {
@@ -356,6 +595,11 @@ where
 
 /// Streams a file too large to map, reading on the blocking pool so a cold
 /// page never stalls the worker's event loop.
+///
+/// The read for chunk *n+1* is issued **before** chunk *n* is written, so disk
+/// and socket overlap. Reading and writing strictly in turn instead costs a
+/// full blocking-pool round trip per chunk, which on large files dominates
+/// everything else.
 async fn stream_file<S>(
     sock: &mut S,
     file: std::fs::File,
@@ -369,24 +613,36 @@ where
     let mut sent = 0u64;
     let mut pos = offset;
 
-    while sent < len {
-        let want = FILE_CHUNK.min((len - sent) as usize);
-        let f = file.clone();
-        let chunk = tokio::task::spawn_blocking(move || {
+    let read_chunk = |f: Arc<std::fs::File>, at: u64, want: usize| {
+        tokio::task::spawn_blocking(move || {
             let mut buf = vec![0u8; want];
-            let n = read_at(&f, &mut buf, pos)?;
+            let n = read_at(&f, &mut buf, at)?;
             buf.truncate(n);
             Ok::<_, io::Error>(buf)
         })
-        .await
-        .map_err(|_| io::Error::from(io::ErrorKind::Other))??;
+    };
 
+    let first = FILE_CHUNK.min(len as usize);
+    let mut pending = Some(read_chunk(file.clone(), pos, first));
+
+    while let Some(task) = pending.take() {
+        let chunk = task
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::Other))??;
         if chunk.is_empty() {
-            break; // file shrank underneath us
+            break; // the file shrank underneath us
         }
-        sock.write_all(&chunk).await?;
-        sent += chunk.len() as u64;
         pos += chunk.len() as u64;
+        let done = sent + chunk.len() as u64;
+
+        // Queue the next read before blocking on the socket.
+        if done < len {
+            let want = FILE_CHUNK.min((len - done) as usize);
+            pending = Some(read_chunk(file.clone(), pos, want));
+        }
+
+        sock.write_all(&chunk).await?;
+        sent = done;
     }
     Ok(sent)
 }

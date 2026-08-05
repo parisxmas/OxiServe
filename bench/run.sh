@@ -8,12 +8,20 @@
 # for the other, different sendfile settings, a warm cache for the second run)
 # is either matched or eliminated.
 #
+# Platform note: on macOS, nginx's `sendfile on` path collapses to ~100 MB/s
+# (a Darwin sendfile pathology, not an nginx characteristic). Benchmarking
+# against it would produce a flattering-but-meaningless 60x win, so the harness
+# sets `sendfile off` on BOTH servers here and reports that it did. On Linux,
+# re-run with SENDFILE=on for the configuration people actually deploy.
+#
 # Usage:  bench/run.sh [duration] [connections]
 set -euo pipefail
 
 DURATION="${1:-15}"
 CONNS="${2:-256}"
 THREADS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+# Default off: see the platform note above.
+SENDFILE="${SENDFILE:-off}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$ROOT/bench/work"
@@ -59,7 +67,7 @@ error_log         $WORK/logs/oxi-error.log crit;
 events { worker_connections 16384; }
 http {
     access_log off;
-    sendfile   on;
+    sendfile   $SENDFILE;
     tcp_nodelay on;
     keepalive_timeout  65;
     keepalive_requests 100000;
@@ -79,7 +87,7 @@ daemon            on;
 events { worker_connections 16384; }
 http {
     access_log off;
-    sendfile   on;
+    sendfile   $SENDFILE;
     tcp_nodelay on;
     keepalive_timeout  65;
     keepalive_requests 100000;
@@ -106,7 +114,7 @@ trap cleanup EXIT
 
 hammer() { # url -> "rps latency_p99"
     case "$LOADGEN" in
-        wrk)  wrk -t"$THREADS" -c"$CONNS" -d"${DURATION}s" --latency "$1" 2>/dev/null ;;
+        wrk)  wrk -t"$THREADS" -c"$CONNS" -d"${DURATION}s" --timeout 10s --latency "$1" 2>/dev/null ;;
         oha)  oha -c "$CONNS" -z "${DURATION}s" --no-tui "$1" 2>/dev/null ;;
         bombardier) bombardier -c "$CONNS" -d "${DURATION}s" -l "$1" 2>/dev/null ;;
     esac
@@ -124,7 +132,7 @@ run_suite() { # name port
     done
 }
 
-echo "load generator: $LOADGEN   workers: $THREADS   conns: $CONNS   duration: ${DURATION}s"
+echo "load generator: $LOADGEN   workers: $THREADS   conns: $CONNS   duration: ${DURATION}s   sendfile: $SENDFILE"
 echo
 
 echo "== OxiServe =="

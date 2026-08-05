@@ -19,6 +19,8 @@ pub struct Ctx<'a> {
     /// The connection read buffer that `req`'s ranges point into.
     pub buf: &'a [u8],
     pub req: &'a Req,
+    /// The decoded request body, already de-chunked by the connection layer.
+    pub body: &'a [u8],
     pub http: &'a Http,
     pub server: &'a Arc<ServerConf>,
 
@@ -58,6 +60,7 @@ impl<'a> Ctx<'a> {
     pub fn new(
         buf: &'a [u8],
         req: &'a Req,
+        body: &'a [u8],
         http: &'a Http,
         server: &'a Arc<ServerConf>,
         uri: String,
@@ -71,6 +74,7 @@ impl<'a> Ctx<'a> {
         Ctx {
             buf,
             req,
+            body,
             http,
             server,
             uri,

@@ -17,7 +17,6 @@ use tokio::net::TcpStream;
 use super::ctx::Ctx;
 use super::reply::{Body, Reply};
 use crate::config::model::{LbMethod, Location, ProxyPass, ProxyTarget, Upstream};
-use crate::http::request::Body as ReqBody;
 use crate::http::response::{Framing, Resp};
 
 /// Headers that describe *this* hop and must never be forwarded.
@@ -123,6 +122,8 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
         let lower = name.to_ascii_lowercase();
         if HOP_BY_HOP.contains(&lower.as_str())
             || lower == "host"
+            || lower == "content-length"
+            || lower == "expect"
             || overridden.contains(&lower)
             || conf.hide_headers.iter().any(|x| &**x == lower.as_str())
         {
@@ -133,6 +134,12 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
         head.push_str(ctx.req.slice(ctx.buf, &h.value));
         head.push_str("\r\n");
     }
+    // The decoded body length replaces whatever framing the client used.
+    if !ctx.body.is_empty() {
+        head.push_str("Content-Length: ");
+        crate::http::response::push_num(&mut head, ctx.body.len() as u64);
+        head.push_str("\r\n");
+    }
     head.push_str("Connection: close\r\n\r\n");
 
     if up.write_all(head.as_bytes()).await.is_err() {
@@ -140,18 +147,10 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
     }
 
     // ---- request body -----------------------------------------------------
-    // Whatever of the body already sits in the connection buffer is forwarded
-    // first; the rest is not read here because the connection layer owns the
-    // socket. Bodies larger than the buffered prefix are truncated for now.
-    if let ReqBody::Length(n) = ctx.req.body {
-        let available = ctx.buf.len().saturating_sub(ctx.req.head_len);
-        let take = (n as usize).min(available);
-        if take > 0 {
-            let start = ctx.req.head_len;
-            if up.write_all(&ctx.buf[start..start + take]).await.is_err() {
-                return Err(502);
-            }
-        }
+    // The connection layer has already read and de-chunked the whole body, so
+    // it forwards as a plain Content-Length regardless of how it arrived.
+    if !ctx.body.is_empty() && up.write_all(ctx.body).await.is_err() {
+        return Err(502);
     }
     let _ = up.flush().await;
 

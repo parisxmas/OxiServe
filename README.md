@@ -18,7 +18,8 @@ oxiserve: listening on 0.0.0.0:80
 ## Status
 
 This is an early but genuinely working server, not a demo. It serves real
-traffic for the feature set below. It is **not yet a drop-in nginx replacement** —
+traffic for the feature set below, with 154 tests (128 unit + 26 end-to-end
+over real sockets). It is **not yet a drop-in nginx replacement** —
 see [Not implemented](#not-implemented) for exactly what is missing, and run
 `oxiserve -t` against your own config to get a precise list for *your* setup.
 
@@ -54,6 +55,9 @@ including the list-directive replace-wholesale rule.
 `location` (`=`, `^~`, `~`, `~*`, prefix, `@named`, nested), the full nginx
 search order.
 
+**Bodies** — `Content-Length` and chunked request bodies are read and decoded
+before routing, `Expect: 100-continue`, `client_max_body_size` enforcement.
+
 **Serving** — static files, `root` / `alias`, `index`, `autoindex`, `try_files`,
 byte ranges, `If-None-Match` / `If-Modified-Since` / `If-Range` / `If-Match`,
 ETags, MIME types, `expires`, `add_header`, gzip, `error_page`, `return`,
@@ -83,7 +87,6 @@ sharing a listener.
 - **`proxy_cache`** and the content cache.
 - **`limit_req` / `limit_conn`** rate limiting.
 - **`auth_basic`**, `auth_request`.
-- **Request bodies larger than the initial read buffer** are truncated on proxy.
 - **Unix domain sockets** in `listen`.
 - **`stream` and `mail`** blocks.
 - **PCRE-only regex** — lookaround and backreferences are rejected with a clear
@@ -92,18 +95,39 @@ sharing a listener.
 ## Benchmarks
 
 ```console
-$ bench/run.sh 15 256
+$ bench/run.sh 10 128
 ```
 
-The harness runs both servers with matched settings (same worker count, same
-keepalive, logging off on both, page cache warmed before each measurement) across
-four payload sizes chosen to exercise different paths: 0 B and 1 KiB for
-per-request overhead, 100 KiB for the mapped-file path, 10 MiB for streaming.
-
+The harness runs both servers with matched settings — same worker count, same
+keepalive, access logging off on both, page cache warmed before each
+measurement — across four payload sizes chosen to exercise different paths.
 It requires `nginx` and one of `wrk` / `oha` / `bombardier`.
 
-> Numbers are not published here yet — the comparison has not been run on a
-> machine with nginx installed. Run it yourself before believing any claim.
+**Measured** on macOS 15 (Darwin 25.3), M-series, 10 cores, loopback,
+`wrk -t10 -c128 -d10s`, nginx 1.31.3, `sendfile off` on both:
+
+| Payload | OxiServe | nginx | |
+|---|---:|---:|---|
+| 0 B | **139,850** rps | 79,948 rps | **1.75×** |
+| 1 KiB | **105,287** rps | 75,022 rps | **1.40×** |
+| 100 KiB | **73,971** rps | 37,043 rps | **2.00×** |
+| 10 MiB | 479 rps | **725** rps | **0.66×** — we lose |
+
+Read the caveats before quoting any of this:
+
+- **We lose on multi-megabyte files**, by a third. The cost is in the bulk
+  write path, not the read path: raising the mmap threshold so 10 MiB files are
+  served from a mapping changed nothing (479 → 482 rps). This is a real,
+  unfixed gap, not a measurement artifact.
+- **`sendfile off` on both is deliberate.** On macOS, nginx's `sendfile on`
+  path collapses to ~100 MB/s — a Darwin pathology, not an nginx
+  characteristic. Leaving it on produces a flattering 63× "win" on the 10 MiB
+  case that means nothing. The harness turns it off for both and says so.
+  On Linux, re-run with `SENDFILE=on`.
+- **macOS is not nginx's best platform.** No `epoll`, no `SO_REUSEPORT` accept
+  load-balancing. Expect nginx to close much of the small-payload gap on Linux.
+  These numbers are a starting point, not a verdict.
+- Loopback benchmarks measure the server and the kernel, not a network.
 
 ## Building
 

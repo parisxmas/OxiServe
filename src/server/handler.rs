@@ -548,7 +548,7 @@ fn maybe_gzip(ctx: &Ctx<'_>, core: &CoreConf, r: &mut Reply) {
         return;
     };
     let base = ct.split(';').next().unwrap_or("").trim().to_string();
-    if !g.types.iter().any(|t| &**t == base) && base != "text/html" {
+    if !g.types.iter().any(|t| **t == base) && base != "text/html" {
         return;
     }
     let Some(len) = r.body.known_len() else { return };

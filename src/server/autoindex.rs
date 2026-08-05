@@ -75,7 +75,7 @@ pub async fn render(ctx: &mut Ctx<'_>, dir: &Path) -> Result<Reply, u16> {
             h.push(' ');
         }
 
-        h.push_str(&crate::http::date::http_date(*mtime).replace("GMT", "").trim_end().to_string());
+        h.push_str(crate::http::date::http_date(*mtime).replace("GMT", "").trim_end());
         h.push_str("  ");
         if *is_dir {
             h.push_str("                   -");
