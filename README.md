@@ -108,17 +108,16 @@ It requires `nginx` and one of `wrk` / `oha` / `bombardier`.
 
 | Payload | OxiServe | nginx | |
 |---|---:|---:|---|
-| 0 B | **139,850** rps | 79,948 rps | **1.75×** |
-| 1 KiB | **105,287** rps | 75,022 rps | **1.40×** |
-| 100 KiB | **73,971** rps | 37,043 rps | **2.00×** |
-| 10 MiB | 479 rps | **725** rps | **0.66×** — we lose |
+| 0 B | **140,076** rps | 80,326 rps | **1.74×** |
+| 1 KiB | **108,280** rps | 76,289 rps | **1.42×** |
+| 100 KiB | **74,087** rps | 37,273 rps | **1.99×** |
+| 10 MiB | 667 rps | 703 rps | 0.95× — parity |
 
 Read the caveats before quoting any of this:
 
-- **We lose on multi-megabyte files**, by a third. The cost is in the bulk
-  write path, not the read path: raising the mmap threshold so 10 MiB files are
-  served from a mapping changed nothing (479 → 482 rps). This is a real,
-  unfixed gap, not a measurement artifact.
+- **Multi-megabyte files are at parity, not ahead.** They started at 0.66×.
+  Fixing that meant discovering the bottleneck was neither of the two things
+  it looked like — see [Large files](#large-files) below.
 - **`sendfile off` on both is deliberate.** On macOS, nginx's `sendfile on`
   path collapses to ~100 MB/s — a Darwin pathology, not an nginx
   characteristic. Leaving it on produces a flattering 63× "win" on the 10 MiB
@@ -128,6 +127,39 @@ Read the caveats before quoting any of this:
   load-balancing. Expect nginx to close much of the small-payload gap on Linux.
   These numbers are a starting point, not a verdict.
 - Loopback benchmarks measure the server and the kernel, not a network.
+
+### Large files
+
+The 10 MiB case is worth writing down, because the obvious explanations were
+wrong and the measurements say so. Throughput per concurrency level, 10 MiB:
+
+| strategy | c=1 | c=10 | c=128 |
+|---|---:|---:|---:|
+| blocking pool, 512 KiB buffers | 813 | 809 | 473 |
+| blocking pool, 32 KiB buffers | 393 | 745 | 689 |
+| inline `pread`, 32 KiB buffers | 699 | 809 | 393 |
+| whole file from a memory map | 807 | 744 | 475 |
+| **adaptive (shipped)** | **694** | **793** | **667** |
+| nginx | 704 | 779 | 706 |
+
+Three findings, none of which were guessable from reading the code:
+
+1. **Per-connection we were always faster than nginx** (813 vs 704 at c=1).
+   The problem was purely how throughput scaled — it fell off past ~10
+   concurrent transfers.
+2. **Buffer size dominates, and bigger is not better.** 64 KiB and above cost
+   ~30% at 128 connections. nginx's `output_buffers 2 32k` default is that
+   number, and OxiServe now honours the directive rather than hardcoding one.
+3. **Offloading reads to a thread pool is right only under load.** A pool round
+   trip per chunk halves single-stream throughput, because a page-cache read is
+   cheaper than the handoff. Under concurrency the same offload is what keeps
+   the worker free. So the choice is made at runtime from the number of
+   transfers that worker is currently running — inline below the threshold,
+   pooled above it.
+
+Serving large files from a memory map was also tried, and is *worse* under
+concurrency regardless of write size. Mapping is therefore reserved for small
+files, where its single-syscall write is what produces the 2× at 100 KiB.
 
 ## Building
 

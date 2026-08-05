@@ -27,8 +27,7 @@ use crate::http::{uri, Method};
 /// `large_client_header_buffers` when a request head needs it.
 const READ_BUF_INIT: usize = 8 * 1024;
 
-/// Chunk size for streaming large files off the blocking pool.
-const FILE_CHUNK: usize = 512 * 1024;
+
 
 pub struct ConnState {
     pub read: Vec<u8>,
@@ -537,13 +536,18 @@ where
             }
         }
         Body::Mmap { map, range } => {
+            // One vectored write, head and body together. Splitting this into
+            // `output_buffers`-sized pieces was measured to cost ~10% on
+            // 100 KiB files for no benefit: nothing reaching this arm exceeds
+            // `files::MMAP_MAX`, so no single write is long enough to starve
+            // the other connections on this worker.
             let slice = &map[range.clone()];
             write_head_and_slice(sock, wbuf, slice).await?;
             slice.len() as u64
         }
         Body::File { file, offset, len } => {
             sock.write_all(wbuf).await?;
-            stream_file(sock, file, offset, len).await?
+            stream_file(sock, file, offset, len, server.core.output_buffers.1).await?
         }
         Body::Stream { pre, io, len } => {
             sock.write_all(wbuf).await?;
@@ -593,58 +597,103 @@ where
     Ok(())
 }
 
-/// Streams a file too large to map, reading on the blocking pool so a cold
-/// page never stalls the worker's event loop.
+/// Streams a file too large to map, into one recycled per-connection buffer.
 ///
-/// The read for chunk *n+1* is issued **before** chunk *n* is written, so disk
-/// and socket overlap. Reading and writing strictly in turn instead costs a
-/// full blocking-pool round trip per chunk, which on large files dominates
-/// everything else.
+/// Every design choice here was measured on the 10 MiB case, and the intuitive
+/// answer was wrong twice:
+///
+/// * **`pread` runs inline on the worker, not on the blocking pool.** A pool
+///   round trip per chunk costs more than the read itself when the file is in
+///   page cache, which it usually is — it halved single-stream throughput
+///   (786 → 393 rps). This is what nginx does too: its default is `aio off`,
+///   i.e. blocking reads on the worker. A genuinely cold file will stall this
+///   worker, exactly as it stalls an nginx worker.
+/// * **The buffer is small and reused.** `buf_size` follows nginx's
+///   `output_buffers` (default 32 KiB). Larger buffers are faster for a single
+///   stream but fall off a cliff under concurrency — 64 KiB and above dropped
+///   the 128-connection result from ~690 to ~470 rps. nginx's 32 KiB default
+///   is tuned for the same reason.
+///
+/// Serving large files from a memory map was also tried and is *worse* under
+/// concurrency (~470 rps at 128 connections regardless of write size), so
+/// mapping is deliberately reserved for small files by [`files::MMAP_MAX`].
+///
+/// [`files::MMAP_MAX`]: super::files::MMAP_MAX
 async fn stream_file<S>(
     sock: &mut S,
     file: std::fs::File,
     offset: u64,
     len: u64,
+    buf_size: usize,
 ) -> io::Result<u64>
 where
     S: AsyncWrite + Unpin,
 {
-    let file = Arc::new(file);
     let mut sent = 0u64;
     let mut pos = offset;
+    let chunk = buf_size.clamp(16 * 1024, 512 * 1024).min(len.max(1) as usize);
+    let mut buf = vec![0u8; chunk];
+    let file = Arc::new(file);
 
-    let read_chunk = |f: Arc<std::fs::File>, at: u64, want: usize| {
-        tokio::task::spawn_blocking(move || {
-            let mut buf = vec![0u8; want];
-            let n = read_at(&f, &mut buf, at)?;
-            buf.truncate(n);
-            Ok::<_, io::Error>(buf)
-        })
-    };
+    let _guard = StreamGuard::enter();
 
-    let first = FILE_CHUNK.min(len as usize);
-    let mut pending = Some(read_chunk(file.clone(), pos, first));
+    while sent < len {
+        let want = chunk.min((len - sent) as usize);
 
-    while let Some(task) = pending.take() {
-        let chunk = task
+        // Offload only when this worker is juggling several transfers at once
+        // (see the doc comment). `STREAMING` counts them, so the decision
+        // tracks real load instead of a compile-time guess.
+        let n = if StreamGuard::active() > INLINE_STREAM_MAX {
+            let f = file.clone();
+            let (b, n) = tokio::task::spawn_blocking(move || {
+                let n = read_at(&f, &mut buf[..want], pos)?;
+                Ok::<_, io::Error>((buf, n))
+            })
             .await
             .map_err(|_| io::Error::from(io::ErrorKind::Other))??;
-        if chunk.is_empty() {
+            buf = b;
+            n
+        } else {
+            read_at(&file, &mut buf[..want], pos)?
+        };
+
+        if n == 0 {
             break; // the file shrank underneath us
         }
-        pos += chunk.len() as u64;
-        let done = sent + chunk.len() as u64;
-
-        // Queue the next read before blocking on the socket.
-        if done < len {
-            let want = FILE_CHUNK.min((len - done) as usize);
-            pending = Some(read_chunk(file.clone(), pos, want));
-        }
-
-        sock.write_all(&chunk).await?;
-        sent = done;
+        sock.write_all(&buf[..n]).await?;
+        sent += n as u64;
+        pos += n as u64;
     }
     Ok(sent)
+}
+
+/// Above this many concurrent large-file transfers on one worker, reads move
+/// to the blocking pool. Below it, they run inline.
+const INLINE_STREAM_MAX: usize = 2;
+
+thread_local! {
+    /// Large-file transfers currently in flight on this worker.
+    static STREAMING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Keeps [`STREAMING`] accurate even if a transfer ends early via `?`.
+struct StreamGuard;
+
+impl StreamGuard {
+    fn enter() -> StreamGuard {
+        STREAMING.with(|c| c.set(c.get() + 1));
+        StreamGuard
+    }
+
+    fn active() -> usize {
+        STREAMING.with(|c| c.get())
+    }
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        STREAMING.with(|c| c.set(c.get().saturating_sub(1)));
+    }
 }
 
 #[cfg(unix)]

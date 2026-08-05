@@ -25,7 +25,7 @@ use crate::http::response::{push_num, Resp};
 /// Raising this past a few megabytes was measured to make no difference — on
 /// multi-megabyte files the cost is in the bulk write path, not the read — so
 /// it is kept low enough that a connection does not pin large address ranges.
-pub const MMAP_MAX: u64 = 4 * 1024 * 1024;
+pub const MMAP_MAX: u64 = 256 * 1024;
 
 /// Maps a request URI onto a filesystem path using `root` or `alias`.
 ///
