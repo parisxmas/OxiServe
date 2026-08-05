@@ -7,10 +7,11 @@ OxiServe reads your existing `nginx.conf` — the real grammar, includes, variab
 thread-per-core data plane.
 
 The original goal was to beat nginx on the static hot path. **On a realistic
-Linux benchmark it does not** — nginx is faster at every payload size (see
-[Benchmarks](#benchmarks)). The macOS numbers that suggested otherwise turned
-out to be an artifact of the test conditions. Closing that gap — starting with
-`sendfile()`, which OxiServe does not yet implement — is the active work.
+Linux benchmark it does not** — nginx is 1.4–2× faster depending on payload
+size (see [Benchmarks](#benchmarks)). The macOS numbers that suggested
+otherwise were an artifact of the test conditions. `sendfile(2)` is now
+implemented and an optimisation pass has closed part of the gap, but not all
+of it; the remaining work is profiling the per-request path.
 
 ```console
 $ oxiserve -t -c /etc/nginx/nginx.conf
@@ -89,6 +90,7 @@ sharing a listener.
 "unknown directive". Currently missing:
 
 - **HTTP/2 and HTTP/3** — `listen ... http2` is parsed and ignored (serves 1.1).
+- **`open_file_cache`** — every request re-opens and re-stats the file.
 - **FastCGI / uwsgi / SCGI / gRPC** — `fastcgi_pass` and friends.
 - **`proxy_cache`** and the content cache.
 - **`limit_req` / `limit_conn`** rate limiting.
@@ -113,25 +115,34 @@ It requires `nginx` and one of `wrk` / `oha` / `bombardier`.
 
 Debian 12, kernel 6.1, 4 cores, `wrk -t2 -c16`, nginx 1.22.1. Both servers and
 the load generator pinned to 2 cores (a shared box; this bounds the blast
-radius, and handicaps both equally). **nginx wins at every size, with
-`sendfile` on or off:**
+radius and handicaps both equally), `sendfile on` for both.
 
-| Payload | OxiServe | nginx (sendfile on) | nginx (sendfile off) |
-|---|---:|---:|---:|
-| 0 B | 45,277 rps | 67,876 (**0.67×**) | 74,925 (**0.58×**) |
-| 1 KiB | 26,554 rps | 48,149 (**0.55×**) | 55,675 (**0.44×**) |
-| 100 KiB | 12,523 rps | 27,825 (**0.45×**) | 19,102 (**0.61×**) |
-| 10 MiB | 125 rps | 405 (**0.31×**) | 252 (**0.53×**) |
+| Payload | OxiServe | nginx | ratio | vs. first Linux run |
+|---|---:|---:|---:|---:|
+| 0 B | 43,176 rps | 82,767 rps | 0.52× | — |
+| 1 KiB | 41,202 rps | 55,987 rps | **0.74×** | **+55%** |
+| 100 KiB | 13,910 rps | 31,365 rps | 0.44× | +11% |
+| 10 MiB | ~228 rps | 506 rps | 0.45× | **+82%** |
 
-Two things this shows:
+**nginx is still faster at every size.** An optimisation pass moved 1 KiB by
+55% and 10 MiB by 82%, and did not move 0 B at all. What that pass established:
 
-- **The gap is not just `sendfile`.** With sendfile off — the setup that
-  favoured OxiServe on macOS — nginx still wins 1.6–2.3×. On small payloads,
-  which have no body to zero-copy, nginx simply has a cheaper per-request path.
-- **`sendfile` is a real, unimplemented advantage.** It roughly doubles nginx's
-  large-file throughput (252 → 405 rps on 10 MiB) while doing nothing for
-  OxiServe, which reads through userspace. This is the single biggest concrete
-  item to close, and it is on the list.
+- **`sendfile(2)` works and matters.** Measured directly by A/B-ing the
+  directive on the same binary: 10 MiB runs at 228 rps with it and 132 without,
+  a 1.7× gain. It is not enough to reach nginx.
+- **Allocations were worth fixing, but are no longer the limit.** Removing the
+  per-request header `Vec`, the regex-deep-copying directive clones, two
+  redundant location searches, and the `Last-Modified` / `ETag` /
+  `Content-Type` strings bought the 1 KiB gain. A further pass removing three
+  more allocations changed nothing measurable — so the remaining gap is
+  elsewhere.
+- **The 0 B case is the honest signal.** It has no body to send and no
+  compression to do, so it measures pure per-request cost, and it did not
+  improve. At ~0.5× nginx, the request path itself is roughly twice as
+  expensive. That is the next thing to profile, not guess at.
+
+Measurements on this box carry ±5% run-to-run noise (10 MiB repeated four
+times: 216, 221, 233, 241), so single-run differences under ~10% mean nothing.
 
 ### macOS — where the story began, and why it misled
 
