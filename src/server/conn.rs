@@ -874,7 +874,9 @@ async fn sendfile_all(
 
     while sent < len {
         let want = (len - sent).min(1 << 30) as usize;
-        tcp.writable().await?;
+        // Try the syscall first and only park when the kernel says the send
+        // buffer is full. Awaiting writability up front cost an epoll round
+        // trip per chunk even when the socket could already accept data.
         let res = tcp.try_io(Interest::WRITABLE, || {
             // SAFETY: both descriptors are owned and open for the call, and
             // `off` is a valid mutable pointer the kernel advances for us.
@@ -888,7 +890,8 @@ async fn sendfile_all(
         match res {
             Ok(0) => break, // the file ended early (truncated underneath us)
             Ok(n) => sent += n,
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            // Send buffer full: wait for the kernel to drain it, then retry.
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => tcp.writable().await.map(|_| ())?,
             Err(e) => return Err(e),
         }
     }
