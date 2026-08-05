@@ -20,6 +20,9 @@ use crate::http::date;
 use crate::http::request::Hot;
 use crate::http::response::{push_num, Resp};
 
+/// Files at or below this size are read straight into the write buffer.
+pub const INLINE_MAX: u64 = 64 * 1024;
+
 /// Files at or below this size are memory-mapped; above it we stream.
 ///
 /// Raising this past a few megabytes was measured to make no difference — on
@@ -229,16 +232,25 @@ async fn serve_file(
         return Ok(r);
     }
 
-    let body = open_body(path, start, len).map_err(|e| io_status(&e))?;
+    let body = open_body(path, start, len, core.sendfile).map_err(|e| io_status(&e))?;
     Ok(Reply::new(resp, body))
 }
 
-fn open_body(path: &Path, start: u64, len: u64) -> io::Result<Body> {
+fn open_body(path: &Path, start: u64, len: u64, sendfile: bool) -> io::Result<Body> {
     let file = std::fs::File::open(path)?;
     if len == 0 {
         return Ok(Body::Empty);
     }
-    if len <= MMAP_MAX {
+    // Small files: one `pread` into the write buffer beats mapping. `mmap` and
+    // `munmap` are page-table operations, and at a few kilobytes their cost
+    // dominates the copy they save.
+    if len <= INLINE_MAX {
+        return Ok(Body::Inline { file, offset: start, len });
+    }
+    // With `sendfile on`, the kernel can move the file to the socket without a
+    // mapping at all, so skip straight to the file path and let the write side
+    // choose `sendfile(2)`.
+    if !sendfile && len <= MMAP_MAX {
         // SAFETY: mapping a file another process may truncate can fault on
         // access. We accept the same exposure nginx has with sendfile, and
         // bound it by only mapping small, already-stat'd regular files.

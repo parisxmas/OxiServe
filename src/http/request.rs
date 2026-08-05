@@ -148,6 +148,10 @@ pub struct Req {
 
 const NO_HEADER: u16 = u16::MAX;
 
+/// Upper bound on request headers. nginx's practical limit is set by
+/// `large_client_header_buffers`; this caps the parse scratch array.
+pub const MAX_HEADERS: usize = 96;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParseResult {
     /// Need more bytes before a decision can be made.
@@ -190,14 +194,22 @@ impl Req {
         self.keep_alive = true;
     }
 
-    /// Parses a request head out of `buf`. `max_headers` bounds the header
-    /// count so a hostile peer cannot force unbounded work.
-    pub fn parse(&mut self, buf: &[u8], max_headers: usize) -> ParseResult {
+    /// Parses a request head out of `buf`.
+    ///
+    /// The header scratch space is an uninitialised stack array rather than a
+    /// heap `Vec`: allocating and zeroing one per request cost more than the
+    /// parse itself at small payload sizes. [`MAX_HEADERS`] bounds it, so a
+    /// hostile peer cannot force unbounded work.
+    pub fn parse(&mut self, buf: &[u8], _max_headers: usize) -> ParseResult {
         self.reset();
 
-        let mut hbuf = vec![httparse::EMPTY_HEADER; max_headers];
-        let mut p = httparse::Request::new(&mut hbuf);
-        let status = match p.parse(buf) {
+        // SAFETY: an array of `MaybeUninit` needs no initialisation, and
+        // `parse_with_uninit_headers` only ever reads back the entries it has
+        // itself written (httparse documents this contract).
+        let mut hbuf: [std::mem::MaybeUninit<httparse::Header<'_>>; MAX_HEADERS] =
+            unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+        let mut p = httparse::Request::new(&mut []);
+        let status = match p.parse_with_uninit_headers(buf, &mut hbuf) {
             Ok(s) => s,
             Err(httparse::Error::TooManyHeaders) => return ParseResult::Error(431),
             Err(httparse::Error::Version) => return ParseResult::Error(505),

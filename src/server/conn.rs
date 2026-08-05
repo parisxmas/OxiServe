@@ -29,6 +29,24 @@ const READ_BUF_INIT: usize = 8 * 1024;
 
 
 
+/// Gives the write path access to the raw socket when the transport is plain
+/// TCP. `sendfile(2)` needs a real file descriptor pair, and a TLS stream has
+/// no such thing — the default implementation returns `None`, so TLS simply
+/// takes the ordinary copy path.
+pub trait RawStream {
+    fn as_tcp(&self) -> Option<&tokio::net::TcpStream> {
+        None
+    }
+}
+
+impl RawStream for tokio::net::TcpStream {
+    fn as_tcp(&self) -> Option<&tokio::net::TcpStream> {
+        Some(self)
+    }
+}
+
+impl<T> RawStream for tokio_rustls::server::TlsStream<T> {}
+
 pub struct ConnState {
     pub read: Vec<u8>,
     pub write: Vec<u8>,
@@ -66,7 +84,7 @@ pub async fn serve<S>(
     scheme: &'static str,
     conn_id: u64,
 ) where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + RawStream,
 {
     let mut st = ConnState::default();
     let mut requests: u64 = 0;
@@ -113,8 +131,9 @@ pub async fn serve<S>(
         requests += 1;
 
         // ---- pick the server and normalise the URI -------------------------
-        let host_owned = st.req.host(&st.read).to_ascii_lowercase();
-        let server: &Arc<ServerConf> = listener.match_host(&host_owned);
+        // No `to_ascii_lowercase()` here: `match_host` compares
+        // case-insensitively, so lowercasing first was a wasted allocation.
+        let server: &Arc<ServerConf> = listener.match_host(st.req.host(&st.read));
 
         let raw_path = st.req.path_str(&st.read);
         let normalised = match uri::normalize(raw_path) {
@@ -509,7 +528,7 @@ async fn write_reply<S>(
     head_only: bool,
 ) -> io::Result<Written>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + RawStream,
 {
     let Reply { resp, body } = reply;
     wbuf.clear();
@@ -544,6 +563,18 @@ where
             let slice = &map[range.clone()];
             write_head_and_slice(sock, wbuf, slice).await?;
             slice.len() as u64
+        }
+        Body::Inline { file, offset, len } => {
+            // Append the file to the head buffer and send both in one write.
+            // The buffer is per-connection and reused, so this costs a `pread`
+            // and no allocation once the connection has warmed up.
+            let head = wbuf.len();
+            let want = len as usize;
+            wbuf.resize(head + want, 0);
+            let n = read_at(&file, &mut wbuf[head..], offset)?;
+            wbuf.truncate(head + n);
+            sock.write_all(wbuf).await?;
+            n as u64
         }
         Body::File { file, offset, len } => {
             sock.write_all(wbuf).await?;
@@ -627,8 +658,16 @@ async fn stream_file<S>(
     buf_size: usize,
 ) -> io::Result<u64>
 where
-    S: AsyncWrite + Unpin,
+    S: AsyncWrite + Unpin + RawStream,
 {
+    // Zero-copy first: `sendfile(2)` moves the file straight from page cache to
+    // socket without it ever entering user space. This is the single biggest
+    // advantage nginx had on Linux.
+    #[cfg(target_os = "linux")]
+    if let Some(tcp) = sock.as_tcp() {
+        return sendfile_all(tcp, &file, offset, len).await;
+    }
+
     let mut sent = 0u64;
     let mut pos = offset;
     let chunk = buf_size.clamp(16 * 1024, 512 * 1024).min(len.max(1) as usize);
@@ -802,4 +841,44 @@ mod tests {
         assert!(s.read.capacity() >= READ_BUF_INIT);
         assert!(s.write.capacity() >= READ_BUF_INIT);
     }
+}
+
+/// Copies a file to a socket with `sendfile(2)`, never touching user space.
+///
+/// The socket is non-blocking, so `sendfile` returns `EAGAIN` once the send
+/// buffer fills; `writable()` parks the task until the kernel has drained it.
+#[cfg(target_os = "linux")]
+async fn sendfile_all(
+    tcp: &tokio::net::TcpStream,
+    file: &std::fs::File,
+    offset: u64,
+    len: u64,
+) -> io::Result<u64> {
+    use std::os::fd::AsRawFd;
+    use tokio::io::Interest;
+
+    let mut off = offset as libc::off_t;
+    let mut sent = 0u64;
+
+    while sent < len {
+        let want = (len - sent).min(1 << 30) as usize;
+        tcp.writable().await?;
+        let res = tcp.try_io(Interest::WRITABLE, || {
+            // SAFETY: both descriptors are owned and open for the call, and
+            // `off` is a valid mutable pointer the kernel advances for us.
+            let n = unsafe { libc::sendfile(tcp.as_raw_fd(), file.as_raw_fd(), &mut off, want) };
+            if n < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(n as u64)
+            }
+        });
+        match res {
+            Ok(0) => break, // the file ended early (truncated underneath us)
+            Ok(n) => sent += n,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(sent)
 }

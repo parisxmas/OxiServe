@@ -53,6 +53,9 @@ pub struct Ctx<'a> {
 
     /// How many internal redirects have happened, to break `try_files` loops.
     pub redirects: u32,
+    /// The location `route` selected, cached so response decoration and
+    /// `error_page` lookup do not each repeat the location search.
+    pub matched: Option<Arc<crate::config::model::Location>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -93,6 +96,7 @@ impl<'a> Ctx<'a> {
             upstream_status: 0,
             upstream_time: 0.0,
             redirects: 0,
+            matched: None,
         }
     }
 

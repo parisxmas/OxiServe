@@ -37,14 +37,23 @@ enum Step {
 
 pub async fn handle(ctx: &mut Ctx<'_>) -> Reply {
     // Phase 1: server-level rewrites and conditions.
-    if let Some(step) = run_rewrites(ctx, &ctx.server.rewrites.clone()) {
-        if let Some(r) = finish(ctx, step).await {
-            return r;
+    //
+    // The `Arc` is cloned, not the directive lists. Cloning the `Vec<Rewrite>`
+    // here deep-copied every compiled regex on every request; bumping a
+    // refcount instead ends the borrow on `ctx` just as effectively.
+    let srv = ctx.server.clone();
+    if !srv.rewrites.is_empty() {
+        if let Some(step) = run_rewrites(ctx, &srv.rewrites) {
+            if let Some(r) = finish(ctx, step).await {
+                return r;
+            }
         }
     }
-    if let Some(step) = run_ifs(ctx, &ctx.server.ifs.clone()) {
-        if let Some(r) = finish(ctx, step).await {
-            return r;
+    if !srv.ifs.is_empty() {
+        if let Some(step) = run_ifs(ctx, &srv.ifs) {
+            if let Some(r) = finish(ctx, step).await {
+                return r;
+            }
         }
     }
 
@@ -121,9 +130,52 @@ pub async fn handle(ctx: &mut Ctx<'_>) -> Reply {
 }
 
 /// Selects a location and dispatches to it.
+///
+/// The chosen location is cached on the context. Response decoration and
+/// `error_page` lookup both need it, and re-running the location search for
+/// each meant matching every prefix and regex three times per request.
 async fn route(ctx: &mut Ctx<'_>, internal: bool) -> Step {
-    let uri = ctx.uri.clone();
-    let Some((loc, caps)) = ctx.server.locations.find(&uri) else {
+    // The URI is moved out of `ctx` rather than cloned so the match can hold a
+    // reference to it while `ctx` is mutated. It is put straight back.
+    let uri = std::mem::take(&mut ctx.uri);
+
+    let mut caps: Option<Vec<String>> = None;
+    let found = match ctx.server.locations.find(&uri) {
+        None => None,
+        Some((loc, c)) => {
+            if let Some(c) = c {
+                caps = Some(owned_captures(&c));
+            }
+            // Nested locations are searched only within the matched parent.
+            let mut cur = loc.clone();
+            loop {
+                let next = match &cur.nested {
+                    Some(nested) => nested
+                        .find(&uri)
+                        .map(|(inner, c)| (inner.clone(), c.map(|c| owned_captures(&c)))),
+                    None => None,
+                };
+                match next {
+                    Some((inner, c)) => {
+                        if let Some(c) = c {
+                            caps = Some(c);
+                        }
+                        cur = inner;
+                    }
+                    None => break,
+                }
+            }
+            Some(cur)
+        }
+    };
+
+    ctx.uri = uri;
+    if let Some(c) = caps {
+        ctx.captures = c;
+    }
+    ctx.matched = found.clone();
+
+    let Some(loc) = found else {
         // No location at all: fall back to the server's own action or static.
         return match &ctx.server.action {
             Action::Return { status, body } => Step::Done(return_reply(ctx, *status, body.clone())),
@@ -133,24 +185,14 @@ async fn route(ctx: &mut Ctx<'_>, internal: bool) -> Step {
             },
         };
     };
-    let mut loc = loc.clone();
-    if let Some(c) = caps {
-        ctx.set_captures(&c);
-    }
-
-    // Nested locations are searched only within the matched parent.
-    while let Some(nested) = &loc.nested {
-        let Some((inner, caps)) = nested.find(&uri) else {
-            break;
-        };
-        let inner = inner.clone();
-        if let Some(c) = caps {
-            ctx.set_captures(&c);
-        }
-        loc = inner;
-    }
 
     dispatch(ctx, &loc, internal).await
+}
+
+fn owned_captures(c: &regex::Captures<'_>) -> Vec<String> {
+    (1..c.len())
+        .map(|i| c.get(i).map(|m| m.as_str()).unwrap_or("").to_string())
+        .collect()
 }
 
 async fn dispatch(ctx: &mut Ctx<'_>, loc: &Arc<Location>, internal: bool) -> Step {
@@ -369,12 +411,10 @@ enum ErrorRoute {
 
 /// Finds the `error_page` covering `code`, preferring the location's list.
 fn error_page_for(ctx: &Ctx<'_>, code: u16) -> Option<ErrorRoute> {
-    let uri = ctx.uri.clone();
     let loc_pages = ctx
-        .server
-        .locations
-        .find(&uri)
-        .map(|(l, _)| l.error_pages.as_slice())
+        .matched
+        .as_ref()
+        .map(|l| l.error_pages.as_slice())
         .filter(|p| !p.is_empty());
 
     let pages = loc_pages.unwrap_or(ctx.server.error_pages.as_slice());
@@ -493,11 +533,10 @@ fn decorate(ctx: &Ctx<'_>, mut r: Reply) -> Reply {
 
 /// The core conf of whichever location matched, for post-processing.
 fn matched_core<'a>(ctx: &'a Ctx<'a>) -> &'a CoreConf {
-    ctx.server
-        .locations
-        .find(&ctx.uri)
-        .map(|(l, _)| &l.core)
-        .unwrap_or(&ctx.server.core)
+    match &ctx.matched {
+        Some(l) => &l.core,
+        None => &ctx.server.core,
+    }
 }
 
 fn apply_expires(resp: &mut Resp, e: Expires) {
@@ -558,9 +597,25 @@ fn maybe_gzip(ctx: &Ctx<'_>, core: &CoreConf, r: &mut Reply) {
 
     // Only in-memory bodies are compressed inline; streaming a compressor over
     // a large file would cost more than it saves at these sizes.
+    //
+    // `Inline` bodies have not been read yet — they are normally handed to the
+    // connection to `pread` straight into the write buffer — so compressing one
+    // means reading it here first. That is still cheaper than the compression.
+    let inline_read;
     let raw: &[u8] = match &r.body {
         Body::Bytes(b) => b,
         Body::Mmap { map, range } => &map[range.clone()],
+        Body::Inline { file, offset, len } => {
+            let mut v = vec![0u8; *len as usize];
+            match read_exact_at(file, &mut v, *offset) {
+                Ok(n) => {
+                    v.truncate(n);
+                    inline_read = v;
+                    &inline_read
+                }
+                Err(_) => return,
+            }
+        }
         _ => return,
     };
 
@@ -614,4 +669,34 @@ pub fn absolute_url(ctx: &Ctx<'_>, path: &str) -> String {
     }
     s.push_str(path);
     s
+}
+
+/// Reads `buf.len()` bytes at `off`, tolerating short reads.
+fn read_exact_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        let mut done = 0;
+        while done < buf.len() {
+            match f.read_at(&mut buf[done..], off + done as u64)? {
+                0 => break,
+                n => done += n,
+            }
+        }
+        Ok(done)
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = f.try_clone()?;
+        f.seek(SeekFrom::Start(off))?;
+        let mut done = 0;
+        while done < buf.len() {
+            match f.read(&mut buf[done..])? {
+                0 => break,
+                n => done += n,
+            }
+        }
+        Ok(done)
+    }
 }

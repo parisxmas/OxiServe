@@ -19,6 +19,10 @@ pub enum Body {
     Bytes(Vec<u8>),
     /// A window into a memory-mapped file.
     Mmap { map: Arc<Mmap>, range: Range<usize> },
+    /// A small file read directly into the connection's write buffer, so the
+    /// head and body leave in a single `write`. Cheaper than mapping: `mmap` +
+    /// `munmap` per request costs more than one `pread` at these sizes.
+    Inline { file: std::fs::File, offset: u64, len: u64 },
     /// A file too large to map, read in chunks off the blocking pool.
     File { file: std::fs::File, offset: u64, len: u64 },
     /// A proxied upstream body. `pre` is whatever already arrived in the
@@ -37,6 +41,7 @@ impl Body {
             Body::Empty => Some(0),
             Body::Bytes(b) => Some(b.len() as u64),
             Body::Mmap { range, .. } => Some(range.len() as u64),
+            Body::Inline { len, .. } => Some(*len),
             Body::File { len, .. } => Some(*len),
             Body::Stream { len, .. } => *len,
         }
@@ -53,6 +58,7 @@ impl std::fmt::Debug for Body {
             Body::Empty => write!(f, "Empty"),
             Body::Bytes(b) => write!(f, "Bytes({})", b.len()),
             Body::Mmap { range, .. } => write!(f, "Mmap({}..{})", range.start, range.end),
+            Body::Inline { offset, len, .. } => write!(f, "Inline(@{offset}, {len})"),
             Body::File { offset, len, .. } => write!(f, "File(@{offset}, {len})"),
             Body::Stream { len, .. } => write!(f, "Stream({len:?})"),
         }
