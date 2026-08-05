@@ -4,7 +4,13 @@ An nginx-configuration-compatible web server written in Rust.
 
 OxiServe reads your existing `nginx.conf` — the real grammar, includes, variables,
 `server_name` and `location` matching semantics included — and serves it from a
-thread-per-core data plane designed to beat nginx on the static and proxy hot paths.
+thread-per-core data plane.
+
+The original goal was to beat nginx on the static hot path. **On a realistic
+Linux benchmark it does not** — nginx is faster at every payload size (see
+[Benchmarks](#benchmarks)). The macOS numbers that suggested otherwise turned
+out to be an artifact of the test conditions. Closing that gap — starting with
+`sendfile()`, which OxiServe does not yet implement — is the active work.
 
 ```console
 $ oxiserve -t -c /etc/nginx/nginx.conf
@@ -103,35 +109,64 @@ keepalive, access logging off on both, page cache warmed before each
 measurement — across four payload sizes chosen to exercise different paths.
 It requires `nginx` and one of `wrk` / `oha` / `bombardier`.
 
-**Measured** on macOS 15 (Darwin 25.3), M-series, 10 cores, loopback,
-`wrk -t10 -c128 -d10s`, nginx 1.31.3, `sendfile off` on both:
+### Linux — the result that counts
+
+Debian 12, kernel 6.1, 4 cores, `wrk -t2 -c16`, nginx 1.22.1. Both servers and
+the load generator pinned to 2 cores (a shared box; this bounds the blast
+radius, and handicaps both equally). **nginx wins at every size, with
+`sendfile` on or off:**
+
+| Payload | OxiServe | nginx (sendfile on) | nginx (sendfile off) |
+|---|---:|---:|---:|
+| 0 B | 45,277 rps | 67,876 (**0.67×**) | 74,925 (**0.58×**) |
+| 1 KiB | 26,554 rps | 48,149 (**0.55×**) | 55,675 (**0.44×**) |
+| 100 KiB | 12,523 rps | 27,825 (**0.45×**) | 19,102 (**0.61×**) |
+| 10 MiB | 125 rps | 405 (**0.31×**) | 252 (**0.53×**) |
+
+Two things this shows:
+
+- **The gap is not just `sendfile`.** With sendfile off — the setup that
+  favoured OxiServe on macOS — nginx still wins 1.6–2.3×. On small payloads,
+  which have no body to zero-copy, nginx simply has a cheaper per-request path.
+- **`sendfile` is a real, unimplemented advantage.** It roughly doubles nginx's
+  large-file throughput (252 → 405 rps on 10 MiB) while doing nothing for
+  OxiServe, which reads through userspace. This is the single biggest concrete
+  item to close, and it is on the list.
+
+### macOS — where the story began, and why it misled
+
+macOS 15, M-series, 10 cores, unloaded, `wrk -t10 -c128`, nginx 1.31.3,
+`sendfile off` on both:
 
 | Payload | OxiServe | nginx | |
 |---|---:|---:|---|
-| 0 B | **140,076** rps | 80,326 rps | **1.74×** |
-| 1 KiB | **108,280** rps | 76,289 rps | **1.42×** |
-| 100 KiB | **74,087** rps | 37,273 rps | **1.99×** |
-| 10 MiB | 667 rps | 703 rps | 0.95× — parity |
+| 0 B | 140,076 rps | 80,326 rps | 1.74× |
+| 1 KiB | 108,280 rps | 76,289 rps | 1.42× |
+| 100 KiB | 74,087 rps | 37,273 rps | 1.99× |
+| 10 MiB | 667 rps | 703 rps | 0.95× |
 
-Read the caveats before quoting any of this:
+These looked like wins. They were mostly artifacts, and the Linux run above is
+why I no longer trust them:
 
-- **Multi-megabyte files are at parity, not ahead.** They started at 0.66×.
-  Fixing that meant discovering the bottleneck was neither of the two things
-  it looked like — see [Large files](#large-files) below.
-- **`sendfile off` on both is deliberate.** On macOS, nginx's `sendfile on`
-  path collapses to ~100 MB/s — a Darwin pathology, not an nginx
-  characteristic. Leaving it on produces a flattering 63× "win" on the 10 MiB
-  case that means nothing. The harness turns it off for both and says so.
-  On Linux, re-run with `SENDFILE=on`.
-- **macOS is not nginx's best platform.** No `epoll`, no `SO_REUSEPORT` accept
-  load-balancing. Expect nginx to close much of the small-payload gap on Linux.
-  These numbers are a starting point, not a verdict.
+- **`sendfile off` was hiding nginx's best trick.** It was forced off because
+  macOS's `sendfile` has a pathology (nginx collapses to ~100 MB/s). But
+  turning off a feature nginx has and OxiServe lacks flatters OxiServe. The
+  fair Linux comparison puts it back.
+- **An unloaded 10-core Mac hides per-request CPU cost.** OxiServe uses more
+  CPU per request than nginx; with 8 spare cores that never showed. On 2
+  contended Linux cores it dominates.
 - Loopback benchmarks measure the server and the kernel, not a network.
 
-### Large files
+The honest summary: **OxiServe is correct and reasonably fast, but it does not
+beat nginx on Linux today.** The name of the game now is closing that gap, not
+claiming it is closed.
 
-The 10 MiB case is worth writing down, because the obvious explanations were
-wrong and the measurements say so. Throughput per concurrency level, 10 MiB:
+### Large files (macOS tuning notes)
+
+The 10 MiB path went through several strategies on macOS before reaching the
+0.95× above. Recorded here because the obvious explanations were wrong and the
+measurements said so — but note the Linux table above supersedes these as the
+headline result. Throughput per concurrency level, 10 MiB, macOS:
 
 | strategy | c=1 | c=10 | c=128 |
 |---|---:|---:|---:|
