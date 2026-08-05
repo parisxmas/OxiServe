@@ -25,6 +25,11 @@ use crate::http::status;
 /// spinning a worker forever. nginx uses the same limit.
 const MAX_INTERNAL_REDIRECTS: u32 = 10;
 
+/// Largest file compressed on the fly. Above this the CPU and the memory to
+/// hold both copies cost more than the bandwidth saved, and `sendfile` — which
+/// compression rules out — is the better trade.
+const GZIP_MAX_FILE: u64 = 8 * 1024 * 1024;
+
 /// Outcome of one routing pass.
 enum Step {
     Done(Reply),
@@ -607,17 +612,24 @@ fn maybe_gzip(ctx: &Ctx<'_>, core: &CoreConf, r: &mut Reply) {
     // `Inline` bodies have not been read yet — they are normally handed to the
     // connection to `pread` straight into the write buffer — so compressing one
     // means reading it here first. That is still cheaper than the compression.
-    let inline_read;
+    // A file body has not been read yet — the write path would normally hand
+    // it to `sendfile`. Compressing means reading it here instead, which is
+    // the trade nginx also makes: gzip and sendfile are mutually exclusive,
+    // because compression has to happen in user space.
+    if len > GZIP_MAX_FILE {
+        return;
+    }
+    let file_read;
     let raw: &[u8] = match &r.body {
         Body::Bytes(b) => b,
         Body::Mmap { map, range } => &map[range.clone()],
-        Body::Inline { file, offset, len } => {
+        Body::Inline { file, offset, len } | Body::File { file, offset, len } => {
             let mut v = vec![0u8; *len as usize];
             match read_exact_at(file, &mut v, *offset) {
                 Ok(n) => {
                     v.truncate(n);
-                    inline_read = v;
-                    &inline_read
+                    file_read = v;
+                    &file_read
                 }
                 Err(_) => return,
             }

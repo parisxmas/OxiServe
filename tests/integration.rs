@@ -847,3 +847,33 @@ fn open_file_cache_missing_file_still_404s_and_appears_when_created() {
     assert_eq!(r.status, 200, "with errors off, a created file must appear immediately");
     assert_eq!(r.body_str(), "now");
 }
+
+#[test]
+fn gzip_compresses_files_too_large_for_the_inline_path() {
+    // Files above the inline threshold take the sendfile/stream path. They
+    // must still compress — WordPress ships a 131 KB stylesheet, and skipping
+    // those silently defeats gzip on exactly the assets that matter most.
+    let big = "body{color:red;padding:0;margin:0}\n".repeat(6000); // ~200 KB
+    let s = Server::start(
+        "gzipbig",
+        &format!("{BASE}
+    gzip on;
+    gzip_min_length 256;
+    gzip_types text/css;
+    server {{ listen {{PORT}}; root {{ROOT}}; }}
+}}"),
+        &[("big.css", big.as_bytes())],
+    );
+
+    let r = s.raw("GET /big.css HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("Content-Encoding"), Some("gzip"), "large file must still be compressed");
+    assert!(
+        r.body.len() < big.len() / 4,
+        "expected real compression, got {} from {}", r.body.len(), big.len()
+    );
+
+    // Without gzip the client still gets every byte.
+    let plain = s.get("/big.css");
+    assert_eq!(plain.body.len(), big.len());
+}
