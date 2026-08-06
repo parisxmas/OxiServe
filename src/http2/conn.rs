@@ -427,7 +427,10 @@ where
                 // request it ever served.
                 streams.retain(|_, s| !(s.dispatched && s.flow.done.get()));
 
-                let active = streams.values().filter(|s| !s.dispatched).count();
+                // Everything still in flight counts, not just the requests
+                // waiting to be dispatched: a stream whose response is still
+                // being written is very much concurrent.
+                let active = streams.values().filter(|s| !s.flow.done.get()).count();
                 if active >= MAX_CONCURRENT as usize {
                     let mut o = Vec::new();
                     frame::rst(head.stream, Code::RefusedStream, &mut o);
@@ -453,8 +456,13 @@ where
             }
 
             kind::CONTINUATION => {
-                if !streams.contains_key(&head.stream) {
-                    return Err(ConnErr(Code::Protocol, "CONTINUATION without HEADERS"));
+                // Only legal while a header block is open on this exact
+                // stream. The check at the top of the loop catches a *wrong*
+                // frame arriving mid-block; this catches a CONTINUATION with
+                // no block open at all, which is otherwise indistinguishable
+                // from a header block appearing out of nowhere.
+                if expect_continuation != Some(head.stream) {
+                    return Err(ConnErr(Code::Protocol, "CONTINUATION without an open block"));
                 }
                 {
                     let st = streams.get_mut(&head.stream).expect("checked");
