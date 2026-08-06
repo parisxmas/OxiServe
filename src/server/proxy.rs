@@ -264,6 +264,7 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
     let mut upstream_chunked = false;
     let mut upstream_len: Option<u64> = None;
     let mut upstream_said_close = false;
+    let mut upstream_upgrade: Option<String> = None;
 
     loop {
         let mut chunk = [0u8; 8192];
@@ -327,6 +328,13 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
                         upstream_said_close = value.eq_ignore_ascii_case("close");
                         continue;
                     }
+                    // `Upgrade` is hop-by-hop for good reason — but a `101` is
+                    // the one response where the hop IS the point, and the
+                    // client needs to be told which protocol it just got.
+                    if lower == "upgrade" {
+                        upstream_upgrade = Some(value);
+                        continue;
+                    }
                     if HOP_BY_HOP.contains(&lower.as_str()) {
                         continue;
                     }
@@ -384,6 +392,38 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
     }
 
     let pre = buf[head_len..].to_vec();
+
+    // ---- protocol switch --------------------------------------------------
+    // A `101` ends the request/response shape entirely: no length, no
+    // chunking, no keep-alive, and the upstream connection must never go back
+    // in the pool — it belongs to this client now. Everything below this point
+    // assumes an HTTP body, which a tunnel is not.
+    if status == 101 {
+        // The client only gets a switch it asked for. A backend answering 101
+        // to a request that carried no `Upgrade` is confused, and forwarding
+        // it would leave a client that speaks HTTP wired to one that no longer
+        // does.
+        if ctx.req.hot_value(ctx.buf, crate::http::request::Hot::Upgrade).is_none() {
+            note_failure(chosen, ctx);
+            return Err(502);
+        }
+        let mut resp = Resp::new();
+        resp.status = 101;
+        for (n, v) in resp_headers {
+            resp.header(&n, &v);
+        }
+        if let Some(proto) = upstream_upgrade {
+            resp.header("Upgrade", &proto);
+        }
+        // RFC 9110: the `Connection` header of a switch names `upgrade`, not
+        // `close`. `Reply::frame` still stops this connection from returning
+        // to the keep-alive loop.
+        resp.header("Connection", "Upgrade");
+        return Ok(Reply::new(
+            resp,
+            Body::Upgraded { pre, io: Box::new(up), idle: read_to },
+        ));
+    }
 
     // Store, when the response is cacheable and fully in hand. Only bodies
     // that arrived complete are cached: writing a partial entry would be

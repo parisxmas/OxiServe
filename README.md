@@ -121,6 +121,25 @@ automatic recovery), `backup` failover, weighted round-robin, real
 `keepalive` pool that probes a connection for liveness before reusing it.
 Health is shared across workers; the pool is per worker.
 
+**WebSockets** — a `101` from the backend switches the connection out of HTTP
+and wires the two sockets together until a peer hangs up. Configured as nginx
+configures it:
+
+```nginx
+location /ws {
+    proxy_pass http://app;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+}
+```
+
+`proxy_read_timeout` becomes an *idle* timeout on the tunnel rather than a
+bound on its life — a WebSocket that sits quiet for an hour and then carries a
+message is working, not stuck. A `101` the client never asked for is refused
+with `502`: forwarding it would leave a client that speaks HTTP wired to one
+that no longer does.
+
 **HTTP/2** — `listen 443 ssl http2` negotiates `h2` over ALPN;
 `listen 80 http2` also serves cleartext h2c by prior knowledge, sharing the
 port with HTTP/1.1 (the first bytes are inspected, never consumed, so an

@@ -1051,6 +1051,13 @@ async fn write_body(
             }
             send(&[], true, tx);
         }
+        Body::Upgraded { .. } => {
+            // Unreachable: RFC 9113 has no 101, and `parse_headers` refuses a
+            // request carrying `connection` or `upgrade`, so no HTTP/2 stream
+            // can ever ask for a protocol switch. Ending the stream is the
+            // only honest thing to do if one somehow arrives.
+            send(&[], true, tx);
+        }
         Body::Stream { pre, mut io, .. } => {
             sent += pump(id, &pre, flow, st, tx).await;
             let mut chunk = vec![0u8; 64 * 1024];

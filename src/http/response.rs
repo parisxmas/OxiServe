@@ -178,11 +178,18 @@ impl Resp {
             Framing::UntilClose | Framing::None => {}
         }
 
-        out.extend_from_slice(if self.keep_alive {
-            b"Connection: keep-alive\r\n".as_slice()
-        } else {
-            b"Connection: close\r\n".as_slice()
-        });
+        // A `101` carries its own `Connection: Upgrade`, set by whoever built
+        // the switch. Adding ours would put two contradictory `Connection`
+        // headers on the same response — "close" and "Upgrade" — which is
+        // exactly the sort of thing a strict client rejects and a lenient one
+        // acts on unpredictably.
+        if self.status != 101 {
+            out.extend_from_slice(if self.keep_alive {
+                b"Connection: keep-alive\r\n".as_slice()
+            } else {
+                b"Connection: close\r\n".as_slice()
+            });
+        }
 
         for (n, v) in self.iter() {
             out.extend_from_slice(n.as_bytes());
@@ -277,6 +284,22 @@ mod tests {
         let mut r = Resp::new();
         r.keep_alive = false;
         assert!(head(&r).contains("Connection: close\r\n"));
+    }
+
+    #[test]
+    fn a_protocol_switch_gets_exactly_one_connection_header() {
+        // The switch names `Upgrade`; the writer must not also announce the
+        // close it is otherwise about to do.
+        let mut r = Resp::new();
+        r.status = 101;
+        r.keep_alive = false;
+        r.framing = Framing::None;
+        r.header("Upgrade", "websocket");
+        r.header("Connection", "Upgrade");
+        let h = head(&r);
+        assert_eq!(h.matches("Connection:").count(), 1, "in: {h}");
+        assert!(h.contains("Connection: Upgrade\r\n"));
+        assert!(!h.contains("Content-Length"), "a switch has no body to measure");
     }
 
     #[test]

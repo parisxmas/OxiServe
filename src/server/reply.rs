@@ -9,7 +9,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use memmap2::Mmap;
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::http::response::{Framing, Resp};
 
@@ -34,7 +34,28 @@ pub enum Body {
         io: Box<dyn AsyncRead + Send + Unpin>,
         len: Option<u64>,
     },
+    /// A protocol switch — the upstream answered `101`, and past the response
+    /// head this connection is no longer HTTP in either direction.
+    ///
+    /// Unlike [`Body::Stream`] the upstream must stay *writable*: a WebSocket
+    /// carries frames both ways for as long as the peers want it, so the
+    /// connection becomes a byte tunnel rather than a body being read out.
+    /// `pre` is whatever the upstream sent immediately after its head, and
+    /// `idle` is the `proxy_read_timeout` that governs the tunnel — carried
+    /// here because the location's proxy settings are long out of scope by the
+    /// time the response is written.
+    Upgraded {
+        pre: Vec<u8>,
+        io: Box<dyn Duplex>,
+        idle: std::time::Duration,
+    },
 }
+
+/// A stream that can be read *and* written — what a tunnel needs and what
+/// [`Body::Stream`]'s read-only `io` cannot express.
+pub trait Duplex: AsyncRead + AsyncWrite + Send + Unpin {}
+
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> Duplex for T {}
 
 impl Body {
     /// Byte length when known up front, which is what sets `Content-Length`.
@@ -46,6 +67,8 @@ impl Body {
             Body::Inline { len, .. } => Some(*len),
             Body::File { len, .. } => Some(*len),
             Body::Stream { len, .. } => *len,
+            // Neither bounded nor empty: it ends when a peer hangs up.
+            Body::Upgraded { .. } => None,
         }
     }
 
@@ -63,6 +86,7 @@ impl std::fmt::Debug for Body {
             Body::Inline { offset, len, .. } => write!(f, "Inline(@{offset}, {len})"),
             Body::File { offset, len, .. } => write!(f, "File(@{offset}, {len})"),
             Body::Stream { len, .. } => write!(f, "Stream({len:?})"),
+            Body::Upgraded { pre, .. } => write!(f, "Upgraded(pre {})", pre.len()),
         }
     }
 }
@@ -84,6 +108,18 @@ impl Reply {
     /// this to forward an upstream's chunked body verbatim instead of having
     /// it decoded and re-encoded.
     pub fn frame(mut self, http11: bool) -> Reply {
+        // A protocol switch is checked before the bodyless rule, because 101
+        // *is* in the 1xx range that rule covers. Letting it through there
+        // discarded the tunnel and left the client holding a 101 on a
+        // connection that then closed — the response looked right and nothing
+        // worked.
+        if let Body::Upgraded { .. } = self.body {
+            self.resp.framing = Framing::None;
+            // Not "close" in the TCP sense — but this connection never returns
+            // to the HTTP keep-alive loop, which is what this flag controls.
+            self.resp.keep_alive = false;
+            return self;
+        }
         if crate::http::status::is_bodyless(self.resp.status) {
             self.body = Body::Empty;
             // 304 must not carry Content-Length; 204 must not either.

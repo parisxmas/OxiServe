@@ -683,6 +683,16 @@ where
 
     let body_bytes = match body {
         Body::Empty => 0,
+        Body::Upgraded { pre, io, idle } => {
+            // Send the 101 and everything the upstream already said after it,
+            // then stop speaking HTTP: from here the two sockets are wired to
+            // each other until a peer hangs up.
+            wbuf.extend_from_slice(&pre);
+            sock.write_all(wbuf).await?;
+            sock.flush().await?;
+            let carried = pre.len() as u64;
+            carried + tunnel(sock, io, idle).await
+        }
         Body::Bytes(b) => {
             // Small bodies ride along in the head buffer: one write syscall.
             if b.len() <= 16 * 1024 {
@@ -1036,6 +1046,69 @@ mod tests {
         assert!(s.read.capacity() >= READ_BUF_INIT);
         assert!(s.write.capacity() >= READ_BUF_INIT);
     }
+}
+
+/// Wires the client and upstream sockets together after a `101`.
+///
+/// Returns the bytes sent to the client, for `$body_bytes_sent`.
+///
+/// The timeout is an **idle** one, applied per read rather than to the tunnel
+/// as a whole. A WebSocket exists precisely to sit quiet and then carry a
+/// message hours later; bounding its lifetime would sever exactly the
+/// connections this feature is for. `stream`'s layer 4 proxy makes the same
+/// distinction for the same reason.
+async fn tunnel<S>(
+    sock: &mut S,
+    up: Box<dyn crate::server::reply::Duplex>,
+    idle: Duration,
+) -> u64
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // 16 KB each way: a WebSocket control frame is a handful of bytes and a
+    // data frame is rarely large, so a bigger buffer would only cost memory
+    // per idle connection — and idle connections are what these are.
+    const BUF: usize = 16 * 1024;
+
+    let (mut cr, mut cw) = tokio::io::split(sock);
+    let (mut ur, mut uw) = tokio::io::split(up);
+
+    let to_upstream = async {
+        let mut buf = vec![0u8; BUF];
+        loop {
+            let n = match tokio::time::timeout(idle, cr.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => n,
+            };
+            if uw.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+        }
+        // Half-close, so a backend that finishes on EOF still gets to.
+        let _ = uw.shutdown().await;
+    };
+
+    let to_client = async {
+        let mut sent = 0u64;
+        let mut buf = vec![0u8; BUF];
+        loop {
+            let n = match tokio::time::timeout(idle, ur.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => n,
+            };
+            if cw.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+            sent += n as u64;
+        }
+        let _ = cw.shutdown().await;
+        sent
+    };
+
+    // Both directions run to completion. Stopping at the first would truncate
+    // whatever the other side still had in flight.
+    let (_, sent) = tokio::join!(to_upstream, to_client);
+    sent
 }
 
 /// Copies a file to a socket with `sendfile(2)`, never touching user space.
