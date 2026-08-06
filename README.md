@@ -256,14 +256,18 @@ Median of 5 rounds, alternating which server runs first. Reproduce with
 `bench/nginx-compare.sh`, which prints the worker pinning it verified before
 measuring anything.
 
+Median of 5 rounds, alternating which server runs first. Reproduce with
+`bench/nginx-compare.sh`, which prints the worker pinning it verified before
+measuring anything.
+
 | Scenario | nginx | OxiServe | |
 |---|---:|---:|---|
-| HTTPS/1.1, keepalive, 100 B | 227,639 rps | **297,749 rps** | **1.31×** |
-| HTTP/2 over TLS (100 conns × 32 streams) | 269,030 rps | **342,332 rps** | **1.27×** |
-| HTTP/1.1, keepalive, 100 B | 269,750 rps | **330,847 rps** | **1.23×** |
-| HTTP/1.1, keepalive, 10 KB | 267,787 rps | 276,749 rps | 1.03× |
-| HTTP/1.1, keepalive, 1 MB | 23,122 rps | 23,601 rps | 1.02× |
-| HTTP/1.1, **new connection per request** | **146,676 rps** | 141,331 rps | **0.96×** |
+| HTTPS/1.1, keepalive, 100 B | 243,233 rps | **318,788 rps** | **1.31×** |
+| HTTP/2 over TLS (100 conns × 32 streams) | 278,503 rps | **361,244 rps** | **1.30×** |
+| HTTP/1.1, keepalive, 100 B | 278,962 rps | **347,981 rps** | **1.25×** |
+| HTTP/1.1, keepalive, 10 KB | 289,970 rps | 299,929 rps | 1.03× |
+| HTTP/1.1, keepalive, 1 MB | 24,576 rps | 24,967 rps | 1.02× |
+| HTTP/1.1, **new connection per request** | **158,760 rps** | 147,266 rps | **0.93×** |
 
 Two honest caveats about the table above.
 
@@ -272,51 +276,54 @@ and 26 GB/s they are loopback and memory bandwidth, not server code — both
 implementations are waiting on the same ceiling, and a 1.01× there means
 "indistinguishable", not "narrowly ahead".
 
-**The last row is a real loss and it is still unexplained.** It is genuine
-connection churn — the kernel's `PassiveOpens` counter reads exactly 1.000 new
-TCP connections per request, against 0.000 for the keepalive rows.
+**The last row is a real loss, and the cause is now known.** It is contention
+between our own worker threads:
 
-Chasing it took OxiServe from 11.15 syscalls per connection to **8.08, against
-nginx's 10.02**. We now make ~19% *fewer* syscalls per connection and are still
-3–4% slower on this one workload, which is the useful finding: syscall count
-is not what this row is measuring. Per connection we now issue `accept4`,
-`read`, `openat`, `fstat`, `pread64`, `sendto` and two `close`s; nginx issues
-those plus `setsockopt`, `epoll_ctl`, and a second write syscall.
+| workers each | nginx | OxiServe | |
+|---|---:|---:|---|
+| 1 | 111,780 rps | **115,029 rps** | **1.03×** |
+| 2 | 158,760 rps | 147,266 rps | 0.93× |
 
-Found and fixed on the way, each kept because it is right on its own terms:
+With one worker we are ahead. Adding a second inverts it. nginx never pays this
+because it forks worker *processes*, which share no file-descriptor table — and
+a connection costs four descriptor operations (accept the socket, open the
+file, close the file, close the socket), each taking the `files_struct`
+spinlock that threads in one process share.
 
-- **Reactor registration.** Every accepted socket was registered with epoll on
-  arrival and deregistered on drop; nginx registers once and lets `close`
-  remove it. Accepted sockets now stay unregistered and upgrade in place the
-  first time a syscall would block, so a connection that arrives with its
-  request already buffered never touches epoll.
-- **An 8 KB `memset` per request.** The read path zeroed the whole buffer
-  before every read, of bytes the kernel was about to overwrite.
-- **A timer armed per read.** Arming `tokio::time::timeout` reads the clock;
-  a request already sitting in the socket buffer is now read synchronously and
-  the timeout is only armed when the read would actually block.
-- **`fstat` rather than `statx`.** `File::metadata()` reaches for `statx` on
-  Linux, which returns birth time, mount id and attribute flags a static file
-  server never looks at.
-- **`tcp_nodelay` applied on demand.** Nagle only delays a partial segment
-  while earlier data is unacknowledged, so a connection whose first write is
-  also its last can never be affected by it.
-- **`accept4(SOCK_NONBLOCK)`** rather than accept plus `ioctl(FIONBIO)`, a
-  redundant `shutdown()` before close, and a per-request `Instant::now()` whose
-  value was never read.
+`unshare(CLONE_FILES)` per worker thread buys the same separation and was
+tried. It moved the number about half a point and broke eleven FastCGI tests
+with an unexplained `EINVAL` out of worker startup — serially as well as in
+parallel — so it was reverted rather than shipped. The real fix is the one
+nginx made: worker processes instead of threads, which would also need the
+shared-memory zones nginx has, because upstream health, the cache index and
+`limit_req` counters are shared through `Arc` here today.
 
-Tested and found **not** to be the cause: per-connection allocation churn
-(buffers are pooled per worker regardless now), the per-connection task
-(serving inline without spawning moves the number 0.5%), the accept readiness
-path, `SO_REUSEPORT` distribution (both bind one listening socket per worker,
-verified), and file I/O (the gap survives `open_file_cache` on both sides).
+Getting to that answer meant driving syscalls from 11.15 per connection to
+8.08, against nginx's 10.02 — and watching the gap survive. That is worth
+recording on its own: **syscall count was not what this row was measuring.**
+nginx's two extra calls are `setsockopt` and `epoll_ctl`, which touch no data;
+counting the ones that do real work, both servers issue eight. The
+optimisations found on the way are all kept because each is right on its own
+terms:
 
-One measured difference does remain: time reads (`arch_counter_get_cntvct`)
-are 2.4% of our CPU against nginx's 1.6%, because nginx refreshes one cached
-timestamp per event-loop turn and shares it across every connection in the
-batch. Removing ours entirely would be worth well under a point — not enough
-to close 3–4% — so it is recorded rather than chased into complexity that
-could not pay for itself.
+- accepted sockets stay unregistered with the reactor until a syscall would
+  actually block, so a short connection never calls `epoll_ctl` at all
+- an 8 KB `memset` per request, of bytes the kernel was about to overwrite
+- a timer armed per read — arming `tokio::time::timeout` reads the clock, and
+  a request already in the socket buffer is now read synchronously
+- three heap allocations in URI normalisation for paths with nothing to
+  normalise, which is nearly all of them
+- `fstat` rather than `statx`, `accept4(SOCK_NONBLOCK)` rather than accept plus
+  `ioctl`, `tcp_nodelay` applied only once Nagle could delay something, a
+  redundant `shutdown()`, and a per-request `Instant::now()` never read
+
+Refuted by measurement rather than argument: allocation churn, the
+per-connection task (serving inline without spawning moves it 0.5%), the accept
+readiness path, `SO_REUSEPORT` distribution (both bind one listening socket per
+worker), file I/O (the gap survives `open_file_cache` on both sides), and
+TIME_WAIT accumulation — where the first measurement suggested we held twice as
+many, and counting by local port showed the two were within 0.3% of each other.
+That one was a sampling artifact, caught before anything was built on it.
 
 ### Real-world check: WordPress
 
