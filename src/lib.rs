@@ -16,5 +16,6 @@
 
 pub mod config;
 pub mod http;
+pub mod http2;
 pub mod mime;
 pub mod server;

@@ -121,6 +121,27 @@ automatic recovery), `backup` failover, weighted round-robin, real
 `keepalive` pool that probes a connection for liveness before reusing it.
 Health is shared across workers; the pool is per worker.
 
+**HTTP/2** — `listen 443 ssl http2` negotiates `h2` over ALPN;
+`listen 80 http2` also serves cleartext h2c by prior knowledge, sharing the
+port with HTTP/1.1 (the first bytes are inspected, never consumed, so an
+HTTP/1 client is unaffected). Streams are genuinely concurrent: each request
+runs as its own task and a writer owns the socket, so a slow backend on one
+stream does not hold up a cache hit on another. HPACK with Huffman, flow
+control on both the connection and each stream, and the connection/stream
+error split (a malformed request resets its own stream; a compression error
+ends the connection).
+
+HTTP/2 is a *transport* swap and nothing above the framing layer is
+reimplemented: a decoded request becomes the same `Req` the HTTP/1 parser
+produces and goes through the same handler, so `proxy_pass`, `proxy_cache`,
+`limit_req`, FastCGI, `try_files`, `error_page` and every variable behave
+identically. `:authority` is turned back into a `Host` header so `server_name`
+matching and `$host` need no special case.
+
+> `sendfile` cannot apply to HTTP/2 — every byte must be wrapped in a DATA
+> frame, so the kernel cannot hand the page cache straight to the socket.
+> That is inherent to the protocol; nginx pays the same cost.
+
 **Layer 4 (`stream`)** — TCP proxying with no HTTP parsing, so it fronts
 PostgreSQL, Redis, MQTT or anything else with a TCP protocol. Shares upstream
 selection, passive health and `least_conn` with the HTTP proxy; `proxy_timeout`
@@ -179,7 +200,11 @@ regex captures `$1`–`$9`.
 `oxiserve -t` reports these per-config, distinguishing "not implemented yet" from
 "unknown directive". Currently missing:
 
-- **HTTP/2 and HTTP/3** — `listen ... http2` is parsed and ignored (serves 1.1).
+- **HTTP/3** (QUIC). `listen ... quic` is parsed and ignored.
+- **HTTP/2 server push** — deprecated by RFC 9113 and advertised as disabled;
+  **HTTP/2 CONNECT**; **HTTP/2 trailers** (accepted and discarded);
+  **`Upgrade: h2c`** (the deprecated cleartext upgrade — prior-knowledge h2c
+  works).
 - **uwsgi / SCGI / gRPC** — `uwsgi_pass` and friends (FastCGI *is* supported).
 - **FastCGI response streaming** — responses are fully buffered
   (`fastcgi_buffering on`, capped at 64 MB) rather than streamed.

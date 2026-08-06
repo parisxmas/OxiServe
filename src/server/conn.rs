@@ -82,7 +82,7 @@ impl Default for ConnState {
 /// Drives one client connection to completion.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve<S>(
-    mut sock: S,
+    sock: S,
     listener: &Arc<Listener>,
     http: &Arc<Http>,
     logs: &Rc<RefCell<Logs>>,
@@ -93,7 +93,33 @@ pub async fn serve<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + RawStream,
 {
+    serve_with_prefix(sock, listener, http, logs, remote, local, scheme, conn_id, Vec::new()).await
+}
+
+/// [`serve`], but starting with bytes already read off the socket.
+///
+/// The cleartext HTTP/2 probe has to read the first bytes to tell a preface
+/// from a request line. Those bytes belong to the request, so they are handed
+/// back rather than discarded — anything else would truncate the request line
+/// of every HTTP/1 client on a port that also offers h2c.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_prefix<S>(
+    mut sock: S,
+    listener: &Arc<Listener>,
+    http: &Arc<Http>,
+    logs: &Rc<RefCell<Logs>>,
+    remote: Option<SocketAddr>,
+    local: Option<SocketAddr>,
+    scheme: &'static str,
+    conn_id: u64,
+    prefix: Vec<u8>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + RawStream,
+{
     let mut st = ConnState::default();
+    if !prefix.is_empty() {
+        st.read.extend_from_slice(&prefix);
+    }
     let mut requests: u64 = 0;
 
     // Defaults come from the listener's default server until a Host is parsed.
@@ -859,7 +885,10 @@ fn encode_record(
     }
 }
 
-fn log_request(
+/// Shared with the HTTP/2 path, which produces the same `Ctx` and `Resp` and
+/// so must produce identical log lines — a `log_format` cannot be allowed to
+/// mean different things depending on the transport.
+pub(crate) fn log_request(
     logs: &Rc<RefCell<Logs>>,
     ctx: &Ctx<'_>,
     resp: &Resp,

@@ -359,21 +359,101 @@ async fn accept_loop(
         let tls = tls.clone();
         let id = CONN_ID.fetch_add(1, Ordering::Relaxed);
 
+        let h2_enabled = conf.http2;
         tokio::task::spawn_local(async move {
             match tls {
                 Some(cfg) => {
                     let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
                     // A failed handshake is routine (scanners, probes); drop it.
-                    if let Ok(stream) = acceptor.accept(sock).await {
+                    let Ok(stream) = acceptor.accept(sock).await else { return };
+                    // ALPN is the only negotiation HTTP/2 over TLS has: RFC
+                    // 9113 section 3.1 gives no in-band upgrade, so what the
+                    // handshake agreed on is final.
+                    let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
+                    if h2 {
+                        crate::http2::conn::serve(
+                            stream, &conf, &http, &logs, remote, local_addr, "https", id,
+                            Vec::new(),
+                        )
+                        .await;
+                    } else {
                         conn::serve(stream, &conf, &http, &logs, remote, local_addr, "https", id)
                             .await;
                     }
                 }
                 None => {
+                    // Cleartext HTTP/2 has no ALPN, so a client either knows
+                    // the server speaks it and opens with the preface ("prior
+                    // knowledge"), or it speaks HTTP/1.1. Peeking for the
+                    // preface is how both share a port.
+                    if h2_enabled {
+                        match peek_preface(sock).await {
+                            Preface::H2(sock, pre) => {
+                                crate::http2::conn::serve(
+                                    sock, &conf, &http, &logs, remote, local_addr, "http", id, pre,
+                                )
+                                .await;
+                                return;
+                            }
+                            Preface::Http1(sock, pre) => {
+                                conn::serve_with_prefix(
+                                    sock, &conf, &http, &logs, remote, local_addr, "http", id, pre,
+                                )
+                                .await;
+                                return;
+                            }
+                            Preface::Gone => return,
+                        }
+                    }
                     conn::serve(sock, &conf, &http, &logs, remote, local_addr, "http", id).await;
                 }
             }
         });
+    }
+}
+
+/// What the first bytes on a cleartext connection turned out to be.
+enum Preface {
+    /// The HTTP/2 client preface, plus whatever else arrived with it.
+    H2(transport::Stream, Vec<u8>),
+    /// Not HTTP/2. The bytes read must be handed back — they are the start of
+    /// an HTTP/1 request line.
+    Http1(transport::Stream, Vec<u8>),
+    Gone,
+}
+
+/// Reads just enough of a cleartext connection to tell HTTP/2 from HTTP/1.1.
+///
+/// Cleartext HTTP/2 has no ALPN to negotiate with, so a client that knows the
+/// server supports it simply opens with the connection preface. The preface
+/// begins `PRI * HTTP/2.0`, which is not a valid HTTP/1 request line, so the
+/// two are distinguishable without ambiguity — and the bytes are never
+/// consumed, only inspected, so an HTTP/1 client is unaffected.
+async fn peek_preface(mut sock: transport::Stream) -> Preface {
+    use tokio::io::AsyncReadExt;
+    const P: &[u8] = crate::http2::frame::PREFACE;
+    let mut buf = Vec::with_capacity(P.len());
+    let mut chunk = [0u8; 64];
+    loop {
+        // Compare only what we hold: a client that dribbles the preface a byte
+        // at a time must not be mistaken for an HTTP/1 client.
+        let have = buf.len().min(P.len());
+        if buf[..have] != P[..have] {
+            return Preface::Http1(sock, buf);
+        }
+        if buf.len() >= P.len() {
+            return Preface::H2(sock, buf);
+        }
+        let want = (P.len() - buf.len()).min(chunk.len());
+        match sock.read(&mut chunk[..want]).await {
+            Ok(0) => {
+                // EOF before we could tell. An HTTP/1 request cannot be this
+                // short either, so let the HTTP/1 path produce the error.
+                return Preface::Http1(sock, buf);
+            }
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => return Preface::Gone,
+        }
     }
 }
 
@@ -491,7 +571,15 @@ fn build_tls(http: &Http) -> io::Result<TlsMap> {
         let mut cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(resolver));
-        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        // Order is a preference list: the client picks the first it also
+        // supports, so `h2` must lead for `listen ... http2` to mean anything.
+        // Without `http2` on the listener we do not offer it at all, which is
+        // how a config keeps HTTP/1.1 deliberately.
+        cfg.alpn_protocols = if l.http2 {
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        } else {
+            vec![b"http/1.1".to_vec()]
+        };
         out.push(Some(Arc::new(cfg)));
     }
     Ok(Arc::new(out))

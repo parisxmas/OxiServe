@@ -321,6 +321,71 @@ impl Req {
         ParseResult::Complete
     }
 
+    /// Builds a request from parts rather than from HTTP/1 text.
+    ///
+    /// HTTP/2 carries the method, target and headers as separate decoded
+    /// fields, so there is no request line to parse. The alternative was to
+    /// re-serialise them into HTTP/1.1 bytes and run the normal parser over
+    /// them, which would have been less code and a per-request round trip
+    /// through a format neither end used.
+    ///
+    /// The returned buffer is what every `Range` in the request points into;
+    /// the two must be kept together for the request's whole life.
+    pub fn from_parts(method: &str, target: &str, headers: &[(&str, &str)]) -> (Vec<u8>, Req) {
+        let cap = method.len()
+            + target.len()
+            + headers.iter().map(|(n, v)| n.len() + v.len()).sum::<usize>();
+        let mut buf = Vec::with_capacity(cap);
+        let mut req = Req::new();
+
+        let put = |buf: &mut Vec<u8>, s: &str| {
+            let start = buf.len();
+            buf.extend_from_slice(s.as_bytes());
+            start..buf.len()
+        };
+
+        req.method_raw = put(&mut buf, method);
+        req.method = Method::parse(method);
+        req.target = put(&mut buf, target);
+
+        // The query split is the same one HTTP/1 does on the request target;
+        // `:path` carries both halves exactly as an origin-form target does.
+        let (p, q) = uri::split_query(target);
+        let t = req.target.start;
+        req.path = t..t + p.len();
+        req.query = if q.is_empty() { t..t } else { t + p.len() + 1..t + target.len() };
+
+        for (name, value) in headers {
+            let n = put(&mut buf, name);
+            let v = put(&mut buf, value);
+            req.push_header(n, v, &buf);
+        }
+
+        // HTTP/2 has no version token and no `Connection` header: the
+        // connection outlives the stream by construction, and framing comes
+        // from END_STREAM rather than from Content-Length. A caller that knows
+        // a body is coming sets `body` afterwards.
+        req.minor = 1;
+        req.keep_alive = true;
+        req.head_len = 0;
+        (buf, req)
+    }
+
+    /// Appends a header and updates the hot-header index.
+    ///
+    /// `buf` must already contain the bytes both ranges point at.
+    pub fn push_header(&mut self, name: Range<usize>, value: Range<usize>, buf: &[u8]) {
+        let idx = self.headers.len();
+        if let Some(hot) = hot_of(&buf[name.clone()]) {
+            let slot = hot as usize;
+            // Keep the first occurrence, as the HTTP/1 parser does.
+            if self.hot[slot] == NO_HEADER {
+                self.hot[slot] = idx as u16;
+            }
+        }
+        self.headers.push(HeaderRef { name, value });
+    }
+
     #[inline]
     pub fn slice<'b>(&self, buf: &'b [u8], r: &Range<usize>) -> &'b str {
         // Header bytes are validated as ASCII-compatible by httparse; anything
