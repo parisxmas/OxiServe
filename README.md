@@ -238,6 +238,41 @@ keepalive, access logging off on both, page cache warmed before each
 measurement — across four payload sizes chosen to exercise different paths.
 It requires `nginx` and one of `wrk` / `oha` / `bombardier`.
 
+### nginx 1.28.3, Ubuntu on 6 cores
+
+Two workers each, pinned to cores 0–1 (verified per thread — nginx forks
+worker processes, OxiServe runs worker threads, so a process count would have
+compared 3 against 1). The load generator gets cores 2–5 so it is never
+competing with either server; during a run the server cores sit at ~0% idle
+and the generator at ~6%, which is what makes the server the thing being
+measured. `sendfile on`, `gzip off`, `reuseport` and identical keepalive
+settings on both. Warmup runs discarded.
+
+| Scenario | nginx | OxiServe | |
+|---|---:|---:|---|
+| HTTP/2 over TLS (100 conns × 32 streams) | 292,542 rps | **400,687 rps** | **1.37×** |
+| HTTPS/1.1, keepalive, 100 B | 247,489 rps | **315,922 rps** | **1.28×** |
+| HTTP/1.1, keepalive, 100 B | 293,043 rps | **346,633 rps** | **1.18×** |
+| HTTP/1.1, keepalive, 10 KB | 294,705 rps | 297,480 rps | 1.01× |
+| HTTP/1.1, keepalive, 1 MB | 26,762 rps | 27,385 rps | 1.02× |
+| HTTP/1.1, **new connection per request** | **177,451 rps** | 167,556 rps | **0.94×** |
+
+Two honest caveats about the table above.
+
+The 10 KB and 1 MB rows do not discriminate between the servers. At 2.9 GB/s
+and 26 GB/s they are loopback and memory bandwidth, not server code — both
+implementations are waiting on the same ceiling, and a 1.01× there means
+"indistinguishable", not "narrowly ahead".
+
+**The last row is a real loss, and the cause is not yet identified.** It is
+genuine connection churn, confirmed against the kernel's `PassiveOpens`
+counter at exactly 1.000 new TCP connections per request (against 0.000 for
+the keepalive rows). Two hypotheses were tested and both were wrong: removing
+the redundant `shutdown()` syscall on close, and pooling per-worker connection
+buffers so a connection costs no allocations to set up. Neither moved the
+number by more than run-to-run noise. Both changes were kept because they are
+right on their own terms, but neither explains the gap.
+
 ### Real-world check: WordPress
 
 WordPress 6.x on PHP 8.3 (php-fpm in a container over a Unix socket, MariaDB,
