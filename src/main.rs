@@ -17,6 +17,7 @@ Usage: oxiserve [options]
 
   -c FILE    configuration file (default: <prefix>/conf/oxiserve.conf)
   -p PATH    prefix for relative paths in the configuration (default: .)
+  -s SIGNAL  send a signal to a running master: stop, quit, reload, reopen
   -t         test the configuration and exit
   -T         test the configuration, print it, and exit
   -q         suppress non-error messages during configuration testing
@@ -26,6 +27,7 @@ Usage: oxiserve [options]
 ";
 
 struct Args {
+    signal: Option<String>,
     conf: Option<PathBuf>,
     prefix: PathBuf,
     test: bool,
@@ -37,6 +39,7 @@ fn main() -> ExitCode {
     let mut args = Args {
         conf: None,
         prefix: PathBuf::from("."),
+        signal: None,
         test: false,
         dump: false,
         quiet: false,
@@ -52,6 +55,10 @@ fn main() -> ExitCode {
             "-p" => match it.next() {
                 Some(v) => args.prefix = PathBuf::from(v),
                 None => return fail("option \"-p\" requires a directory name"),
+            },
+            "-s" => match it.next() {
+                Some(v) => args.signal = Some(v),
+                None => return fail("option \"-s\" requires a signal name"),
             },
             "-t" => args.test = true,
             "-T" => {
@@ -86,6 +93,21 @@ fn main() -> ExitCode {
             "open() \"{}\" failed (2: No such file or directory)",
             conf.display()
         ));
+    }
+
+    // A signal is delivered to whatever master the *current* config names in
+    // its `pid` directive, so the file is located by parsing the config rather
+    // than by guessing a path. Deliberately before the unsupported-directive
+    // warnings: `-s stop` should work even against a config full of things we
+    // do not implement.
+    if let Some(sig) = &args.signal {
+        return match oxiserve::server::signal_master(&conf, args.prefix.clone(), sig) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("oxiserve: [emerg] {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
 
     let cfg = match oxiserve::config::load(&conf, args.prefix.clone()) {
@@ -131,7 +153,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    if let Err(e) = oxiserve::server::run(cfg) {
+    if let Err(e) = oxiserve::server::run_from(cfg, Some((conf.clone(), args.prefix.clone()))) {
         eprintln!("oxiserve: [emerg] {e}");
         return ExitCode::FAILURE;
     }

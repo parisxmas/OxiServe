@@ -121,6 +121,28 @@ automatic recovery), `backup` failover, weighted round-robin, real
 `keepalive` pool that probes a connection for liveness before reusing it.
 Health is shared across workers; the pool is per worker.
 
+**Signals** — `-s stop | quit | reload | reopen`, found through the `pid` file
+the configuration names, so a host running two servers signals the right one.
+
+`reload` re-reads and fully validates the configuration *before* it forks
+anything. A file that does not load costs one log line and nothing else — the
+running workers keep serving the old configuration, which is the entire reason
+to reload rather than restart. On success the new workers start first and only
+then are the old ones asked to drain, so there is no moment with nobody
+listening; `SO_REUSEPORT` is what lets both generations hold the port, and
+without it the new workers inherit the master's descriptors instead.
+
+`quit` and a superseded generation drain gracefully: they stop accepting, and
+requests already in progress finish. "In progress" starts at the *first byte*
+of a request — a connection merely sitting open, including a keep-alive slot
+or a readiness probe, is closed at once rather than delaying the handover.
+A WebSocket tunnel counts as in progress, which is why the drain is bounded at
+30 seconds.
+
+`reopen` reopens every log file by name, and takes effect on the next line
+written rather than at the next flush — a lazier check left a window in which
+lines still went to the inode `logrotate` had just moved aside.
+
 **WebSockets** — a `101` from the backend switches the connection out of HTTP
 and wires the two sockets together until a peer hangs up. Configured as nginx
 configures it:
@@ -242,6 +264,8 @@ regex captures `$1`–`$9`.
 - **`limit_conn`** connection limiting (`limit_req` is implemented).
 - **`auth_basic`**, `auth_request`.
 - **`mail`** block; **UDP** inside `stream` (`ssl_preread` is implemented).
+- **Binary upgrade** (`USR2`/`WINCH`) — replacing the executable without
+  dropping connections. `-s reload` covers configuration changes.
 - **PCRE-only regex** — lookaround and backreferences are rejected with a clear
   error rather than silently mismatching (Rust's `regex` has neither).
 

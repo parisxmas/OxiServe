@@ -31,6 +31,7 @@ pub mod upstream;
 
 use std::cell::RefCell;
 use std::io;
+use std::path::PathBuf;
 use std::net::{SocketAddr, TcpListener as StdListener};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,88 +47,196 @@ use log::Logs;
 static CONN_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Binds every configured listener and runs workers until shutdown.
-pub fn run(config: Config) -> io::Result<()> {
-    let stream_conf = config.stream.map(Arc::new);
-    let http = match config.http {
-        Some(h) => Arc::new(h),
-        None if stream_conf.is_some() => {
-            // A stream-only configuration is legitimate: a pure L4 proxy.
-            Arc::new(Http {
-                cache_zones: Default::default(),
-                limit_req_zones: Default::default(),
-                limit_req_keys: Default::default(),
-                listeners: Vec::new(),
-                upstreams: Default::default(),
-                maps: Vec::new(),
-                mime: Arc::new(Default::default()),
-                servers: Vec::new(),
-            })
-        }
-        None => {
-            eprintln!("oxiserve: no http or stream block in configuration, nothing to serve");
-            return Ok(());
+/// Sends one of nginx's control signals to a running master.
+///
+/// The pid file is located by loading the configuration, because that is what
+/// names it — guessing a conventional path would send `-s stop` to the wrong
+/// server on a host running two.
+#[cfg(unix)]
+pub fn signal_master(conf: &std::path::Path, prefix: PathBuf, name: &str) -> io::Result<()> {
+    let sig = match name {
+        // nginx's mapping, exactly.
+        "stop" => libc::SIGTERM,
+        "quit" => libc::SIGQUIT,
+        "reload" => libc::SIGHUP,
+        "reopen" => libc::SIGUSR1,
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid option: \"-s {other}\""),
+            ))
         }
     };
-    let error_log = config.error_log.clone();
-    let workers = config.worker_processes.resolve();
 
-    // Sockets are bound before workers start, so a port conflict is reported
-    // once, at startup, rather than N times from N threads.
-    let mut shared: Vec<Option<BoundSocket>> = Vec::new();
-    for l in &http.listeners {
-        if cfg!(target_os = "linux") && l.reuseport {
-            // Each worker will bind its own socket instead.
-            shared.push(None);
-        } else {
-            shared.push(Some(bind(l)?));
-        }
+    let cfg = crate::config::load(conf, prefix)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let path = cfg.pid.clone().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "no \"pid\" directive in the configuration")
+    })?;
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        io::Error::new(e.kind(), format!("open() \"{}\" failed ({e})", path.display()))
+    })?;
+    let pid: libc::pid_t = text
+        .trim()
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid PID number"))?;
+
+    // SAFETY: `kill` with a plain signal number; a stale pid is reported, not
+    // acted on further.
+    if unsafe { libc::kill(pid, sig) } != 0 {
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(e.kind(), format!("kill({pid}, {name}) failed ({e})")));
     }
+    Ok(())
+}
 
-    for (i, l) in http.listeners.iter().enumerate() {
-        eprintln!(
-            "oxiserve: listening on {}{}{}",
-            l.addr,
-            if l.ssl { " ssl" } else { "" },
-            if shared[i].is_none() { " (reuseport)" } else { "" }
-        );
-    }
+#[cfg(not(unix))]
+pub fn signal_master(_c: &std::path::Path, _p: PathBuf, _n: &str) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "signals are a unix feature"))
+}
 
-    // Stream listeners bind up front too, so a port clash is one startup error.
-    let mut stream_bound: Vec<Option<BoundSocket>> = Vec::new();
-    if let Some(sc) = &stream_conf {
-        for l in &sc.listeners {
-            if cfg!(target_os = "linux") && l.reuseport {
-                stream_bound.push(None);
-            } else {
-                stream_bound.push(Some(bind_stream(l)?));
+pub fn run(config: Config) -> io::Result<()> {
+    run_from(config, None)
+}
+
+/// [`run`], plus where the configuration came from.
+///
+/// The master needs the path to honour `-s reload`: reloading means reading
+/// the file again, and a `Config` does not remember where it was parsed from.
+/// Embedders that build a `Config` by hand pass `None` and simply have no
+/// reload.
+/// One configuration's worth of prepared state: everything a worker needs,
+/// already bound and built.
+///
+/// A reload produces a *new* `Generation` and forks from that. The earlier
+/// version validated the new configuration and then forked from the old one
+/// still in memory — it logged "reloaded" and changed nothing, which is worse
+/// than failing.
+struct Generation {
+    http: Arc<Http>,
+    stream_conf: Option<Arc<crate::config::model::StreamConf>>,
+    error_log: crate::config::model::ErrorLogConf,
+    tls: TlsMap,
+    shared: Vec<Option<BoundSocket>>,
+    stream_bound: Vec<Option<BoundSocket>>,
+    workers: usize,
+}
+
+impl Generation {
+    /// Binds sockets and builds TLS state for `config`.
+    ///
+    /// `previous` supplies already-bound sockets for addresses that have not
+    /// changed. Rebinding those would fail with `EADDRINUSE` while the old
+    /// generation still holds them — reuseport listeners are the exception,
+    /// which is why they are bound per worker in the first place.
+    fn prepare(config: Config, previous: Option<&Generation>, announce: bool) -> io::Result<Option<Generation>> {
+        let stream_conf = config.stream.map(Arc::new);
+        let http = match config.http {
+            Some(h) => Arc::new(h),
+            None if stream_conf.is_some() => {
+                // A stream-only configuration is legitimate: a pure L4 proxy.
+                Arc::new(Http {
+                    cache_zones: Default::default(),
+                    limit_req_zones: Default::default(),
+                    limit_req_keys: Default::default(),
+                    listeners: Vec::new(),
+                    upstreams: Default::default(),
+                    maps: Vec::new(),
+                    mime: Arc::new(Default::default()),
+                    servers: Vec::new(),
+                })
             }
-            eprintln!("oxiserve: stream listening on {}", l.addr);
+            None => {
+                eprintln!("oxiserve: no http or stream block in configuration, nothing to serve");
+                return Ok(None);
+            }
+        };
+
+        // Sockets are bound before workers start, so a port conflict is
+        // reported once, at startup, rather than N times from N workers.
+        let mut shared: Vec<Option<BoundSocket>> = Vec::new();
+        for l in &http.listeners {
+            if cfg!(target_os = "linux") && l.reuseport {
+                // Each worker will bind its own socket instead.
+                shared.push(None);
+            } else if let Some(s) = previous.and_then(|p| p.socket_for(&l.addr)) {
+                shared.push(Some(s.try_clone()?));
+            } else {
+                shared.push(Some(bind(l)?));
+            }
         }
+        if announce {
+            for (i, l) in http.listeners.iter().enumerate() {
+                eprintln!(
+                    "oxiserve: listening on {}{}{}",
+                    l.addr,
+                    if l.ssl { " ssl" } else { "" },
+                    if shared[i].is_none() { " (reuseport)" } else { "" }
+                );
+            }
+        }
+
+        let mut stream_bound: Vec<Option<BoundSocket>> = Vec::new();
+        if let Some(sc) = &stream_conf {
+            for l in &sc.listeners {
+                if cfg!(target_os = "linux") && l.reuseport {
+                    stream_bound.push(None);
+                } else if let Some(s) = previous.and_then(|p| p.stream_socket_for(&l.addr)) {
+                    stream_bound.push(Some(s.try_clone()?));
+                } else {
+                    stream_bound.push(Some(bind_stream(l)?));
+                }
+                if announce {
+                    eprintln!("oxiserve: stream listening on {}", l.addr);
+                }
+            }
+        }
+
+        let tls = build_tls(&http)?;
+        Ok(Some(Generation {
+            workers: config.worker_processes.resolve(),
+            error_log: config.error_log,
+            http,
+            stream_conf,
+            tls,
+            shared,
+            stream_bound,
+        }))
     }
 
-    let tls = build_tls(&http)?;
-    let cores = core_affinity::get_core_ids().unwrap_or_default();
+    fn socket_for(&self, addr: &crate::config::model::ListenAddr) -> Option<&BoundSocket> {
+        let i = self.http.listeners.iter().position(|l| &l.addr == addr)?;
+        self.shared.get(i)?.as_ref()
+    }
 
-    // Assembles one worker's inputs. In thread mode this runs in the parent
-    // and the values move into the thread; in process mode it runs in the
-    // child, where `try_clone` dups the descriptor the child inherited.
-    let build = |w: usize| -> io::Result<WorkerInputs> {
+    fn stream_socket_for(&self, addr: &crate::config::model::ListenAddr) -> Option<&BoundSocket> {
+        let sc = self.stream_conf.as_ref()?;
+        let i = sc.listeners.iter().position(|l| &l.addr == addr)?;
+        self.stream_bound.get(i)?.as_ref()
+    }
+
+    /// Assembles one worker's inputs. In thread mode this runs in the parent
+    /// and the values move into the thread; in process mode it runs in the
+    /// child, where `try_clone` dups the descriptor the child inherited.
+    fn build(&self, w: usize, cores: &[core_affinity::CoreId]) -> io::Result<WorkerInputs> {
         let core = if cores.is_empty() { None } else { Some(cores[w % cores.len()]) };
         // Each worker needs its own listener handle. Cloning the descriptor
         // gives every worker an independent accept loop on the same queue.
         let mut listeners: Vec<(Arc<Listener>, Option<BoundSocket>)> = Vec::new();
-        for (i, l) in http.listeners.iter().enumerate() {
-            let sock = match &shared[i] {
+        for (i, l) in self.http.listeners.iter().enumerate() {
+            let sock = match &self.shared[i] {
                 Some(s) => Some(s.try_clone()?),
                 None => None,
             };
             listeners.push((l.clone(), sock));
         }
-        let mut stream_listeners: Vec<(Arc<crate::config::model::StreamListener>, Option<BoundSocket>)> =
-            Vec::new();
-        if let Some(sc) = &stream_conf {
+        let mut stream_listeners: Vec<(
+            Arc<crate::config::model::StreamListener>,
+            Option<BoundSocket>,
+        )> = Vec::new();
+        if let Some(sc) = &self.stream_conf {
             for (i, l) in sc.listeners.iter().enumerate() {
-                let sock = match &stream_bound[i] {
+                let sock = match &self.stream_bound[i] {
                     Some(s) => Some(s.try_clone()?),
                     None => None,
                 };
@@ -135,15 +244,22 @@ pub fn run(config: Config) -> io::Result<()> {
             }
         }
         Ok(WorkerInputs {
-            http: http.clone(),
-            error_log: error_log.clone(),
-            tls: tls.clone(),
+            http: self.http.clone(),
+            error_log: self.error_log.clone(),
+            tls: self.tls.clone(),
             core,
             listeners,
-            stream_conf: stream_conf.clone(),
+            stream_conf: self.stream_conf.clone(),
             stream_listeners,
         })
-    };
+    }
+}
+
+pub fn run_from(config: Config, source: Option<(PathBuf, PathBuf)>) -> io::Result<()> {
+    let pid_path = config.pid.clone();
+    let Some(gen) = Generation::prepare(config, None, true)? else { return Ok(()) };
+    let workers = gen.workers;
+    let cores = core_affinity::get_core_ids().unwrap_or_default();
 
     // Workers are processes, as nginx's are, unless there is only one (tests
     // and embedders run the server on a thread inside a larger program, where
@@ -156,13 +272,20 @@ pub fn run(config: Config) -> io::Result<()> {
         && cfg!(unix)
         && std::env::var_os("OXISERVE_WORKER_MODEL").map(|v| v != "threads").unwrap_or(true);
 
+    // Written before any worker exists, so `-s reload` immediately after start
+    // finds a pid rather than a missing file. Removed on a clean exit; a stale
+    // one left by a crash is harmless, since `kill` on a dead pid reports
+    // ESRCH rather than signalling whatever reused the number... on Linux,
+    // where pids are not reused that fast. It is the same exposure nginx has.
+    let _pid_file = pid_path.as_ref().map(|p| PidFile::write(p)).transpose()?;
+
     if process_mode {
-        return prefork(workers, &build);
+        return prefork(gen, cores, source.as_ref());
     }
 
     let mut handles = Vec::with_capacity(workers);
     for w in 0..workers {
-        let inp = build(w)?;
+        let inp = gen.build(w, &cores)?;
         handles.push(
             std::thread::Builder::new()
                 .name(format!("oxiserve-worker-{w}"))
@@ -192,6 +315,31 @@ pub fn run(config: Config) -> io::Result<()> {
     Ok(())
 }
 
+/// The master's pid file, removed when the master goes away.
+///
+/// `-s reload` has nowhere to send its signal without this, so a config with a
+/// `pid` directive that produced no file would make the whole control
+/// interface silently unavailable.
+struct PidFile(PathBuf);
+
+impl PidFile {
+    fn write(path: &std::path::Path) -> io::Result<PidFile> {
+        if let Some(dir) = path.parent() {
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir)?;
+            }
+        }
+        std::fs::write(path, format!("{}\n", std::process::id()))?;
+        Ok(PidFile(path.to_path_buf()))
+    }
+}
+
+impl Drop for PidFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Everything one worker needs, built per worker.
 struct WorkerInputs {
     http: Arc<Http>,
@@ -214,27 +362,44 @@ struct WorkerInputs {
 /// *index* was per worker already; `proxy_cache_lock` collapses a stampede per
 /// process rather than globally.
 #[cfg(unix)]
-fn prefork<F>(workers: usize, build: &F) -> io::Result<()>
-where
-    F: Fn(usize) -> io::Result<WorkerInputs>,
-{
-    use std::sync::atomic::AtomicBool;
+fn prefork(
+    mut gen: Generation,
+    cores: Vec<core_affinity::CoreId>,
+    source: Option<&(PathBuf, PathBuf)>,
+) -> io::Result<()> {
+    use std::sync::atomic::{AtomicBool, AtomicU32};
     static STOP: AtomicBool = AtomicBool::new(false);
+    /// Set by SIGHUP/SIGUSR1 and drained by the supervisor loop. A counter
+    /// rather than a flag so two reloads in quick succession are two reloads.
+    static RELOAD: AtomicU32 = AtomicU32::new(0);
+    static REOPEN: AtomicU32 = AtomicU32::new(0);
+
     extern "C" fn on_stop(_: libc::c_int) {
         STOP.store(true, Ordering::SeqCst);
     }
+    extern "C" fn on_reload(_: libc::c_int) {
+        RELOAD.fetch_add(1, Ordering::SeqCst);
+    }
+    extern "C" fn on_reopen(_: libc::c_int) {
+        REOPEN.fetch_add(1, Ordering::SeqCst);
+    }
     // Installed WITHOUT SA_RESTART, so a signal interrupts `waitpid` with
     // EINTR instead of transparently resuming it — the loop below depends on
-    // waking up to notice STOP.
+    // waking up to notice these flags.
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = on_stop as extern "C" fn(libc::c_int) as usize;
         libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_sigaction = on_stop as extern "C" fn(libc::c_int) as usize;
         libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
         libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGQUIT, &sa, std::ptr::null_mut());
+        sa.sa_sigaction = on_reload as extern "C" fn(libc::c_int) as usize;
+        libc::sigaction(libc::SIGHUP, &sa, std::ptr::null_mut());
+        sa.sa_sigaction = on_reopen as extern "C" fn(libc::c_int) as usize;
+        libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
     }
 
-    let spawn = |w: usize| -> io::Result<libc::pid_t> {
+    let spawn = |gen: &Generation, w: usize| -> io::Result<libc::pid_t> {
         // SAFETY: the master has spawned no threads, so the child is a clean
         // single-threaded copy with no lock held by a thread that no longer
         // exists.
@@ -267,7 +432,7 @@ where
                 unsafe {
                     libc::prctl(libc::PR_SET_NAME, c"oxiserve-worker".as_ptr());
                 }
-                let code = match build(w) {
+                let code = match gen.build(w, &cores) {
                     Ok(inp) => {
                         if let Some(c) = inp.core {
                             core_affinity::set_for_current(c);
@@ -300,23 +465,59 @@ where
         }
     };
 
-    let mut children: Vec<(libc::pid_t, usize)> = Vec::with_capacity(workers);
-    for w in 0..workers {
-        children.push((spawn(w)?, w));
+    let mut children: Vec<(libc::pid_t, usize)> = Vec::with_capacity(gen.workers);
+    for w in 0..gen.workers {
+        children.push((spawn(&gen, w)?, w));
     }
 
+    // Workers from a superseded configuration. They are draining, must not be
+    // respawned when they exit, and must not be counted as the live set.
+    let mut retiring: Vec<libc::pid_t> = Vec::new();
+
     loop {
+        // Signals are handled before blocking again, so one that arrived while
+        // we were inside `waitpid` is not left sitting until the next event.
+        if REOPEN.swap(0, Ordering::SeqCst) > 0 {
+            // Draining workers reopen too: they may still be writing lines
+            // for connections they have not finished.
+            for p in children.iter().map(|(p, _)| *p).chain(retiring.iter().copied()) {
+                unsafe { libc::kill(p, libc::SIGUSR1) };
+            }
+        }
+        if RELOAD.swap(0, Ordering::SeqCst) > 0 && !STOP.load(Ordering::SeqCst) {
+            match reload(source, &gen, &spawn) {
+                Ok((fresh_gen, fresh)) => {
+                    // Old workers only start draining once the new ones exist,
+                    // so there is no window with nobody serving. `SO_REUSEPORT`
+                    // is what lets both generations hold the port at once.
+                    eprintln!("oxiserve: reloaded configuration");
+                    retiring.extend(children.iter().map(|(p, _)| *p));
+                    for (p, _) in &children {
+                        unsafe { libc::kill(*p, libc::SIGQUIT) };
+                    }
+                    children = fresh;
+                    // The old generation drops here, closing any listening
+                    // socket the new one did not take over.
+                    gen = fresh_gen;
+                }
+                // A bad configuration must never cost the running server. This
+                // is the whole reason reload validates before it acts.
+                Err(e) => eprintln!("oxiserve: [emerg] reload failed, keeping the old configuration: {e}"),
+            }
+            continue;
+        }
+
         let mut status = 0;
         let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
         if pid < 0 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {
                 if STOP.load(Ordering::SeqCst) {
-                    for (p, _) in &children {
-                        unsafe { libc::kill(*p, libc::SIGTERM) };
+                    for p in children.iter().map(|(p, _)| *p).chain(retiring.iter().copied()) {
+                        unsafe { libc::kill(p, libc::SIGQUIT) };
                     }
-                    for (p, _) in &children {
-                        unsafe { libc::waitpid(*p, &mut status, 0) };
+                    for p in children.iter().map(|(p, _)| *p).chain(retiring.iter().copied()) {
+                        unsafe { libc::waitpid(p, &mut status, 0) };
                     }
                     return Ok(());
                 }
@@ -327,10 +528,17 @@ where
             }
             return Err(e);
         }
+
+        // A retiring worker finishing is the expected end of a reload, not a
+        // failure, and must not be respawned.
+        if let Some(i) = retiring.iter().position(|p| *p == pid) {
+            retiring.swap_remove(i);
+            continue;
+        }
         let Some(pos) = children.iter().position(|(p, _)| *p == pid) else { continue };
         let (_, w) = children.swap_remove(pos);
         if STOP.load(Ordering::SeqCst) {
-            if children.is_empty() {
+            if children.is_empty() && retiring.is_empty() {
                 return Ok(());
             }
             continue;
@@ -340,15 +548,64 @@ where
         // dies instantly from turning the master into a fork loop.
         eprintln!("oxiserve: worker {w} exited unexpectedly, respawning");
         std::thread::sleep(std::time::Duration::from_millis(100));
-        children.push((spawn(w)?, w));
+        children.push((spawn(&gen, w)?, w));
     }
 }
 
-#[cfg(not(unix))]
-fn prefork<F>(_workers: usize, _build: &F) -> io::Result<()>
+/// Re-reads the configuration and starts a fresh generation of workers.
+///
+/// Returns the new children, or an error that leaves the caller's existing
+/// ones untouched — validation happens before anything is forked, so a
+/// configuration with a typo costs a log line and nothing else. That ordering
+/// is the entire value of `-s reload` over `restart`.
+///
+/// New workers bind their own listening sockets: `SO_REUSEPORT` means both
+/// generations can hold the port while the old one drains, which is what makes
+/// the handover seamless. Without `reuseport` the new workers inherit the
+/// master's already-bound descriptors, so the port is never released either.
+#[cfg(unix)]
+fn reload<S>(
+    source: Option<&(PathBuf, PathBuf)>,
+    current: &Generation,
+    spawn: &S,
+) -> io::Result<(Generation, Vec<(libc::pid_t, usize)>)>
 where
-    F: Fn(usize) -> io::Result<WorkerInputs>,
+    S: Fn(&Generation, usize) -> io::Result<libc::pid_t>,
 {
+    let Some((conf, prefix)) = source else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this server was started from an in-memory configuration, so there is no file to re-read",
+        ));
+    };
+    // Parsed and lowered in full — the same work startup does — so a config
+    // that would have failed to start fails here instead of in a child that
+    // then exits and gets respawned into a loop.
+    let config = crate::config::load(conf, prefix.clone())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+    // Binding happens before any fork too, so a port that is now taken by
+    // something else is also caught while the old workers are still serving.
+    let Some(next) = Generation::prepare(config, Some(current), false)? else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the new configuration serves nothing",
+        ));
+    };
+
+    let mut fresh = Vec::with_capacity(next.workers);
+    for w in 0..next.workers {
+        fresh.push((spawn(&next, w)?, w));
+    }
+    Ok((next, fresh))
+}
+
+#[cfg(not(unix))]
+fn prefork(
+    _gen: Generation,
+    _cores: Vec<core_affinity::CoreId>,
+    _source: Option<&(PathBuf, PathBuf)>,
+) -> io::Result<()> {
     unreachable!("process_mode is only ever true on unix")
 }
 
@@ -482,11 +739,30 @@ fn worker(
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
             loop {
                 tick.tick().await;
-                flusher_logs.borrow_mut().flush_due();
+                let mut l = flusher_logs.borrow_mut();
+                l.reopen_if_asked();
+                l.flush_due();
             }
         }));
 
-        shutdown_signal().await;
+        match shutdown_signal().await {
+            Stop::Now => {}
+            Stop::Graceful => {
+                // Accept loops and background tasks stop first, so no new work
+                // arrives; then the connections already in hand get to finish.
+                // Cutting them here is exactly what makes a naive reload drop
+                // requests.
+                for t in &tasks {
+                    t.abort();
+                }
+                let deadline = std::time::Instant::now() + GRACEFUL_TIMEOUT;
+                while LIVE_REQUESTS.load(Ordering::Acquire) > 0
+                    && std::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        }
         logs.borrow_mut().flush_all();
         for t in tasks {
             t.abort();
@@ -495,27 +771,107 @@ fn worker(
     }))
 }
 
-async fn shutdown_signal() {
+/// Requests currently being handled by this process.
+///
+/// Requests, not connections. A keep-alive connection sitting idle between
+/// requests has nothing to lose by being closed, and counting those made a
+/// graceful shutdown wait out its whole timeout for clients that were not
+/// asking for anything — including the connection a readiness probe opens and
+/// abandons.
+///
+/// Process-wide rather than per worker: a graceful shutdown wants everything
+/// this process is still doing, and in thread mode several workers share it.
+pub(crate) static LIVE_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+/// Increments [`LIVE_REQUESTS`] for as long as it exists.
+pub(crate) struct LiveRequest;
+
+impl LiveRequest {
+    pub(crate) fn enter() -> LiveRequest {
+        LIVE_REQUESTS.fetch_add(1, Ordering::AcqRel);
+        LiveRequest
+    }
+}
+
+impl Drop for LiveRequest {
+    fn drop(&mut self) {
+        LIVE_REQUESTS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// What ended the worker's run.
+enum Stop {
+    /// `SIGTERM` — nginx's "fast shutdown". Stop now.
+    Now,
+    /// `SIGQUIT` — nginx's "graceful shutdown", and what a reload sends to the
+    /// previous generation. Stop accepting, then let what is in flight finish.
+    Graceful,
+}
+
+/// How long a draining worker waits for its connections.
+///
+/// A WebSocket or a long download can outlive any sensible reload, so the wait
+/// is bounded: past this, finishing the reload matters more than the last
+/// stragglers. nginx has the same knob as `worker_shutdown_timeout`.
+const GRACEFUL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn shutdown_signal() -> Stop {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = term.recv() => {}
+        let mut quit = signal(SignalKind::quit()).ok();
+        let mut term = signal(SignalKind::terminate()).ok();
+        // Reopening logs must not end the run, so it loops rather than
+        // returning: a worker can be told to reopen any number of times and
+        // keep serving.
+        let mut usr1 = signal(SignalKind::user_defined1()).ok();
+        loop {
+            let quit_fut = async {
+                match quit.as_mut() {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending().await,
                 }
-            }
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
+            };
+            let term_fut = async {
+                match term.as_mut() {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            let usr1_fut = async {
+                match usr1.as_mut() {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                _ = quit_fut => return Stop::Graceful,
+                _ = term_fut => return Stop::Now,
+                _ = tokio::signal::ctrl_c() => return Stop::Now,
+                _ = usr1_fut => {
+                    // The next line written reopens the file, so a rotated log
+                    // stops being written to the moved inode.
+                    REOPEN_LOGS.store(true, Ordering::Release);
+                }
             }
         }
     }
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+        Stop::Now
     }
 }
+
+/// Set by `SIGUSR1`; the logging layer clears it when it has reopened.
+pub static REOPEN_LOGS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 async fn accept_loop(
     listener: transport::Listener,

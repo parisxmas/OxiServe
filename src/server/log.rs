@@ -19,6 +19,8 @@ struct Sink {
     cap: usize,
     flush_every: Option<Duration>,
     last_flush: Instant,
+    /// Kept so the file can be opened again by name after a rotation.
+    path: PathBuf,
 }
 
 impl Sink {
@@ -33,7 +35,22 @@ impl Sink {
             cap,
             flush_every,
             last_flush: Instant::now(),
+            path: path.to_path_buf(),
         })
+    }
+
+    /// Reopens the file by name, after flushing what is buffered.
+    ///
+    /// This is what makes `logrotate` work: once the file is moved aside, an
+    /// open descriptor keeps writing to the renamed inode, so the new file
+    /// stays empty and disk is never reclaimed. Reopening by path lands on
+    /// whatever the name refers to now, and the flush first means the lines
+    /// already formatted go to the old file rather than being lost.
+    fn reopen(&mut self) {
+        self.flush();
+        if let Ok(f) = OpenOptions::new().create(true).append(true).open(&self.path) {
+            self.file = f;
+        }
     }
 
     fn write_line(&mut self, line: &[u8]) {
@@ -173,6 +190,7 @@ impl Logs {
     }
 
     pub fn access(&mut self, conf: &AccessLogConf, line: &str) {
+        self.reopen_if_asked();
         if let LogSink::File(path) = &conf.sink {
             if let Some(s) = self.access.get_mut(path) {
                 s.write_line(line.as_bytes());
@@ -198,6 +216,7 @@ impl Logs {
     }
 
     pub fn error(&mut self, level: LogLevel, msg: &str) {
+        self.reopen_if_asked();
         if level < self.error_level {
             return;
         }
@@ -223,6 +242,33 @@ impl Logs {
     pub fn flush_due(&mut self) {
         for s in self.access.values_mut() {
             s.flush_if_due();
+        }
+    }
+
+    /// Reopens every log file, if `SIGUSR1` asked for it since the last check.
+    ///
+    /// Polled rather than done in the signal handler, where almost nothing is
+    /// safe to call — but polled *before every line*, not only on the flush
+    /// timer. Deferring it to the timer left a window after `-s reopen` in
+    /// which lines still went to the renamed inode, which is precisely the
+    /// data `logrotate` expects to have stopped arriving there.
+    ///
+    /// The common case is one relaxed load of a `bool`, so the check costs
+    /// nothing worth measuring per line.
+    #[inline]
+    pub fn reopen_if_asked(&mut self) {
+        use std::sync::atomic::Ordering;
+        if !crate::server::REOPEN_LOGS.load(Ordering::Relaxed) {
+            return;
+        }
+        if !crate::server::REOPEN_LOGS.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        for s in self.access.values_mut() {
+            s.reopen();
+        }
+        if let Some(e) = &mut self.error {
+            e.reopen();
         }
     }
 

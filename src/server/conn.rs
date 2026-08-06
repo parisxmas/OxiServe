@@ -226,8 +226,12 @@ pub async fn serve_with_prefix<S>(
         };
 
         // ---- read the request head ----------------------------------------
+        // Held from the first byte of a request until its response is written,
+        // so a graceful shutdown waits for work in progress and not for
+        // connections that are merely open.
+        let mut live: Option<crate::server::LiveRequest> = None;
         let max_head = core.large_client_header_buffers.0 * core.large_client_header_buffers.1;
-        let parse = match read_head(&mut sock, st, header_timeout, max_head).await {
+        let parse = match read_head(&mut sock, st, header_timeout, max_head, &mut live).await {
             Ok(p) => p,
             // A clean EOF while idle is a normal keep-alive close.
             Err(HeadError::Eof) => return,
@@ -251,6 +255,10 @@ pub async fn serve_with_prefix<S>(
         }
 
         requests += 1;
+        // From here until the response is written, this connection is holding
+        // work a graceful shutdown must not cut. Before here it was merely
+        // waiting, which is not worth delaying a reload for.
+        let _live = crate::server::LiveRequest::enter();
 
         // ---- pick the server and normalise the URI -------------------------
         // No `to_ascii_lowercase()` here: `match_host` compares
@@ -600,6 +608,7 @@ async fn read_head<S>(
     st: &mut ConnState,
     timeout: Duration,
     max_head: usize,
+    live: &mut Option<crate::server::LiveRequest>,
 ) -> Result<ParseResult, HeadError>
 where
     S: AsyncRead + AsyncWrite + Unpin + RawStream,
@@ -650,6 +659,13 @@ where
 
         if n == 0 {
             return Err(if start == 0 { HeadError::Eof } else { HeadError::Io });
+        }
+        // The client has committed to a request. Even a partial one is work in
+        // progress, and cutting it is exactly the dropped request a graceful
+        // shutdown exists to avoid — while a connection that has said nothing
+        // is not worth delaying a reload for.
+        if live.is_none() {
+            *live = Some(crate::server::LiveRequest::enter());
         }
     }
 }
