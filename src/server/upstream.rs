@@ -152,6 +152,21 @@ impl Drop for InFlightGuard<'_> {
 /// failed peer is returned anyway — refusing to try at all would turn a
 /// transient outage into a permanent one.
 pub fn select(up: &Upstream, now: Instant, hash: Option<u64>, rr_cursor: usize) -> Option<usize> {
+    select_excluding(up, now, hash, rr_cursor, &[])
+}
+
+/// [`select`], skipping peers already tried for this request.
+///
+/// `proxy_next_upstream` needs this: retrying is only useful against a peer
+/// that has not just failed, and round-robin alone would happily hand back the
+/// same one — a "retry" that repeats the failure and doubles the latency.
+pub fn select_excluding(
+    up: &Upstream,
+    now: Instant,
+    hash: Option<u64>,
+    rr_cursor: usize,
+    exclude: &[usize],
+) -> Option<usize> {
     let now_ms = now.saturating_duration_since(up.origin).as_millis() as u64;
 
     for want_backup in [false, true] {
@@ -160,7 +175,10 @@ pub fn select(up: &Upstream, now: Instant, hash: Option<u64>, rr_cursor: usize) 
             .iter()
             .enumerate()
             .filter(|(i, s)| {
-                !s.down && s.backup == want_backup && !up.health[*i].is_down(now_ms)
+                !s.down
+                    && s.backup == want_backup
+                    && !up.health[*i].is_down(now_ms)
+                    && !exclude.contains(i)
             })
             .map(|(i, _)| i)
             .collect();
@@ -173,11 +191,12 @@ pub fn select(up: &Upstream, now: Instant, hash: Option<u64>, rr_cursor: usize) 
 
     // Everything is marked down. Take the peer whose penalty expires soonest
     // so recovery is attempted rather than waiting for a health check we do
-    // not have yet.
+    // not have yet. Excluded peers stay excluded: one already tried and failed
+    // in this very request is the worst candidate there is.
     up.servers
         .iter()
         .enumerate()
-        .filter(|(_, s)| !s.down)
+        .filter(|(i, s)| !s.down && !exclude.contains(i))
         .min_by_key(|(i, _)| up.health[*i].down_until_ms.load(Ordering::Relaxed))
         .map(|(i, _)| i)
 }

@@ -101,267 +101,322 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
         }
     }
 
+    // `proxy_next_upstream`: which failures are worth another peer, and how
+    // many peers we may burn before answering the client.
+    let nu = &conf.next_upstream;
+    // A request that is not safe to repeat is not retried unless the
+    // configuration says so. A retried POST can charge a card twice, and
+    // "the first attempt might have succeeded" is exactly the case where
+    // retrying is worse than failing.
+    let idempotent = matches!(
+        ctx.req.method,
+        crate::http::Method::Get
+            | crate::http::Method::Head
+            | crate::http::Method::Put
+            | crate::http::Method::Delete
+            | crate::http::Method::Options
+            | crate::http::Method::Trace
+    );
+    let may_retry = !nu.off && (idempotent || nu.non_idempotent);
+    let retry_deadline = if conf.next_upstream_timeout.is_zero() {
+        None
+    } else {
+        Some(started + conf.next_upstream_timeout)
+    };
+    let mut tried: Vec<usize> = Vec::new();
+
     // When the target is an upstream we keep hold of the chosen peer, so the
     // outcome of this request can be fed back into its health state.
-    let mut chosen: Option<(&Arc<Upstream>, usize)> = None;
-    let (addr_str, tls) = match &pp.target {
-        ProxyTarget::Addr { host, port } => (format!("{host}:{port}"), pp.tls),
-        ProxyTarget::Unix(path) => (format!("unix:{path}"), false),
-        ProxyTarget::Dynamic(t) => {
-            let rendered = t.render(&*ctx);
-            let (scheme_tls, rest) = match rendered.strip_prefix("https://") {
-                Some(r) => (true, r.to_string()),
-                None => (false, rendered.trim_start_matches("http://").to_string()),
-            };
-            let authority = rest.split('/').next().unwrap_or("").to_string();
-            if authority.is_empty() {
-                return Err(502);
-            }
-            let with_port = if authority.contains(':') {
-                authority
-            } else {
-                format!("{}:{}", authority, if scheme_tls { 443 } else { 80 })
-            };
-            (with_port, scheme_tls)
-        }
-        ProxyTarget::Upstream(name) => {
-            let up = ctx.http.upstreams.get(&**name).ok_or(502u16)?;
-            let idx = select_peer(ctx, up)?;
-            let addr = peer_addr(&up.servers[idx].addr);
-            chosen = Some((up, idx));
-            (addr, pp.tls)
-        }
-    };
-
-    if tls {
-        // TLS to the upstream needs the connector plumbing that only the
-        // listener side has today; say so instead of silently downgrading.
-        return Err(502);
-    }
-
-    ctx.upstream_addr = addr_str.clone();
-
-    // Counted for the whole life of the request, released even on an early
-    // return — this is the number `least_conn` balances on.
-    let _in_flight = chosen.map(|(u, i)| InFlightGuard::enter(&u.health[i]));
-
-    let keepalive = chosen.map(|(u, _)| u.keepalive).unwrap_or(0);
-    let connect_to = conf.connect_timeout.unwrap_or(Duration::from_secs(60));
-
-    // A pooled connection skips the handshake entirely.
-    let (mut up, reused) = match up_state::take(&addr_str) {
-        Some(s) => (s, true),
-        None => match tokio::time::timeout(connect_to, Stream::connect(&addr_str)).await {
-            Ok(Ok(s)) => (s, false),
-            Ok(Err(_)) | Err(_) => {
-                // A refused or timed-out connection is exactly what passive
-                // health tracking exists to notice.
-                note_failure(chosen, ctx);
-                // An old copy beats an error page, when the config says so.
-                if let Some(r) = try_stale(ctx, &cache, &mut stale, cache::StaleWhen::Error) {
-                    return Ok(r);
-                }
-                return Err(502);
-            }
-        },
-    };
-
-    // ---- request head -----------------------------------------------------
-    let mut head = String::with_capacity(512);
-    head.push_str(ctx.req.slice(ctx.buf, &ctx.req.method_raw));
-    head.push(' ');
-    head.push_str(&upstream_uri(ctx, loc, pp));
-    head.push_str(if conf.http_version_11 {
-        " HTTP/1.1\r\n"
-    } else {
-        " HTTP/1.0\r\n"
-    });
-
-    // proxy_set_header wins over anything inherited from the client.
-    let mut overridden: Vec<String> = Vec::with_capacity(conf.set_headers.len() + 1);
-    let mut host_set = false;
-    for (name, tmpl) in &conf.set_headers {
-        let value = tmpl.render(&*ctx);
-        overridden.push(name.to_ascii_lowercase());
-        if name.eq_ignore_ascii_case("host") {
-            host_set = true;
-        }
-        // An empty value means "do not send this header at all".
-        if value.is_empty() {
-            continue;
-        }
-        head.push_str(name);
-        head.push_str(": ");
-        head.push_str(&value);
-        head.push_str("\r\n");
-    }
-    if !host_set {
-        // nginx's default is `proxy_set_header Host $proxy_host`.
-        head.push_str("Host: ");
-        head.push_str(host_of(&addr_str));
-        head.push_str("\r\n");
-    }
-
-    for h in &ctx.req.headers {
-        let name = ctx.req.slice(ctx.buf, &h.name);
-        let lower = name.to_ascii_lowercase();
-        if HOP_BY_HOP.contains(&lower.as_str())
-            || lower == "host"
-            || lower == "content-length"
-            || lower == "expect"
-            || overridden.contains(&lower)
-            || conf.hide_headers.iter().any(|x| &**x == lower.as_str())
-        {
-            continue;
-        }
-        head.push_str(name);
-        head.push_str(": ");
-        head.push_str(ctx.req.slice(ctx.buf, &h.value));
-        head.push_str("\r\n");
-    }
-    // The decoded body length replaces whatever framing the client used.
-    if !ctx.body.is_empty() {
-        head.push_str("Content-Length: ");
-        crate::http::response::push_num(&mut head, ctx.body.len() as u64);
-        head.push_str("\r\n");
-    }
-    // With a pool we must ask the upstream to keep the connection, and that
-    // only works on HTTP/1.1.
-    let want_keepalive = keepalive > 0 && conf.http_version_11;
-    if want_keepalive {
-        head.push_str("Connection: keep-alive\r\n\r\n");
-    } else {
-        head.push_str("Connection: close\r\n\r\n");
-    }
-
-    if up.write_all(head.as_bytes()).await.is_err() {
-        // Only counted against the peer when we opened the connection
-        // ourselves; a reused one that died is our bookkeeping, not their
-        // fault. `take` probes for liveness, so this is already rare.
-        if !reused {
-            note_failure(chosen, ctx);
-        }
-        return Err(502);
-    }
-
-    // ---- request body -----------------------------------------------------
-    // The connection layer has already read and de-chunked the whole body, so
-    // it forwards as a plain Content-Length regardless of how it arrived.
-    if !ctx.body.is_empty() && up.write_all(ctx.body).await.is_err() {
-        note_failure(chosen, ctx);
-        return Err(502);
-    }
-    let _ = up.flush().await;
-
-    // ---- response head ----------------------------------------------------
-    // Header values are needed twice when caching (once to answer, once to
-    // store), so they are collected rather than streamed straight through.
+    // One pass per peer. A failure `proxy_next_upstream` names moves to the
+    // next peer instead of answering the client; anything else answers at
+    // once, as before. Nothing past the response head is retryable — by then
+    // the client is already receiving the answer, which is where nginx stops
+    // too.
+    let mut first_error: Option<u16> = None;
     let read_to = conf.read_timeout.unwrap_or(Duration::from_secs(60));
-    let mut buf = Vec::with_capacity(8192);
-    let head_len;
-    let mut status;
-    let mut headers: Vec<(String, String)> = Vec::new();
-    let mut upstream_chunked = false;
-    let mut upstream_len: Option<u64> = None;
-    let mut upstream_said_close = false;
-    let mut upstream_upgrade: Option<String> = None;
-
-    loop {
-        let mut chunk = [0u8; 8192];
-        let n = match tokio::time::timeout(read_to, up.read(&mut chunk)).await {
-            Ok(Ok(0)) => {
-                // EOF before a response. On a reused connection that is the
-                // peer having closed it while idle, not a fault of theirs.
-                if !(reused && buf.is_empty()) {
-                    note_failure(chosen, ctx);
-                }
-                // A backend that accepts and then closes without answering is
-                // a common way for one to die, and it is an `error` for
-                // use_stale exactly like a refused connection.
-                if let Some(r) = try_stale(ctx, &cache, &mut stale, cache::StaleWhen::Error) {
-                    return Ok(r);
-                }
-                return Err(502);
-            }
-            Ok(Ok(n)) => n,
-            Ok(Err(_)) => {
-                if !(reused && buf.is_empty()) {
-                    note_failure(chosen, ctx);
-                }
-                if let Some(r) = try_stale(ctx, &cache, &mut stale, cache::StaleWhen::Error) {
-                    return Ok(r);
-                }
-                return Err(502);
-            }
-            Err(_) => {
-                note_failure(chosen, ctx);
-                if let Some(r) = try_stale(ctx, &cache, &mut stale, cache::StaleWhen::Timeout) {
-                    return Ok(r);
-                }
-                return Err(504);
-            }
-        };
-        buf.extend_from_slice(&chunk[..n]);
-
-        let mut hbuf = [httparse::EMPTY_HEADER; 96];
-        let mut r = httparse::Response::new(&mut hbuf);
-        match r.parse(&buf) {
-            Ok(httparse::Status::Complete(len)) => {
-                head_len = len;
-                status = r.code.unwrap_or(502);
-                for h in r.headers.iter() {
-                    if h.name.is_empty() {
-                        break;
-                    }
-                    let name = h.name.to_string();
-                    let value = String::from_utf8_lossy(h.value).into_owned();
-                    let lower = name.to_ascii_lowercase();
-                    if lower == "transfer-encoding" {
-                        upstream_chunked = value.eq_ignore_ascii_case("chunked");
-                        continue;
-                    }
-                    if lower == "content-length" {
-                        upstream_len = value.trim().parse().ok();
-                        continue;
-                    }
-                    if lower == "connection" {
-                        upstream_said_close = value.eq_ignore_ascii_case("close");
-                        continue;
-                    }
-                    // `Upgrade` is hop-by-hop for good reason — but a `101` is
-                    // the one response where the hop IS the point, and the
-                    // client needs to be told which protocol it just got.
-                    if lower == "upgrade" {
-                        upstream_upgrade = Some(value);
-                        continue;
-                    }
-                    if HOP_BY_HOP.contains(&lower.as_str()) {
-                        continue;
-                    }
-                    if conf.hide_headers.iter().any(|x| &**x == lower.as_str()) {
-                        continue;
-                    }
-                    headers.push((name, value));
-                }
-                break;
-            }
-            Ok(httparse::Status::Partial) => {
-                if buf.len() > 64 * 1024 {
-                    note_failure(chosen, ctx);
+    let attempt = 'attempt: loop {
+        let mut chosen: Option<(&Arc<Upstream>, usize)> = None;
+        let (addr_str, tls) = match &pp.target {
+            ProxyTarget::Addr { host, port } => (format!("{host}:{port}"), pp.tls),
+            ProxyTarget::Unix(path) => (format!("unix:{path}"), false),
+            ProxyTarget::Dynamic(t) => {
+                let rendered = t.render(&*ctx);
+                let (scheme_tls, rest) = match rendered.strip_prefix("https://") {
+                    Some(r) => (true, r.to_string()),
+                    None => (false, rendered.trim_start_matches("http://").to_string()),
+                };
+                let authority = rest.split('/').next().unwrap_or("").to_string();
+                if authority.is_empty() {
                     return Err(502);
                 }
+                let with_port = if authority.contains(':') {
+                    authority
+                } else {
+                    format!("{}:{}", authority, if scheme_tls { 443 } else { 80 })
+                };
+                (with_port, scheme_tls)
             }
-            Err(_) => {
-                note_failure(chosen, ctx);
-                if let Some(r) =
-                    try_stale(ctx, &cache, &mut stale, cache::StaleWhen::InvalidHeader)
-                {
-                    return Ok(r);
+            ProxyTarget::Upstream(name) => {
+                let up = ctx.http.upstreams.get(&**name).ok_or(502u16)?;
+                let idx = match select_peer_excluding(ctx, up, &tried) {
+                    Ok(i) => i,
+                    // Out of peers. The first failure is the one to report.
+                    Err(c) => break 'attempt Err(first_error.unwrap_or(c)),
+                };
+                let addr = peer_addr(&up.servers[idx].addr);
+                chosen = Some((up, idx));
+                (addr, pp.tls)
+            }
+        };
+
+        if tls {
+            // TLS to the upstream needs the connector plumbing that only the
+            // listener side has today; say so instead of silently downgrading.
+            return Err(502);
+        }
+
+        ctx.upstream_addr = addr_str.clone();
+
+        // Counted for the whole life of the request, released even on an early
+        // return — this is the number `least_conn` balances on.
+        let _in_flight = chosen.map(|(u, i)| InFlightGuard::enter(&u.health[i]));
+
+        let keepalive = chosen.map(|(u, _)| u.keepalive).unwrap_or(0);
+        let connect_to = conf.connect_timeout.unwrap_or(Duration::from_secs(60));
+
+        // A pooled connection skips the handshake entirely.
+        let (mut up, reused) = match up_state::take(&addr_str) {
+            Some(s) => (s, true),
+            None => match tokio::time::timeout(connect_to, Stream::connect(&addr_str)).await {
+                Ok(Ok(s)) => (s, false),
+                Ok(Err(_)) | Err(_) => {
+                    // A refused or timed-out connection is exactly what passive
+                    // health tracking exists to notice.
+                    note_failure(chosen, ctx);
+                    if next_peer(&mut tried, chosen, nu.error, may_retry, retry_deadline, &mut first_error, 502, conf.next_upstream_tries) {
+                        continue 'attempt;
+                    }
+                    // An old copy beats an error page, when the config says so.
+                    if let Some(r) = try_stale(ctx, &cache, &mut stale, cache::StaleWhen::Error) {
+                        return Ok(r);
+                    }
+                    break 'attempt Err(502);
                 }
-                return Err(502);
+            },
+        };
+
+        // ---- request head -----------------------------------------------------
+        // With a pool we must ask the upstream to keep the connection, and that
+        // only works on HTTP/1.1.
+        let want_keepalive = keepalive > 0 && conf.http_version_11;
+        let head = build_request_head(ctx, loc, pp, conf, &addr_str, want_keepalive);
+
+        if up.write_all(head.as_bytes()).await.is_err() {
+            // Only counted against the peer when we opened the connection
+            // ourselves; a reused one that died is our bookkeeping, not their
+            // fault. `take` probes for liveness, so this is already rare.
+            if !reused {
+                note_failure(chosen, ctx);
+            }
+            if next_peer(&mut tried, chosen, nu.error, may_retry, retry_deadline, &mut first_error, 502, conf.next_upstream_tries) {
+                continue 'attempt;
+            }
+            break 'attempt Err(502);
+        }
+
+        // ---- request body -----------------------------------------------------
+        // The connection layer has already read and de-chunked the whole body, so
+        // it forwards as a plain Content-Length regardless of how it arrived.
+        if !ctx.body.is_empty() && up.write_all(ctx.body).await.is_err() {
+            note_failure(chosen, ctx);
+            if next_peer(&mut tried, chosen, nu.error, may_retry, retry_deadline, &mut first_error, 502, conf.next_upstream_tries) {
+                continue 'attempt;
+            }
+            break 'attempt Err(502);
+        }
+        let _ = up.flush().await;
+
+        // ---- response head ----------------------------------------------------
+        // Header values are needed twice when caching (once to answer, once to
+        // store), so they are collected rather than streamed straight through.
+        let mut buf = Vec::with_capacity(8192);
+        let head_len;
+        let status;
+        let mut headers: Vec<(String, String)> = Vec::new();
+        let mut upstream_chunked = false;
+        let mut upstream_len: Option<u64> = None;
+        let mut upstream_said_close = false;
+        let mut upstream_upgrade: Option<String> = None;
+
+        loop {
+            let mut chunk = [0u8; 8192];
+            let n = match tokio::time::timeout(read_to, up.read(&mut chunk)).await {
+                Ok(Ok(0)) => {
+                    // EOF before a response. On a reused connection that is the
+                    // peer having closed it while idle, not a fault of theirs.
+                    if !(reused && buf.is_empty()) {
+                        note_failure(chosen, ctx);
+                    }
+                    // A backend that accepts and then closes without answering is
+                    // a common way for one to die, and it is an `error` for
+                    // use_stale exactly like a refused connection.
+                    if next_peer(&mut tried, chosen, nu.error, may_retry, retry_deadline, &mut first_error, 502, conf.next_upstream_tries) {
+                        continue 'attempt;
+                    }
+                    if let Some(r) = try_stale(ctx, &cache, &mut stale, cache::StaleWhen::Error) {
+                        return Ok(r);
+                    }
+                    break 'attempt Err(502);
+                }
+                Ok(Ok(n)) => n,
+                Ok(Err(_)) => {
+                    if !(reused && buf.is_empty()) {
+                        note_failure(chosen, ctx);
+                    }
+                    if next_peer(&mut tried, chosen, nu.error, may_retry, retry_deadline, &mut first_error, 502, conf.next_upstream_tries) {
+                        continue 'attempt;
+                    }
+                    if let Some(r) = try_stale(ctx, &cache, &mut stale, cache::StaleWhen::Error) {
+                        return Ok(r);
+                    }
+                    break 'attempt Err(502);
+                }
+                Err(_) => {
+                    note_failure(chosen, ctx);
+                    if next_peer(&mut tried, chosen, nu.timeout, may_retry, retry_deadline, &mut first_error, 504, conf.next_upstream_tries) {
+                        continue 'attempt;
+                    }
+                    if let Some(r) = try_stale(ctx, &cache, &mut stale, cache::StaleWhen::Timeout) {
+                        return Ok(r);
+                    }
+                    break 'attempt Err(504);
+                }
+            };
+            buf.extend_from_slice(&chunk[..n]);
+
+            let mut hbuf = [httparse::EMPTY_HEADER; 96];
+            let mut r = httparse::Response::new(&mut hbuf);
+            match r.parse(&buf) {
+                Ok(httparse::Status::Complete(len)) => {
+                    head_len = len;
+                    status = r.code.unwrap_or(502);
+                    for h in r.headers.iter() {
+                        if h.name.is_empty() {
+                            break;
+                        }
+                        let name = h.name.to_string();
+                        let value = String::from_utf8_lossy(h.value).into_owned();
+                        let lower = name.to_ascii_lowercase();
+                        if lower == "transfer-encoding" {
+                            upstream_chunked = value.eq_ignore_ascii_case("chunked");
+                            continue;
+                        }
+                        if lower == "content-length" {
+                            upstream_len = value.trim().parse().ok();
+                            continue;
+                        }
+                        if lower == "connection" {
+                            upstream_said_close = value.eq_ignore_ascii_case("close");
+                            continue;
+                        }
+                        // `Upgrade` is hop-by-hop for good reason — but a `101` is
+                        // the one response where the hop IS the point, and the
+                        // client needs to be told which protocol it just got.
+                        if lower == "upgrade" {
+                            upstream_upgrade = Some(value);
+                            continue;
+                        }
+                        if HOP_BY_HOP.contains(&lower.as_str()) {
+                            continue;
+                        }
+                        if conf.hide_headers.iter().any(|x| &**x == lower.as_str()) {
+                            continue;
+                        }
+                        headers.push((name, value));
+                    }
+                    // `proxy_next_upstream http_502` and friends: a peer
+                    // that answered is still a peer that failed, if the
+                    // configuration says this status counts as one. Checked
+                    // here because it is the last moment before the response
+                    // becomes the client's.
+                    if nu.statuses.contains(&status) {
+                        note_failure(chosen, ctx);
+                        if next_peer(
+                            &mut tried,
+                            chosen,
+                            true,
+                            may_retry,
+                            retry_deadline,
+                            &mut first_error,
+                            status,
+                            conf.next_upstream_tries,
+                        ) {
+                            continue 'attempt;
+                        }
+                    }
+                    break 'attempt Ok(Attempt {
+                        chosen,
+                        keepalive,
+                        addr_str,
+                        up,
+                        reused,
+                        want_keepalive,
+                        buf,
+                        head_len,
+                        status,
+                        headers,
+                        upstream_chunked,
+                        upstream_len,
+                        upstream_said_close,
+                        upstream_upgrade,
+                    });
+                }
+                Ok(httparse::Status::Partial) => {
+                    if buf.len() > 64 * 1024 {
+                        note_failure(chosen, ctx);
+                        if next_peer(&mut tried, chosen, nu.invalid_header, may_retry, retry_deadline, &mut first_error, 502, conf.next_upstream_tries) {
+                            continue 'attempt;
+                        }
+                        break 'attempt Err(502);
+                    }
+                }
+                Err(_) => {
+                    note_failure(chosen, ctx);
+                    if next_peer(&mut tried, chosen, nu.invalid_header, may_retry, retry_deadline, &mut first_error, 502, conf.next_upstream_tries) {
+                        continue 'attempt;
+                    }
+                    if let Some(r) =
+                        try_stale(ctx, &cache, &mut stale, cache::StaleWhen::InvalidHeader)
+                    {
+                        return Ok(r);
+                    }
+                    break 'attempt Err(502);
+                }
             }
         }
-    }
+
+    };
+
+    let Attempt {
+        chosen,
+        keepalive,
+        addr_str,
+        up,
+        reused,
+        want_keepalive,
+        buf,
+        head_len,
+        mut status,
+        headers,
+        upstream_chunked,
+        upstream_len,
+        upstream_said_close,
+        upstream_upgrade,
+    } = match attempt {
+        Ok(a) => a,
+        Err(code) => return Err(code),
+    };
+    let _ = reused;
 
     if status == 0 {
         status = 502;
@@ -472,6 +527,152 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
     }
 }
 
+/// One peer's worth of a proxied request, up to and including its response
+/// head — the last point at which trying somebody else is still possible.
+struct Attempt<'u> {
+    chosen: Option<(&'u Arc<Upstream>, usize)>,
+    /// The pool size for the peer that answered, needed once the body is done
+    /// to decide whether its connection goes back.
+    keepalive: usize,
+    addr_str: String,
+    up: Stream,
+    reused: bool,
+    want_keepalive: bool,
+    buf: Vec<u8>,
+    head_len: usize,
+    status: u16,
+    headers: Vec<(String, String)>,
+    upstream_chunked: bool,
+    upstream_len: Option<u64>,
+    upstream_said_close: bool,
+    upstream_upgrade: Option<String>,
+}
+
+/// Decides whether this failure is worth another peer, and records it.
+///
+/// Returns `true` when the caller should try again. The first failure's status
+/// is remembered because it is the honest thing to report if every peer fails:
+/// a connect refusal reported as a read timeout because the *last* peer timed
+/// out would send whoever is debugging in the wrong direction.
+#[allow(clippy::too_many_arguments)]
+fn next_peer(
+    tried: &mut Vec<usize>,
+    chosen: Option<(&Arc<Upstream>, usize)>,
+    condition_enabled: bool,
+    may_retry: bool,
+    deadline: Option<Instant>,
+    first_error: &mut Option<u16>,
+    code: u16,
+    // `proxy_next_upstream_tries` counts attempts, not retries: one attempt
+    // plus N-1 retries. Zero means "as many peers as there are".
+    tries_limit: u32,
+) -> bool {
+    if first_error.is_none() {
+        *first_error = Some(code);
+    }
+    // Only an upstream *group* has a next peer; a single address does not.
+    let Some((up, idx)) = chosen else { return false };
+    if !may_retry || !condition_enabled {
+        return false;
+    }
+    if let Some(d) = deadline {
+        if Instant::now() >= d {
+            return false;
+        }
+    }
+    if tried.contains(&idx) {
+        // Selection handed back a peer we already tried, which means there is
+        // nothing else left.
+        return false;
+    }
+    tried.push(idx);
+    if tries_limit > 0 && tried.len() >= tries_limit as usize {
+        return false;
+    }
+    tried.len() < up.servers.len()
+}
+
+/// Builds the request line and headers sent upstream.
+///
+/// Peer-dependent only through the default `Host`, so it is rebuilt per
+/// attempt rather than hoisted — which is what lets a retry against a
+/// different peer send that peer's name.
+#[allow(clippy::too_many_arguments)]
+fn build_request_head(
+    ctx: &Ctx<'_>,
+    loc: &Arc<Location>,
+    pp: &ProxyPass,
+    conf: &crate::config::model::ProxyConf,
+    addr_str: &str,
+    want_keepalive: bool,
+) -> String {
+    let mut head = String::with_capacity(512);
+    head.push_str(ctx.req.slice(ctx.buf, &ctx.req.method_raw));
+    head.push(' ');
+    head.push_str(&upstream_uri(ctx, loc, pp));
+    head.push_str(if conf.http_version_11 {
+        " HTTP/1.1\r\n"
+    } else {
+        " HTTP/1.0\r\n"
+    });
+
+    // proxy_set_header wins over anything inherited from the client.
+    let mut overridden: Vec<String> = Vec::with_capacity(conf.set_headers.len() + 1);
+    let mut host_set = false;
+    for (name, tmpl) in &conf.set_headers {
+        let value = tmpl.render(ctx);
+        overridden.push(name.to_ascii_lowercase());
+        if name.eq_ignore_ascii_case("host") {
+            host_set = true;
+        }
+        // An empty value means "do not send this header at all".
+        if value.is_empty() {
+            continue;
+        }
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(&value);
+        head.push_str("\r\n");
+    }
+    if !host_set {
+        // nginx's default is `proxy_set_header Host $proxy_host`.
+        head.push_str("Host: ");
+        head.push_str(host_of(addr_str));
+        head.push_str("\r\n");
+    }
+
+    for h in &ctx.req.headers {
+        let name = ctx.req.slice(ctx.buf, &h.name);
+        let lower = name.to_ascii_lowercase();
+        if HOP_BY_HOP.contains(&lower.as_str())
+            || lower == "host"
+            || lower == "content-length"
+            || lower == "expect"
+            || overridden.contains(&lower)
+            || conf.hide_headers.iter().any(|x| &**x == lower.as_str())
+        {
+            continue;
+        }
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(ctx.req.slice(ctx.buf, &h.value));
+        head.push_str("\r\n");
+    }
+    // The decoded body length replaces whatever framing the client used.
+    if !ctx.body.is_empty() {
+        head.push_str("Content-Length: ");
+        crate::http::response::push_num(&mut head, ctx.body.len() as u64);
+        head.push_str("\r\n");
+    }
+    if want_keepalive {
+        head.push_str("Connection: keep-alive\r\n\r\n");
+    } else {
+        head.push_str("Connection: close\r\n\r\n");
+    }
+
+    head
+}
+
 /// Builds the URI sent upstream.
 ///
 /// `proxy_pass http://x/` (with a URI part) replaces the matched location
@@ -563,6 +764,15 @@ pub fn peer_addr(addr: &str) -> String {
 
 /// Chooses a peer via the shared health/load state.
 pub fn select_peer(ctx: &Ctx<'_>, up: &Arc<Upstream>) -> Result<usize, u16> {
+    select_peer_excluding(ctx, up, &[])
+}
+
+/// [`select_peer`], skipping peers this request has already tried.
+pub fn select_peer_excluding(
+    ctx: &Ctx<'_>,
+    up: &Arc<Upstream>,
+    exclude: &[usize],
+) -> Result<usize, u16> {
     let hash = match up.method {
         LbMethod::IpHash => {
             let mut h: u64 = 0xcbf29ce484222325;
@@ -581,7 +791,7 @@ pub fn select_peer(ctx: &Ctx<'_>, up: &Arc<Upstream>) -> Result<usize, u16> {
         *c = c.wrapping_add(1);
         i
     });
-    up_state::select(up, Instant::now(), hash, cursor).ok_or(502)
+    up_state::select_excluding(up, Instant::now(), hash, cursor, exclude).ok_or(502)
 }
 
 use super::cache;

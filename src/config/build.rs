@@ -210,7 +210,9 @@ pub fn default_core() -> CoreConf {
             pass_headers: Vec::new(),
             buffering: true,
             http_version_11: false,
+            next_upstream: Default::default(),
             next_upstream_tries: 0,
+            next_upstream_timeout: Duration::ZERO,
             ssl_server_name: false,
             set_body: None,
         }),
@@ -322,6 +324,9 @@ struct CoreLayer {
     proxy_buffering: Option<bool>,
     proxy_http_11: Option<bool>,
     proxy_ssl_server_name: Option<bool>,
+    proxy_next_upstream: Option<crate::config::model::NextUpstream>,
+    proxy_next_upstream_tries: Option<u32>,
+    proxy_next_upstream_timeout: Option<Duration>,
 }
 
 impl CoreLayer {
@@ -528,6 +533,9 @@ impl CoreLayer {
             || self.proxy_buffering.is_some()
             || self.proxy_http_11.is_some()
             || self.proxy_ssl_server_name.is_some()
+            || self.proxy_next_upstream.is_some()
+            || self.proxy_next_upstream_tries.is_some()
+            || self.proxy_next_upstream_timeout.is_some()
         {
             let mut p = (*c.proxy).clone();
             if let Some(v) = self.proxy_connect_timeout {
@@ -550,6 +558,15 @@ impl CoreLayer {
             }
             if let Some(v) = self.proxy_http_11 {
                 p.http_version_11 = v;
+            }
+            if let Some(v) = &self.proxy_next_upstream {
+                p.next_upstream = v.clone();
+            }
+            if let Some(v) = self.proxy_next_upstream_tries {
+                p.next_upstream_tries = v;
+            }
+            if let Some(v) = self.proxy_next_upstream_timeout {
+                p.next_upstream_timeout = v;
             }
             if let Some(v) = self.proxy_ssl_server_name {
                 p.ssl_server_name = v;
@@ -1864,7 +1881,50 @@ impl Builder {
                 want_args(d, 1)?;
                 c.proxy_http_11 = Some(d.args[0] == "1.1");
             }
-            "proxy_redirect" | "proxy_buffers" | "proxy_buffer_size" | "proxy_next_upstream"
+            "proxy_next_upstream" => {
+                want_args_range(d, 1, 16)?;
+                let mut n = crate::config::model::NextUpstream {
+                    error: false,
+                    timeout: false,
+                    invalid_header: false,
+                    statuses: Vec::new(),
+                    non_idempotent: false,
+                    off: false,
+                };
+                for a in &d.args {
+                    match a.as_str() {
+                        "error" => n.error = true,
+                        "timeout" => n.timeout = true,
+                        "invalid_header" => n.invalid_header = true,
+                        "non_idempotent" => n.non_idempotent = true,
+                        "off" => n.off = true,
+                        // `http_502` and friends. nginx accepts only a fixed
+                        // set; anything else is a typo worth reporting rather
+                        // than a rule that silently never fires.
+                        other => match other.strip_prefix("http_") {
+                            Some(code) => match code.parse::<u16>() {
+                                Ok(c) if matches!(c, 403 | 404 | 429 | 500 | 502 | 503 | 504) => {
+                                    n.statuses.push(c)
+                                }
+                                _ => bail!(d, "invalid parameter \"{other}\" in \"proxy_next_upstream\""),
+                            },
+                            None => bail!(d, "invalid parameter \"{other}\" in \"proxy_next_upstream\""),
+                        },
+                    }
+                }
+                c.proxy_next_upstream = Some(n);
+            }
+            "proxy_next_upstream_tries" => {
+                want_args(d, 1)?;
+                c.proxy_next_upstream_tries = Some(d.args[0].parse().map_err(|_| BuildError {
+                    msg: format!("invalid number \"{}\"", d.args[0]),
+                    loc: format!("line {}", d.line),
+                })?);
+            }
+            "proxy_next_upstream_timeout" => {
+                c.proxy_next_upstream_timeout = Some(time_arg(d, 0)?)
+            }
+            "proxy_redirect" | "proxy_buffers" | "proxy_buffer_size"
             | "proxy_busy_buffers_size" | "proxy_temp_file_write_size" | "proxy_intercept_errors"
             | "proxy_request_buffering" | "proxy_max_temp_file_size" | "proxy_ignore_headers" => {}
             _ => return Ok(false),

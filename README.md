@@ -113,7 +113,13 @@ directories `levels=` leaves behind. It walks the filesystem rather than
 trusting the in-process index, because that index is per worker and empty
 after a restart — the same reason nginx runs a separate cache loader.
 
-**Load balancing** — active health checks (`health_check interval= fails=
+**Load balancing** — `proxy_next_upstream error timeout invalid_header
+http_500 …` retries a failed peer against another one, bounded by
+`proxy_next_upstream_tries` and `proxy_next_upstream_timeout`. A `POST` is not
+retried unless `non_idempotent` says so — "the first attempt might have
+succeeded" is exactly when retrying is worse than failing — and nothing past
+the response head is retryable, because by then the client is already
+receiving the answer. Active health checks (`health_check interval= fails=
 passes= uri= status=`, HTTP or plain TCP, with hysteresis in both directions),
 passive health checks (`max_fails` / `fail_timeout`, with ejection and
 automatic recovery), `backup` failover, weighted round-robin, real

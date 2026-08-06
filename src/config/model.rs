@@ -374,9 +374,50 @@ pub struct ProxyConf {
     pub pass_headers: Vec<Box<str>>,
     pub buffering: bool,
     pub http_version_11: bool,
+    /// `proxy_next_upstream` — which failures are worth another peer.
+    pub next_upstream: NextUpstream,
+    /// `proxy_next_upstream_tries` — 0 means "as many peers as there are".
     pub next_upstream_tries: u32,
+    /// `proxy_next_upstream_timeout` — 0 means no overall bound.
+    pub next_upstream_timeout: Duration,
     pub ssl_server_name: bool,
     pub set_body: Option<Arc<Template>>,
+}
+
+/// Which upstream failures justify trying the next peer.
+///
+/// nginx's default is `error timeout`: a peer that could not be reached or did
+/// not answer in time is worth retrying, while a peer that answered — even
+/// with a 500 — has done its job as far as the proxy is concerned, and
+/// retrying would double the load on a backend already in trouble.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NextUpstream {
+    /// Connection refused, reset, or otherwise unusable.
+    pub error: bool,
+    /// Connect or read timed out.
+    pub timeout: bool,
+    /// The peer answered with something that is not a response head.
+    pub invalid_header: bool,
+    /// Specific status codes that count as a failure of this peer.
+    pub statuses: Vec<u16>,
+    /// Retry even a request that is not safe to repeat. Off by default,
+    /// because a retried `POST` can charge a card twice.
+    pub non_idempotent: bool,
+    /// `proxy_next_upstream off` — never try another peer.
+    pub off: bool,
+}
+
+impl Default for NextUpstream {
+    fn default() -> NextUpstream {
+        NextUpstream {
+            error: true,
+            timeout: true,
+            invalid_header: false,
+            statuses: Vec::new(),
+            non_idempotent: false,
+            off: false,
+        }
+    }
 }
 
 /// How a `location` was written, which drives nginx's matching order.
