@@ -138,9 +138,19 @@ produces and goes through the same handler, so `proxy_pass`, `proxy_cache`,
 identically. `:authority` is turned back into a `Host` header so `server_name`
 matching and `$host` need no special case.
 
+Conformance is measured, not asserted: [h2spec] 2.6 reports **144/145 passed,
+0 failed** over TLS (1 skipped). On a cleartext port the same suite reports
+144/145 with one failure, and it is the one deliberate deviation —
+`listen 80 http2` shares the port with HTTP/1.1, so bytes that are not the
+HTTP/2 preface go to the HTTP/1 parser, which answers `505` and closes.
+h2spec wants the connection closed in silence. Sharing the port is worth more
+than that test.
+
 > `sendfile` cannot apply to HTTP/2 — every byte must be wrapped in a DATA
 > frame, so the kernel cannot hand the page cache straight to the socket.
 > That is inherent to the protocol; nginx pays the same cost.
+
+[h2spec]: https://github.com/summerwind/h2spec
 
 **Layer 4 (`stream`)** — TCP proxying with no HTTP parsing, so it fronts
 PostgreSQL, Redis, MQTT or anything else with a TCP protocol. Shares upstream
