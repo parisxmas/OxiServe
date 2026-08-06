@@ -107,18 +107,12 @@ pub fn run(config: Config) -> io::Result<()> {
 
     let tls = build_tls(&http)?;
     let cores = core_affinity::get_core_ids().unwrap_or_default();
-    let mut handles = Vec::with_capacity(workers);
 
-    for w in 0..workers {
-        let http = http.clone();
-        let error_log = error_log.clone();
-        let tls = tls.clone();
-        let core = if cores.is_empty() {
-            None
-        } else {
-            Some(cores[w % cores.len()])
-        };
-
+    // Assembles one worker's inputs. In thread mode this runs in the parent
+    // and the values move into the thread; in process mode it runs in the
+    // child, where `try_clone` dups the descriptor the child inherited.
+    let build = |w: usize| -> io::Result<WorkerInputs> {
+        let core = if cores.is_empty() { None } else { Some(cores[w % cores.len()]) };
         // Each worker needs its own listener handle. Cloning the descriptor
         // gives every worker an independent accept loop on the same queue.
         let mut listeners: Vec<(Arc<Listener>, Option<BoundSocket>)> = Vec::new();
@@ -129,8 +123,6 @@ pub fn run(config: Config) -> io::Result<()> {
             };
             listeners.push((l.clone(), sock));
         }
-
-        let stream_conf_w = stream_conf.clone();
         let mut stream_listeners: Vec<(Arc<crate::config::model::StreamListener>, Option<BoundSocket>)> =
             Vec::new();
         if let Some(sc) = &stream_conf {
@@ -142,28 +134,215 @@ pub fn run(config: Config) -> io::Result<()> {
                 stream_listeners.push((l.clone(), sock));
             }
         }
+        Ok(WorkerInputs {
+            http: http.clone(),
+            error_log: error_log.clone(),
+            tls: tls.clone(),
+            core,
+            listeners,
+            stream_conf: stream_conf.clone(),
+            stream_listeners,
+        })
+    };
 
+    // Workers are processes, as nginx's are, unless there is only one (tests
+    // and embedders run the server on a thread inside a larger program, where
+    // forking would clone that whole program mid-flight) or the platform has
+    // no fork. Two worker threads in one process measured 0.93x nginx on
+    // connection churn where two processes measure 1.00x — the difference is
+    // contention on state the threads share and the processes do not.
+    // `OXISERVE_WORKER_MODEL=threads` keeps the old model for A/B runs.
+    let process_mode = workers > 1
+        && cfg!(unix)
+        && std::env::var_os("OXISERVE_WORKER_MODEL").map(|v| v != "threads").unwrap_or(true);
+
+    if process_mode {
+        return prefork(workers, &build);
+    }
+
+    let mut handles = Vec::with_capacity(workers);
+    for w in 0..workers {
+        let inp = build(w)?;
         handles.push(
             std::thread::Builder::new()
                 .name(format!("oxiserve-worker-{w}"))
                 .spawn(move || {
-                    if let Some(c) = core {
+                    if let Some(c) = inp.core {
                         // Pinning keeps a connection's buffers in one core's cache.
                         core_affinity::set_for_current(c);
                     }
-                    if let Err(e) =
-                        worker(w, http, listeners, error_log, tls, stream_conf_w, stream_listeners)
-                    {
+                    if let Err(e) = worker(
+                        w,
+                        inp.http,
+                        inp.listeners,
+                        inp.error_log,
+                        inp.tls,
+                        inp.stream_conf,
+                        inp.stream_listeners,
+                        false,
+                    ) {
                         eprintln!("oxiserve: worker {w} exited: {e}");
                     }
                 })?,
         );
     }
-
     for h in handles {
         let _ = h.join();
     }
     Ok(())
+}
+
+/// Everything one worker needs, built per worker.
+struct WorkerInputs {
+    http: Arc<Http>,
+    error_log: crate::config::model::ErrorLogConf,
+    tls: TlsMap,
+    core: Option<core_affinity::CoreId>,
+    listeners: Vec<(Arc<Listener>, Option<BoundSocket>)>,
+    stream_conf: Option<Arc<crate::config::model::StreamConf>>,
+    stream_listeners: Vec<(Arc<crate::config::model::StreamListener>, Option<BoundSocket>)>,
+}
+
+/// Runs `workers` forked worker processes and supervises them.
+///
+/// The master stays single-threaded — it has not spawned anything before this
+/// point, which is what makes `fork` safe — and does exactly what nginx's
+/// master does: wait, respawn a worker that dies, and forward termination.
+/// Shared-state rules in this mode: `limit_req` zones live in `MAP_SHARED`
+/// memory and remain one zone; upstream health and the keepalive pool are per
+/// process (nginx's own semantics without a `zone` directive); the cache
+/// *index* was per worker already; `proxy_cache_lock` collapses a stampede per
+/// process rather than globally.
+#[cfg(unix)]
+fn prefork<F>(workers: usize, build: &F) -> io::Result<()>
+where
+    F: Fn(usize) -> io::Result<WorkerInputs>,
+{
+    use std::sync::atomic::AtomicBool;
+    static STOP: AtomicBool = AtomicBool::new(false);
+    extern "C" fn on_stop(_: libc::c_int) {
+        STOP.store(true, Ordering::SeqCst);
+    }
+    // Installed WITHOUT SA_RESTART, so a signal interrupts `waitpid` with
+    // EINTR instead of transparently resuming it — the loop below depends on
+    // waking up to notice STOP.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_stop as extern "C" fn(libc::c_int) as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+    }
+
+    let spawn = |w: usize| -> io::Result<libc::pid_t> {
+        // SAFETY: the master has spawned no threads, so the child is a clean
+        // single-threaded copy with no lock held by a thread that no longer
+        // exists.
+        match unsafe { libc::fork() } {
+            -1 => Err(io::Error::last_os_error()),
+            0 => {
+                unsafe {
+                    // The child must not inherit the master's stop handler:
+                    // its own termination is the default action.
+                    libc::signal(libc::SIGTERM, libc::SIG_DFL);
+                    libc::signal(libc::SIGINT, libc::SIG_DFL);
+                    #[cfg(target_os = "linux")]
+                    {
+                        // Die with the master even if it is SIGKILLed and
+                        // never gets to signal us. The getppid check closes
+                        // the race where the master died before prctl ran.
+                        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                        if libc::getppid() == 1 {
+                            libc::_exit(0);
+                        }
+                    }
+                }
+                // Distinct $connection ranges per process; purely cosmetic,
+                // but collisions in logs would look like cross-talk.
+                CONN_ID.store((w as u64) << 56, Ordering::Relaxed);
+                let code = match build(w) {
+                    Ok(inp) => {
+                        if let Some(c) = inp.core {
+                            core_affinity::set_for_current(c);
+                        }
+                        match worker(
+                            w,
+                            inp.http,
+                            inp.listeners,
+                            inp.error_log,
+                            inp.tls,
+                            inp.stream_conf,
+                            inp.stream_listeners,
+                            true,
+                        ) {
+                            Ok(()) => 0,
+                            Err(e) => {
+                                eprintln!("oxiserve: worker {w} exited: {e}");
+                                1
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("oxiserve: worker {w} setup failed: {e}");
+                        1
+                    }
+                };
+                std::process::exit(code);
+            }
+            pid => Ok(pid),
+        }
+    };
+
+    let mut children: Vec<(libc::pid_t, usize)> = Vec::with_capacity(workers);
+    for w in 0..workers {
+        children.push((spawn(w)?, w));
+    }
+
+    loop {
+        let mut status = 0;
+        let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+        if pid < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                if STOP.load(Ordering::SeqCst) {
+                    for (p, _) in &children {
+                        unsafe { libc::kill(*p, libc::SIGTERM) };
+                    }
+                    for (p, _) in &children {
+                        unsafe { libc::waitpid(*p, &mut status, 0) };
+                    }
+                    return Ok(());
+                }
+                continue;
+            }
+            if e.raw_os_error() == Some(libc::ECHILD) {
+                return Ok(());
+            }
+            return Err(e);
+        }
+        let Some(pos) = children.iter().position(|(p, _)| *p == pid) else { continue };
+        let (_, w) = children.swap_remove(pos);
+        if STOP.load(Ordering::SeqCst) {
+            if children.is_empty() {
+                return Ok(());
+            }
+            continue;
+        }
+        // A worker died out from under us. Respawning is what keeps one bad
+        // request from turning into an outage; the pause keeps a worker that
+        // dies instantly from turning the master into a fork loop.
+        eprintln!("oxiserve: worker {w} exited unexpectedly, respawning");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        children.push((spawn(w)?, w));
+    }
+}
+
+#[cfg(not(unix))]
+fn prefork<F>(_workers: usize, _build: &F) -> io::Result<()>
+where
+    F: Fn(usize) -> io::Result<WorkerInputs>,
+{
+    unreachable!("process_mode is only ever true on unix")
 }
 
 // A note for whoever benchmarks connection churn next.
@@ -188,6 +367,7 @@ pub fn run(config: Config) -> io::Result<()> {
 
 type TlsMap = Arc<Vec<Option<Arc<rustls::ServerConfig>>>>;
 
+#[allow(clippy::too_many_arguments)]
 fn worker(
     id: usize,
     http: Arc<Http>,
@@ -196,6 +376,10 @@ fn worker(
     tls: TlsMap,
     stream_conf: Option<Arc<crate::config::model::StreamConf>>,
     stream_listeners: Vec<(Arc<crate::config::model::StreamListener>, Option<BoundSocket>)>,
+    // True in process mode: this worker's upstream-health state is private to
+    // its process, so relying on worker 0's probes would leave every other
+    // process blind. Each probes for itself.
+    own_state: bool,
 ) -> io::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -245,7 +429,11 @@ fn worker(
         // Active health checks, on ONE worker only. Every worker probing the
         // same backend would multiply the load on it by the worker count for
         // no extra information, and the health state is shared anyway.
-        if id == 0 {
+        //
+        // Except in process mode: there the health state is per process, so a
+        // worker that did not probe would never learn what the probes know.
+        // The multiplied probe load is the honest price of that isolation.
+        if id == 0 || own_state {
             let mut probed: Vec<Arc<crate::config::model::Upstream>> = Vec::new();
             probed.extend(http.upstreams.values().cloned());
             if let Some(sc) = &stream_conf {

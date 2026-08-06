@@ -9,9 +9,21 @@
 //! 14 µs of CPU in total, so a 10 µs counter update would eat three quarters
 //! of it. nginx keeps this in shared memory for the same reason.
 //!
-//! Being a single process, we do not even need shared memory — a sharded map
-//! behind the same `Arc` is the equivalent, with one lock per shard so
-//! unrelated keys never contend.
+//! The state lives in a `MAP_SHARED` anonymous mapping created at config load
+//! — before any worker exists — so it is one bucket table no matter how the
+//! workers are arranged: threads see it through the shared address space, and
+//! forked worker processes inherit the very same pages. Without this, process
+//! workers would each keep a private bucket per key and every configured rate
+//! would silently multiply by the worker count.
+//!
+//! The table is fixed-size open addressing over 16-byte entries — a key hash
+//! and a packed (timestamp, excess) word, both atomics. No allocator runs in
+//! shared memory, which is precisely what makes nginx's slab-in-shm machinery
+//! its most delicate code; a fixed table sidesteps all of it. The costs of
+//! that trade are bounded and accepted: a full probe window evicts the stalest
+//! entry it can see, and two keys colliding on the same 64-bit seeded hash
+//! would share a bucket (the seed is random per zone, so collisions cannot be
+//! manufactured offline).
 //!
 //! # The algorithm
 //!
@@ -26,13 +38,8 @@
 //!   otherwise       →  admit, after excess × 1000 / rate ms of delay
 //! ```
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-
-/// Number of independent shards. Keys hash into one of these, so two clients
-/// only contend if they land in the same shard.
-const SHARDS: usize = 16;
 
 /// nginx stores `rate` and `excess` scaled by 1000 so a fractional
 /// requests-per-second value stays exact in integer arithmetic.
@@ -82,20 +89,109 @@ pub fn step(
     (excess, Decision::Delay(delay))
 }
 
-struct Entry {
-    last_ms: u64,
-    excess: u64,
+/// How far a probe walks before giving up and evicting.
+const PROBE: usize = 16;
+
+/// `excess` occupies the low 24 bits of the packed state word: 16.7 million
+/// milli-requests, or ~16,777 whole queued requests. A `burst` beyond that is
+/// clamped — no realistic config reaches it.
+const EXCESS_BITS: u32 = 24;
+const EXCESS_MASK: u64 = (1 << EXCESS_BITS) - 1;
+
+/// The timestamp gets 39 bits of milliseconds: ~17 years of uptime before
+/// wrap.
+const MS_MASK: u64 = (1 << 39) - 1;
+
+/// Set on every stored state so that no legitimate state is ever the 0 that
+/// means "freshly claimed". Without it, `pack(0, 0)` — a request with no
+/// excess in the same millisecond the zone was created — would read back as
+/// an empty bucket and admit what should have been rejected.
+const PRESENT: u64 = 1 << 63;
+
+fn pack(last_ms: u64, excess: u64) -> u64 {
+    PRESENT | ((last_ms & MS_MASK) << EXCESS_BITS) | excess.min(EXCESS_MASK)
+}
+
+fn unpack(w: u64) -> (u64, u64) {
+    ((w >> EXCESS_BITS) & MS_MASK, w & EXCESS_MASK)
+}
+
+/// A `MAP_SHARED | MAP_ANONYMOUS` region of atomics.
+///
+/// `Vec<AtomicU64>` would carry the same bits, but its pages would be private
+/// to the process: after `fork` each worker would write to its own copy and
+/// the zone would stop being one zone. `MAP_SHARED` is the entire point.
+struct Shared {
+    ptr: *mut AtomicU64,
+    words: usize,
+}
+
+// SAFETY: every access goes through &AtomicU64; the mapping outlives the Zone
+// that owns it and is unmapped exactly once, on drop.
+unsafe impl Send for Shared {}
+unsafe impl Sync for Shared {}
+
+impl Shared {
+    fn new(words: usize) -> Shared {
+        let bytes = words * std::mem::size_of::<AtomicU64>();
+        // SAFETY: an anonymous mapping with no file behind it; checked for
+        // MAP_FAILED before use. Zero-filled by the kernel, and zero is this
+        // table's "empty" in both words.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(
+            !std::ptr::eq(ptr, libc::MAP_FAILED),
+            "mmap for a limit_req zone failed: {}",
+            std::io::Error::last_os_error()
+        );
+        Shared { ptr: ptr.cast(), words }
+    }
+
+    #[inline]
+    fn at(&self, i: usize) -> &AtomicU64 {
+        debug_assert!(i < self.words);
+        // SAFETY: `i` is always produced by masking with `slots - 1`, and the
+        // mapping holds `words` atomics.
+        unsafe { &*self.ptr.add(i) }
+    }
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        // SAFETY: exactly the region mapped in `new`.
+        unsafe {
+            libc::munmap(self.ptr.cast(), self.words * std::mem::size_of::<AtomicU64>());
+        }
+    }
 }
 
 /// One `limit_req_zone` at runtime: the shared state behind a zone name.
+///
+/// Layout: `slots` entries of two words each — `[hash, state]` — where a hash
+/// of 0 marks an empty slot and `state` packs `(last_ms, excess)`.
 pub struct Zone {
     pub name: Box<str>,
     /// Requests per second, scaled by [`SCALE`].
     pub rate: u64,
     /// Maximum tracked keys, derived from the zone's configured size.
     pub max_entries: usize,
+    /// Created in the master before any worker, so after `fork` every process
+    /// holds the same value and instants stay comparable across them —
+    /// `Instant` is the monotonic clock, which is machine-wide.
     origin: Instant,
-    shards: Vec<Mutex<HashMap<Box<str>, Entry>>>,
+    /// Randomises the key hash per zone so a colliding pair of keys cannot be
+    /// computed offline. Also fixed pre-fork, hence identical in all workers.
+    seed: u64,
+    slots: usize,
+    mem: Shared,
 }
 
 impl std::fmt::Debug for Zone {
@@ -106,23 +202,51 @@ impl std::fmt::Debug for Zone {
 
 impl Zone {
     pub fn new(name: &str, rate: u64, max_entries: usize) -> Zone {
+        // Power of two for mask indexing. At 16 bytes per entry this is far
+        // smaller than the nginx zone size the config asked for, which
+        // budgeted for full keys in a slab; rounding up cannot exceed it.
+        let slots = max_entries.next_power_of_two().max(64);
         Zone {
             name: name.into(),
             rate,
             max_entries,
             origin: Instant::now(),
-            shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            seed: {
+                use std::hash::{BuildHasher, Hasher};
+                // RandomState is seeded per process; hashing the name gives a
+                // per-zone value. This runs in the master, once.
+                let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+                h.write(name.as_bytes());
+                h.finish()
+            },
+            slots,
+            mem: Shared::new(slots * 2),
         }
     }
 
-    fn shard_of(key: &str) -> usize {
-        // FNV-1a: cheap, no dependency, good enough to spread keys.
-        let mut h: u64 = 0xcbf29ce484222325;
+    #[inline]
+    fn hash_slot(&self, i: usize) -> &AtomicU64 {
+        self.mem.at(i * 2)
+    }
+
+    #[inline]
+    fn state_slot(&self, i: usize) -> &AtomicU64 {
+        self.mem.at(i * 2 + 1)
+    }
+
+    fn hash_key(&self, key: &str) -> u64 {
+        // FNV-1a over the seed and the key: cheap, no dependency.
+        let mut h: u64 = 0xcbf29ce484222325 ^ self.seed;
         for b in key.as_bytes() {
             h ^= *b as u64;
             h = h.wrapping_mul(0x100000001b3);
         }
-        (h % SHARDS as u64) as usize
+        // 0 marks an empty slot; a real key must never look like one.
+        if h == 0 {
+            1
+        } else {
+            h
+        }
     }
 
     /// Accounts for one request against `key` and returns the decision.
@@ -138,46 +262,106 @@ impl Zone {
         delay_after: u64,
     ) -> Decision {
         let now_ms = now.saturating_duration_since(self.origin).as_millis() as u64;
-        let mut shard = self.shards[Self::shard_of(key)].lock().unwrap_or_else(|e| e.into_inner());
+        let h = self.hash_key(key);
+        let mask = self.slots - 1;
 
-        let (prev_excess, elapsed) = match shard.get(key) {
-            Some(e) => (e.excess, now_ms.saturating_sub(e.last_ms)),
-            // A key seen for the first time starts with an empty bucket.
-            None => (0, u64::MAX / SCALE),
-        };
-
-        let (excess, decision) = step(prev_excess, elapsed, self.rate, burst, nodelay, delay_after);
-
-        if decision != Decision::Reject {
-            if shard.len() >= self.max_entries.max(1) / SHARDS + 1 && !shard.contains_key(key) {
-                evict(&mut shard, now_ms);
+        // One pass: find our entry, or an empty slot, remembering the stalest
+        // occupant in case the window is full.
+        let mut stalest: Option<(usize, u64)> = None;
+        for p in 0..PROBE {
+            let i = (h as usize).wrapping_add(p) & mask;
+            let eh = self.hash_slot(i).load(Ordering::Acquire);
+            if eh == h {
+                return self.bump(i, h, now_ms, burst, nodelay, delay_after);
             }
-            shard.insert(key.into(), Entry { last_ms: now_ms, excess });
+            if eh == 0 {
+                // Claim it. Losing the race to the same key is a bump; to a
+                // different key, the probe continues.
+                match self.hash_slot(i).compare_exchange(
+                    0,
+                    h,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        self.state_slot(i).store(0, Ordering::Release);
+                        return self.bump(i, h, now_ms, burst, nodelay, delay_after);
+                    }
+                    Err(winner) if winner == h => {
+                        return self.bump(i, h, now_ms, burst, nodelay, delay_after)
+                    }
+                    Err(_) => continue,
+                }
+            }
+            let (last, _) = unpack(self.state_slot(i).load(Ordering::Acquire));
+            if stalest.map_or(true, |(_, l)| last < l) {
+                stalest = Some((i, last));
+            }
         }
-        decision
+
+        // Window full of other keys: take over the one idle longest. nginx
+        // evicts LRU nodes here for the same reason — refusing instead would
+        // let a burst of distinct keys lock every regular out of the zone.
+        // The takeover is racy by design: two workers can fight over a slot,
+        // and the loser's single request is accounted against a fresh bucket.
+        // That imprecision is bounded to one request and only under a window
+        // already saturated with distinct keys.
+        let (i, _) = stalest.expect("PROBE > 0 means at least one candidate");
+        self.hash_slot(i).store(h, Ordering::Release);
+        self.state_slot(i).store(0, Ordering::Release);
+        self.bump(i, h, now_ms, burst, nodelay, delay_after)
     }
 
-    /// Keys currently tracked, across all shards. Test and introspection hook.
+    /// Runs the leaky-bucket step against slot `i`, retrying while other
+    /// workers race on the same key.
+    fn bump(
+        &self,
+        i: usize,
+        h: u64,
+        now_ms: u64,
+        burst: u64,
+        nodelay: bool,
+        delay_after: u64,
+    ) -> Decision {
+        loop {
+            // The slot can be evicted from under us by a saturated window in
+            // another worker. Starting over would be arbitrarily unfair to
+            // this request; treating the takeover as our fresh bucket matches
+            // what the evictor just did.
+            if self.hash_slot(i).load(Ordering::Acquire) != h {
+                let (_, decision) = step(0, u64::MAX / SCALE, self.rate, burst, nodelay, delay_after);
+                return decision;
+            }
+            let cur = self.state_slot(i).load(Ordering::Acquire);
+            let (prev_excess, elapsed) = if cur == 0 {
+                // A freshly claimed slot: an empty bucket, as a first-seen key.
+                (0, u64::MAX / SCALE)
+            } else {
+                let (last, excess) = unpack(cur);
+                (excess, now_ms.saturating_sub(last))
+            };
+            let (excess, decision) = step(prev_excess, elapsed, self.rate, burst, nodelay, delay_after);
+            if decision == Decision::Reject {
+                // nginx does not account a rejected request against the
+                // bucket, and neither did the map-based version.
+                return decision;
+            }
+            let next = pack(now_ms, excess);
+            if self
+                .state_slot(i)
+                .compare_exchange(cur, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return decision;
+            }
+        }
+    }
+
+    /// Keys currently tracked. Test and introspection hook.
     pub fn tracked(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).len())
-            .sum()
-    }
-}
-
-/// Drops the entries whose buckets are closest to empty — they carry the least
-/// state and are cheapest to forget. nginx evicts by LRU from its rbtree; this
-/// is the same intent, and it runs only when a shard is full.
-fn evict(shard: &mut HashMap<Box<str>, Entry>, now_ms: u64) {
-    let mut victims: Vec<(Box<str>, u64)> = shard
-        .iter()
-        .map(|(k, e)| (k.clone(), now_ms.saturating_sub(e.last_ms)))
-        .collect();
-    // Oldest first.
-    victims.sort_by(|a, b| b.1.cmp(&a.1));
-    for (k, _) in victims.into_iter().take((shard.len() / 8).max(1)) {
-        shard.remove(&k);
+        (0..self.slots)
+            .filter(|&i| self.hash_slot(i).load(Ordering::Relaxed) != 0)
+            .count()
     }
 }
 
@@ -329,8 +513,9 @@ mod tests {
         for i in 0..5000 {
             z.check(&format!("key{i}"), t, 10 * SCALE, true, 0);
         }
-        // Bounded by max_entries, with slack for per-shard rounding.
-        assert!(z.tracked() <= 64 + SHARDS * 2, "tracked {} entries", z.tracked());
+        // The table is fixed at construction: whatever the traffic does, the
+        // occupancy can never exceed the slot count.
+        assert!(z.tracked() <= 64, "tracked {} entries", z.tracked());
     }
 
     #[test]
@@ -345,5 +530,52 @@ mod tests {
         }
         // Still recovers on schedule despite the flood.
         assert_eq!(z.check("k", t + Duration::from_millis(1100), 0, true, 0), Decision::Pass);
+    }
+
+    /// The property the shared mapping exists for: a forked process must see
+    /// the same bucket, in both directions. Everything the child does between
+    /// `fork` and `_exit` is allocation-free (`check` is pure arithmetic over
+    /// the mapping), which is what makes forking from a threaded test binary
+    /// safe — no inherited malloc lock is ever taken.
+    #[cfg(unix)]
+    #[test]
+    fn a_forked_process_shares_the_buckets() {
+        let z = Zone::new("fork", 1, 1024); // 0.001 r/s — nothing drains mid-test
+        let now = Instant::now();
+
+        // Parent spends the only token for "k".
+        assert_eq!(z.check("k", now, 0, false, 0), Decision::Pass);
+
+        match unsafe { libc::fork() } {
+            0 => {
+                // Child: "k" must already be over the limit (parent's spend is
+                // visible), and "j" is claimed here for the parent to see.
+                let k = z.check("k", now, 0, false, 0);
+                let j = z.check("j", now, 0, false, 0);
+                let code = match (k, j) {
+                    (Decision::Reject, Decision::Pass) => 0,
+                    (Decision::Reject, _) => 2,
+                    _ => 1,
+                };
+                unsafe { libc::_exit(code) };
+            }
+            pid if pid > 0 => {
+                let mut status = 0;
+                assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+                assert!(libc::WIFEXITED(status), "child died abnormally");
+                match libc::WEXITSTATUS(status) {
+                    0 => {}
+                    1 => panic!("child saw a fresh bucket for \"k\" — the mapping is not shared"),
+                    c => panic!("child exit {c}"),
+                }
+                // And the child's spend on "j" must be visible here.
+                assert_eq!(
+                    z.check("j", now, 0, false, 0),
+                    Decision::Reject,
+                    "the child's bucket write did not reach the parent"
+                );
+            }
+            _ => panic!("fork failed: {}", std::io::Error::last_os_error()),
+        }
     }
 }
