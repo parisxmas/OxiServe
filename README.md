@@ -250,12 +250,13 @@ settings on both. Warmup runs discarded.
 
 | Scenario | nginx | OxiServe | |
 |---|---:|---:|---|
-| HTTP/2 over TLS (100 conns × 32 streams) | 292,542 rps | **400,687 rps** | **1.37×** |
-| HTTPS/1.1, keepalive, 100 B | 247,489 rps | **315,922 rps** | **1.28×** |
-| HTTP/1.1, keepalive, 100 B | 293,043 rps | **346,633 rps** | **1.18×** |
-| HTTP/1.1, keepalive, 10 KB | 294,705 rps | 297,480 rps | 1.01× |
-| HTTP/1.1, keepalive, 1 MB | 26,762 rps | 27,385 rps | 1.02× |
-| HTTP/1.1, **new connection per request** | **177,451 rps** | 167,556 rps | **0.94×** |
+| HTTPS/1.1, keepalive, 100 B | 224,120 rps | **307,045 rps** | **1.37×** |
+| HTTP/2 over TLS (100 conns × 32 streams) | 259,724 rps | **350,568 rps** | **1.35×** |
+| HTTP/1.1, keepalive, 100 B, `open_file_cache` | 413,386 rps | **513,910 rps** | **1.24×** |
+| HTTP/1.1, keepalive, 100 B | 290,609 rps | **330,445 rps** | **1.14×** |
+| HTTP/1.1, keepalive, 10 KB | 252,240 rps | 260,276 rps | 1.03× |
+| HTTP/1.1, keepalive, 1 MB | 21,919 rps | 22,356 rps | 1.02× |
+| HTTP/1.1, **new connection per request** | **169,560 rps** | 166,404 rps | **0.98×** |
 
 Two honest caveats about the table above.
 
@@ -264,14 +265,28 @@ and 26 GB/s they are loopback and memory bandwidth, not server code — both
 implementations are waiting on the same ceiling, and a 1.01× there means
 "indistinguishable", not "narrowly ahead".
 
-**The last row is a real loss, and the cause is not yet identified.** It is
-genuine connection churn, confirmed against the kernel's `PassiveOpens`
-counter at exactly 1.000 new TCP connections per request (against 0.000 for
-the keepalive rows). Two hypotheses were tested and both were wrong: removing
-the redundant `shutdown()` syscall on close, and pooling per-worker connection
-buffers so a connection costs no allocations to set up. Neither moved the
-number by more than run-to-run noise. Both changes were kept because they are
-right on their own terms, but neither explains the gap.
+**The last row is a real loss, and it is only partly explained.** It is genuine
+connection churn — the kernel's `PassiveOpens` counter reads exactly 1.000 new
+TCP connections per request, against 0.000 for the keepalive rows.
+
+Chasing it took OxiServe from 11.15 syscalls per connection to **9.06, against
+nginx's 10.07** — we now make ~10% *fewer* syscalls per connection and are
+still ~2–3% behind. What was found and fixed:
+
+- **Reactor registration.** Every accepted socket was registered with epoll on
+  arrival and deregistered on drop; nginx registers once and lets `close`
+  remove it. Accepted sockets now stay unregistered and upgrade in place the
+  first time a syscall would block, so a connection that arrives with its
+  request already buffered never touches epoll. Worth ~3 points.
+- **`accept4(SOCK_NONBLOCK)`** instead of accept plus `ioctl(FIONBIO)`, and a
+  redundant `shutdown()` before close.
+
+What was tested and found *not* to be the cause: per-connection allocation
+churn (buffers are pooled per worker now anyway), the per-connection task
+(serving inline without spawning moves the number 0.5%), the accept readiness
+path, and file I/O (the gap survives `open_file_cache` on both sides). The
+remaining few percent is not explained by anything measurable with these
+tools, and is recorded as open rather than guessed at.
 
 ### Real-world check: WordPress
 
