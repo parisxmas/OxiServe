@@ -39,6 +39,14 @@ pub fn normalize(path: &str) -> Result<String, UriError> {
     if !path.starts_with('/') {
         return Err(UriError::NotAbsolute);
     }
+    // Almost every real request path has nothing to normalise: no escape to
+    // decode, no duplicate slash to collapse, no dot segment to resolve. The
+    // loop below allocates three vectors to do that work, on every request,
+    // and nginx does the equivalent in place. Recognising the ordinary case
+    // first turns three allocations into one copy.
+    if is_already_normal(path.as_bytes()) {
+        return Ok(path.to_string());
+    }
     let b = path.as_bytes();
     // Bytes, not chars. Percent-decoding works on bytes and a UTF-8 character
     // spans several of them, so pushing `byte as char` would reinterpret each
@@ -112,6 +120,32 @@ pub fn normalize(path: &str) -> Result<String, UriError> {
     String::from_utf8(out).map_err(|_| UriError::Invalid)
 }
 
+/// True when [`normalize`] would return `path` unchanged.
+///
+/// Deliberately conservative: anything that *might* need work goes down the
+/// full path. Being wrong in that direction costs a slower request; being
+/// wrong the other way would skip the traversal checks, so the predicate is
+/// written to reject rather than to be clever.
+fn is_already_normal(b: &[u8]) -> bool {
+    // `b[0]` is '/' — the caller checked.
+    let mut i = 1;
+    while i < b.len() {
+        match b[i] {
+            // Needs decoding, and a decoded byte can be a separator or a NUL.
+            b'%' => return false,
+            // An empty segment, which the slow path collapses.
+            b'/' if b[i - 1] == b'/' => return false,
+            // The start of a `.` or `..` segment. A dot anywhere else in a
+            // segment — `/a.txt` — is an ordinary character and stays.
+            b'.' if b[i - 1] == b'/' => return false,
+            0 => return false,
+            _ => {}
+        }
+        i += 1;
+    }
+    true
+}
+
 #[inline]
 fn hex(c: u8) -> Option<u8> {
     match c {
@@ -170,6 +204,28 @@ pub fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fast path is only sound if it is indistinguishable from the slow
+    /// one. Rather than trust the predicate by eye, force both and compare.
+    #[test]
+    fn the_fast_path_never_disagrees_with_the_full_one() {
+        fn slow(path: &str) -> Result<String, UriError> {
+            // Prefix a segment that always fails `is_already_normal`, run the
+            // full loop, then strip it back off.
+            let forced = format!("/x/..{path}");
+            normalize(&forced)
+        }
+        for p in [
+            "/", "/index.html", "/a/b/c", "/a/b/", "/a.txt", "/a.b.c/d.e",
+            "/ürünler/kitap.html", "/日本語/ページ", "/a-b_c~d", "/a/b/c/d/e/f/g",
+            "/very/deep/path/with/many/segments/and/a/file.html",
+            "/.hidden", "/a/.hidden", "/a..b", "/a/b..c",
+        ] {
+            let fast = normalize(p);
+            let full = slow(p);
+            assert_eq!(fast, full, "fast and full disagree on {p:?}");
+        }
+    }
 
     #[test]
     fn plain_paths_pass_through() {
