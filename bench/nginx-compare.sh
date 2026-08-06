@@ -3,9 +3,9 @@
 # project has already had to learn the hard way:
 #
 #   * Equal worker counts, verified at run time by counting what actually
-#     serves traffic on each side. nginx forks worker *processes*; OxiServe
-#     runs worker *threads* inside one process, so counting processes for both
-#     reports 3 against 1 and calls an unfair run fair.
+#     serves traffic on each side — worker processes for both, since ADR-0003,
+#     but the check still counts either shape so a threads-mode A/B run
+#     (OXISERVE_WORKER_MODEL=threads) stays honest too.
 #   * Neither server is re-pinned by this script. `worker_cpu_affinity auto`
 #     and OxiServe's own pinning already put worker i on core i; a `taskset`
 #     over them would REMOVE that and hand us a win that is really cache
@@ -91,13 +91,28 @@ EOF
 }
 
 # ------------------------------------------------------------- server ctl --
-start_nginx() { sudo nginx -c "$D/nginx.conf" 2>/dev/null; sleep 1.2; }
+# Every start and stop asserts the listener count. A stale server holding a
+# reuseport socket silently absorbs a share of every connection and poisons
+# the round without failing anything — this happened twice before these
+# assertions existed, and both times the number looked plausible.
+listeners() { ss -ltn 2>/dev/null | grep -c ":$1 "; }
+need() {
+    local got; got=$(listeners "$1")
+    [ "$got" = "$2" ] || { echo "ABORT: want $2 listeners on :$1, found $got ($3)"; exit 1; }
+}
+start_nginx() { sudo nginx -c "$D/nginx.conf" 2>/dev/null; sleep 1.2; need "$NG_PORT" 2 nginx; }
 stop_nginx() {
     sudo nginx -c "$D/nginx.conf" -s quit >/dev/null 2>&1
-    sleep 1; sudo pkill -f "nginx:" >/dev/null 2>&1; sleep 0.6
+    sleep 1; sudo pkill -9 -x nginx >/dev/null 2>&1; sleep 0.6
+    need "$NG_PORT" 0 nginx-stop
 }
-start_oxi() { "$OXISERVE" -c "$D/oxiserve.conf" >/dev/null 2>&1 & sleep 1.5; }
-stop_oxi() { pkill -f "oxiserve -c $D" >/dev/null 2>&1; sleep 0.8; }
+start_oxi() { "$OXISERVE" -c "$D/oxiserve.conf" >/dev/null 2>&1 & sleep 1.6; need "$OX_PORT" 2 oxiserve; }
+stop_oxi() {
+    pkill -9 -x oxiserve >/dev/null 2>&1
+    pkill -9 -x oxiserve-worker >/dev/null 2>&1
+    sleep 0.8
+    need "$OX_PORT" 0 oxiserve-stop
+}
 
 verify() {
     local out=""

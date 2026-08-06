@@ -261,68 +261,35 @@ measuring anything.
 
 | Scenario | nginx | OxiServe | |
 |---|---:|---:|---|
-| HTTPS/1.1, keepalive, 100 B | 243,233 rps | **318,788 rps** | **1.31×** |
-| HTTP/2 over TLS (100 conns × 32 streams) | 278,503 rps | **361,244 rps** | **1.30×** |
-| HTTP/1.1, keepalive, 100 B | 278,962 rps | **347,981 rps** | **1.25×** |
-| HTTP/1.1, keepalive, 10 KB | 289,970 rps | 299,929 rps | 1.03× |
-| HTTP/1.1, keepalive, 1 MB | 24,576 rps | 24,967 rps | 1.02× |
-| HTTP/1.1, **new connection per request** | **158,760 rps** | 147,266 rps | **0.93×** |
+| HTTPS/1.1, keepalive, 100 B | 247,147 rps | **352,102 rps** | **1.42×** |
+| HTTP/2 over TLS (100 conns × 32 streams) | 301,259 rps | **410,572 rps** | **1.36×** |
+| HTTP/1.1, keepalive, 100 B | 300,723 rps | **401,825 rps** | **1.34×** |
+| HTTP/1.1, keepalive, 10 KB | 295,158 rps | **328,653 rps** | **1.11×** |
+| HTTP/1.1, keepalive, 1 MB | 27,594 rps | 28,201 rps | 1.02× |
+| HTTP/1.1, new connection per request | 173,547 rps | 173,814 rps | 1.00× |
 
-Two honest caveats about the table above.
+No scenario remains where nginx is ahead. The last row was the stubborn one
+and its story is [ADR-0003]: with worker *threads* it measured 0.93× and no
+syscall-level fix moved it — not even driving our syscall count 19% below
+nginx's. The attribution experiment was three arrangements of the same binary:
+one worker thread scored 1.03×, two worker threads 0.93×, and two single-worker
+*processes* 1.00×. The whole loss was contention on state threads share and
+processes do not. So `worker_processes N` now means what it says — N forked
+worker processes under a supervising master, as nginx runs — and the churn row
+reads dead even (nine asserted alternating rounds, median 1.002×, every round
+within ±0.6%). Moving to processes also lifted every other row: 10 KB, which
+was bandwidth-tied at 1.03×, opened to 1.11×.
 
-The 10 KB and 1 MB rows do not discriminate between the servers. At 2.9 GB/s
-and 26 GB/s they are loopback and memory bandwidth, not server code — both
-implementations are waiting on the same ceiling, and a 1.01× there means
-"indistinguishable", not "narrowly ahead".
+Process mode forced one piece of real shared-memory engineering: `limit_req`
+zones now live in a `MAP_SHARED` mapping created before the fork — a
+fixed-size open-addressing table of atomics, no allocator in shared memory —
+because per-process buckets would silently multiply every configured rate by
+the worker count. A test drives the real binary at `1r/m` across both workers
+and asserts exactly one admitted request. A worker that dies is respawned by
+the master, and `PR_SET_PDEATHSIG` means even a SIGKILLed master cannot leave
+orphans holding the port.
 
-**The last row is a real loss, and the cause is now known.** It is contention
-between our own worker threads:
-
-| workers each | nginx | OxiServe | |
-|---|---:|---:|---|
-| 1 | 111,780 rps | **115,029 rps** | **1.03×** |
-| 2 | 158,760 rps | 147,266 rps | 0.93× |
-
-With one worker we are ahead. Adding a second inverts it. nginx never pays this
-because it forks worker *processes*, which share no file-descriptor table — and
-a connection costs four descriptor operations (accept the socket, open the
-file, close the file, close the socket), each taking the `files_struct`
-spinlock that threads in one process share.
-
-`unshare(CLONE_FILES)` per worker thread buys the same separation and was
-tried. It moved the number about half a point and broke eleven FastCGI tests
-with an unexplained `EINVAL` out of worker startup — serially as well as in
-parallel — so it was reverted rather than shipped. The real fix is the one
-nginx made: worker processes instead of threads, which would also need the
-shared-memory zones nginx has, because upstream health, the cache index and
-`limit_req` counters are shared through `Arc` here today.
-
-Getting to that answer meant driving syscalls from 11.15 per connection to
-8.08, against nginx's 10.02 — and watching the gap survive. That is worth
-recording on its own: **syscall count was not what this row was measuring.**
-nginx's two extra calls are `setsockopt` and `epoll_ctl`, which touch no data;
-counting the ones that do real work, both servers issue eight. The
-optimisations found on the way are all kept because each is right on its own
-terms:
-
-- accepted sockets stay unregistered with the reactor until a syscall would
-  actually block, so a short connection never calls `epoll_ctl` at all
-- an 8 KB `memset` per request, of bytes the kernel was about to overwrite
-- a timer armed per read — arming `tokio::time::timeout` reads the clock, and
-  a request already in the socket buffer is now read synchronously
-- three heap allocations in URI normalisation for paths with nothing to
-  normalise, which is nearly all of them
-- `fstat` rather than `statx`, `accept4(SOCK_NONBLOCK)` rather than accept plus
-  `ioctl`, `tcp_nodelay` applied only once Nagle could delay something, a
-  redundant `shutdown()`, and a per-request `Instant::now()` never read
-
-Refuted by measurement rather than argument: allocation churn, the
-per-connection task (serving inline without spawning moves it 0.5%), the accept
-readiness path, `SO_REUSEPORT` distribution (both bind one listening socket per
-worker), file I/O (the gap survives `open_file_cache` on both sides), and
-TIME_WAIT accumulation — where the first measurement suggested we held twice as
-many, and counting by local port showed the two were within 0.3% of each other.
-That one was a sampling artifact, caught before anything was built on it.
+[ADR-0003]: docs/decisions/0003-worker-processes.md
 
 ### Real-world check: WordPress
 

@@ -48,10 +48,13 @@ impl Master {
             .spawn()
             .expect("spawn oxiserve binary");
 
+        // Constructed before the readiness wait so a panic on the timeout
+        // path still runs Drop and reaps the master instead of leaking it.
+        let m = Master { child, port, dir };
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                return Master { child, port, dir };
+                return m;
             }
             std::thread::sleep(Duration::from_millis(30));
         }
