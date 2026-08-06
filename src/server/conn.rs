@@ -35,19 +35,24 @@ const READ_BUF_INIT: usize = 8 * 1024;
 /// no such thing — the default implementation returns `None`, so TLS simply
 /// takes the ordinary copy path.
 pub trait RawStream {
-    fn as_tcp(&self) -> Option<&tokio::net::TcpStream> {
+    /// The reactor-backed socket, if this stream has one.
+    ///
+    /// Takes `&mut self` so a transport that defers registering with the
+    /// reactor can register here: `sendfile(2)` parks the task when the send
+    /// buffer fills, which needs the reactor either way.
+    fn as_tcp(&mut self) -> Option<&tokio::net::TcpStream> {
         None
     }
 }
 
 impl RawStream for tokio::net::TcpStream {
-    fn as_tcp(&self) -> Option<&tokio::net::TcpStream> {
+    fn as_tcp(&mut self) -> Option<&tokio::net::TcpStream> {
         Some(self)
     }
 }
 
 impl<T: RawStream> RawStream for tokio_rustls::server::TlsStream<T> {
-    fn as_tcp(&self) -> Option<&tokio::net::TcpStream> {
+    fn as_tcp(&mut self) -> Option<&tokio::net::TcpStream> {
         // TLS records must be encrypted in user space, so sendfile can never
         // apply here regardless of the transport underneath.
         None

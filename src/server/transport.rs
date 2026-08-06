@@ -7,21 +7,67 @@
 //!
 //! The enum is a thin dispatch layer: it forwards `AsyncRead`/`AsyncWrite` to
 //! whichever socket it holds, so nothing above this module needs to care.
+//!
+//! Accepted TCP sockets start [`Stream::Pending`]: accepted, but not yet
+//! registered with the reactor. Registering costs an `epoll_ctl` on the way in
+//! and another when the socket drops, and a connection that arrives with its
+//! request already buffered — the common case under load — needs neither. The
+//! first syscall that would block upgrades the socket in place, so a slow or
+//! keep-alive connection ends up exactly where it would have been anyway.
+//! Measured against nginx, those two syscalls were the whole of our
+//! per-connection deficit on connection-churn workloads.
 
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::net::{TcpStream, UnixListener, UnixStream};
 
 use super::conn::RawStream;
 
 /// An accepted client connection, or a connection out to an upstream.
 pub enum Stream {
     Tcp(TcpStream),
+    /// Accepted and non-blocking, but not registered with the reactor. Becomes
+    /// [`Stream::Tcp`] the moment a syscall would block. `Option` only so the
+    /// socket can be moved out through `&mut self` during the upgrade; it is
+    /// never `None` outside that moment.
+    Pending(Option<std::net::TcpStream>),
     Unix(UnixStream),
+}
+
+impl Stream {
+    /// Registers a pending socket with the reactor.
+    ///
+    /// Called when a syscall reports it would block, because from that point
+    /// on we need the reactor to tell us when to try again. Everything
+    /// buffered has already been consumed by the caller, so nothing is lost in
+    /// the handover.
+    fn register(&mut self) -> io::Result<()> {
+        if let Stream::Pending(slot) = self {
+            let std = slot.take().expect("a pending socket always holds one");
+            *self = Stream::Tcp(TcpStream::from_std(std)?);
+        }
+        Ok(())
+    }
+
+    /// Registers if needed and returns the reactor-backed socket.
+    ///
+    /// `sendfile(2)` parks the task when the send buffer fills, which needs
+    /// the reactor — so the fast path ends here for a large response, which is
+    /// exactly where the two saved syscalls stop mattering.
+    pub fn as_registered_tcp(&mut self) -> Option<&TcpStream> {
+        if matches!(self, Stream::Pending(_)) && self.register().is_err() {
+            return None;
+        }
+        match self {
+            Stream::Tcp(s) => Some(s),
+            _ => None,
+        }
+    }
 }
 
 impl Stream {
@@ -56,6 +102,9 @@ impl Stream {
         let r = match self {
             Stream::Tcp(s) => s.try_read(&mut probe),
             Stream::Unix(s) => s.try_read(&mut probe),
+            // Only ever set on accepted client sockets, never on the pooled
+            // upstream connections this probes.
+            Stream::Pending(_) => return false,
         };
         matches!(&r, Err(e) if e.kind() == io::ErrorKind::WouldBlock)
     }
@@ -67,9 +116,35 @@ impl AsyncRead for Stream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
+        let me = self.get_mut();
+        if let Stream::Pending(slot) = me {
+            use std::io::Read;
+            // Free in practice: every caller reaches `AsyncReadExt::read`
+            // with an already-initialised slice, so `ReadBuf` has nothing
+            // left to zero. It keeps this path out of `unsafe` entirely.
+            let dst = buf.initialize_unfilled();
+            match slot.as_mut().expect("present").read(dst) {
+                Ok(n) => {
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                // Nothing buffered, so from here on we need the reactor.
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if let Err(e) = me.register() {
+                        return Poll::Ready(Err(e));
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+        match me {
             Stream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
             Stream::Unix(s) => Pin::new(s).poll_read(cx, buf),
+            Stream::Pending(_) => unreachable!("registered above"),
         }
     }
 }
@@ -80,9 +155,29 @@ impl AsyncWrite for Stream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
+        let me = self.get_mut();
+        if let Stream::Pending(slot) = me {
+            use std::io::Write;
+            match slot.as_mut().expect("present").write(buf) {
+                Ok(n) => return Poll::Ready(Ok(n)),
+                // The send buffer is full, so the rest of this response needs
+                // the reactor to tell us when there is room.
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if let Err(e) = me.register() {
+                        return Poll::Ready(Err(e));
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+        match me {
             Stream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
             Stream::Unix(s) => Pin::new(s).poll_write(cx, buf),
+            Stream::Pending(_) => unreachable!("registered above"),
         }
     }
 
@@ -91,36 +186,68 @@ impl AsyncWrite for Stream {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
+        let me = self.get_mut();
+        // Vectored writes go through the reactor rather than getting their own
+        // fast path: they are used for proxy and FastCGI request heads, not
+        // for the short client responses this optimisation is about.
+        if let Err(e) = me.register() {
+            return Poll::Ready(Err(e));
+        }
+        match me {
             Stream::Tcp(s) => Pin::new(s).poll_write_vectored(cx, bufs),
             Stream::Unix(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+            Stream::Pending(_) => unreachable!("registered above"),
         }
     }
 
     fn is_write_vectored(&self) -> bool {
         match self {
             Stream::Tcp(s) => s.is_write_vectored(),
+            // Not yet registered, so report the same answer the socket will
+            // give once it is: a `TcpStream` is always vectored-capable.
+            Stream::Pending(_) => true,
             Stream::Unix(s) => s.is_write_vectored(),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
+        let me = self.get_mut();
+        match me {
+            // Nothing is buffered in user space, so there is nothing to flush
+            // and no reason to register a socket just to say so.
+            Stream::Pending(_) => Poll::Ready(Ok(())),
             Stream::Tcp(s) => Pin::new(s).poll_flush(cx),
             Stream::Unix(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
+        let me = self.get_mut();
+        if let Stream::Pending(slot) = me {
+            // Shut the write side down directly. Registering with the reactor
+            // purely to close would reintroduce both syscalls this exists to
+            // avoid.
+            let r = slot.as_mut().expect("present").shutdown(std::net::Shutdown::Write);
+            return Poll::Ready(match r {
+                Ok(()) => Ok(()),
+                // The peer closed first; nothing left to shut down.
+                Err(e) if e.kind() == io::ErrorKind::NotConnected => Ok(()),
+                Err(e) => Err(e),
+            });
+        }
+        match me {
             Stream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
             Stream::Unix(s) => Pin::new(s).poll_shutdown(cx),
+            Stream::Pending(_) => unreachable!("handled above"),
         }
     }
 }
 
 impl RawStream for Stream {
-    fn as_tcp(&self) -> Option<&TcpStream> {
+    fn as_tcp(&mut self) -> Option<&TcpStream> {
+        if matches!(self, Stream::Pending(_)) {
+            return self.as_registered_tcp();
+        }
         match self {
             Stream::Tcp(s) => Some(s),
             // `sendfile(2)` to a Unix socket is possible on Linux, but a Unix
@@ -128,13 +255,20 @@ impl RawStream for Stream {
             // host, where the copy is not the bottleneck. Falling back to the
             // ordinary write path keeps one code path honest.
             Stream::Unix(_) => None,
+            Stream::Pending(_) => unreachable!("registered above"),
         }
     }
 }
 
 /// A bound listening socket.
+///
+/// The TCP side is an [`AsyncFd`] over a plain `std` listener rather than
+/// `tokio::net::TcpListener`, because tokio's `accept` registers every
+/// accepted socket with the reactor before handing it over. Going through
+/// readiness ourselves lets the accepted socket stay unregistered — see
+/// [`Stream::Pending`].
 pub enum Listener {
-    Tcp(TcpListener),
+    Tcp(AsyncFd<std::net::TcpListener>),
     Unix(UnixListener),
 }
 
@@ -142,8 +276,22 @@ impl Listener {
     pub async fn accept(&self) -> io::Result<(Stream, Option<std::net::SocketAddr>)> {
         match self {
             Listener::Tcp(l) => {
-                let (s, peer) = l.accept().await?;
-                Ok((Stream::Tcp(s), Some(peer)))
+                // Accepted through the listener's readiness but handed back
+                // *unregistered*: `TcpListener::accept` would register the new
+                // socket with the reactor immediately, and most connections
+                // never need it. See [`Stream::Pending`].
+                loop {
+                    let mut guard = l.readable().await?;
+                    match guard.try_io(|inner| inner.get_ref().accept()) {
+                        Ok(Ok((s, peer))) => {
+                            s.set_nonblocking(true)?;
+                            return Ok((Stream::Pending(Some(s)), Some(peer)));
+                        }
+                        Ok(Err(e)) => return Err(e),
+                        // The readiness was stale — another worker took it.
+                        Err(_would_block) => continue,
+                    }
+                }
             }
             // A Unix peer has no address; nginx reports `$remote_addr` as
             // "unix:" for these, which `Ctx` handles via `remote == None`.

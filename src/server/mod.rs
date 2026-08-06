@@ -475,7 +475,8 @@ impl BoundSocket {
         match self {
             BoundSocket::Tcp(l) => {
                 l.set_nonblocking(true)?;
-                tokio::net::TcpListener::from_std(l).map(transport::Listener::Tcp)
+                l.set_nonblocking(true)?;
+                tokio::io::unix::AsyncFd::new(l).map(transport::Listener::Tcp)
             }
             BoundSocket::Unix(l) => {
                 l.set_nonblocking(true)?;
