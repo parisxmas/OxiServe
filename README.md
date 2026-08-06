@@ -222,7 +222,6 @@ regex captures `$1`–`$9`.
   ignored; a refresh is always a full fetch, never a conditional revalidation.
 - **`limit_conn`** connection limiting (`limit_req` is implemented).
 - **`auth_basic`**, `auth_request`.
-- **Unix domain sockets** in `listen`.
 - **`mail`** block; **UDP** inside `stream` (`ssl_preread` is implemented).
 - **PCRE-only regex** — lookaround and backreferences are rejected with a clear
   error rather than silently mismatching (Rust's `regex` has neither).
