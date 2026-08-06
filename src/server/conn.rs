@@ -516,8 +516,9 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let start = st.read.len();
-    st.read.resize(start + 8192, 0);
-    let n = match tokio::time::timeout(timeout, sock.read(&mut st.read[start..])).await {
+    st.read.reserve(8192);
+    // Into spare capacity, not over a freshly zeroed 8 KB. See `read_head`.
+    let n = match tokio::time::timeout(timeout, sock.read_buf(&mut st.read)).await {
         Ok(Ok(n)) => n,
         Ok(Err(_)) => {
             st.read.truncate(start);
@@ -610,9 +611,11 @@ where
         if st.read.capacity() - start < 2048 {
             st.read.reserve(READ_BUF_INIT);
         }
-        st.read.resize(st.read.capacity(), 0);
-
-        let n = match tokio::time::timeout(timeout, sock.read(&mut st.read[start..])).await {
+        // `read_buf` writes straight into the vector's spare capacity. The old
+        // `resize(capacity, 0)` zeroed the whole 8 KB buffer before every
+        // single read — a memset per request that the kernel then overwrote,
+        // and one of the larger single costs on this path.
+        let n = match tokio::time::timeout(timeout, sock.read_buf(&mut st.read)).await {
             Ok(Ok(n)) => n,
             Ok(Err(_)) => {
                 st.read.truncate(start);

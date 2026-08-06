@@ -163,28 +163,21 @@ impl AsyncRead for Stream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let me = self.get_mut();
-        if let Stream::Pending(slot) = me {
-            use std::io::Read;
-            // Free in practice: every caller reaches `AsyncReadExt::read`
-            // with an already-initialised slice, so `ReadBuf` has nothing
-            // left to zero. It keeps this path out of `unsafe` entirely.
-            let dst = buf.initialize_unfilled();
-            match slot.as_mut().expect("present").sock.read(dst) {
-                Ok(n) => {
-                    buf.advance(n);
-                    return Poll::Ready(Ok(()));
-                }
+        if matches!(me, Stream::Pending(_)) {
+            match pending_read(me, buf) {
                 // Nothing buffered, so from here on we need the reactor.
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                Some(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => {
                     if let Err(e) = me.register() {
                         return Poll::Ready(Err(e));
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                Some(Err(e)) if e.kind() == io::ErrorKind::Interrupted => {
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
-                Err(e) => return Poll::Ready(Err(e)),
+                Some(Err(e)) => return Poll::Ready(Err(e)),
+                Some(Ok(())) => return Poll::Ready(Ok(())),
+                None => unreachable!("matched Pending above"),
             }
         }
         match me {
@@ -193,6 +186,39 @@ impl AsyncRead for Stream {
             Stream::Pending(_) => unreachable!("registered above"),
         }
     }
+}
+
+/// Reads straight into the buffer's uninitialised tail.
+///
+/// The obvious `ReadBuf::initialize_unfilled` would zero it first, and callers
+/// hand over the whole spare capacity of an 8 KB buffer — a memset per read,
+/// of bytes `read(2)` is about to overwrite anyway. That zeroing was one of
+/// the larger single costs on the request path.
+///
+/// No `&mut [u8]` is ever created over uninitialised memory: the raw pointer
+/// goes to the kernel, which initialises exactly the bytes it reports having
+/// written, and only those are then claimed.
+fn pending_read(me: &mut Stream, buf: &mut ReadBuf<'_>) -> Option<io::Result<()>> {
+    use std::os::fd::AsRawFd;
+    let Stream::Pending(slot) = me else { return None };
+    let fd = slot.as_ref().expect("present").sock.as_raw_fd();
+
+    // SAFETY: `unfilled_mut` is unsafe because the caller must not
+    // de-initialise what it hands back. Nothing here writes through the
+    // reference at all — it is only used for its address and length.
+    let unfilled = unsafe { buf.unfilled_mut() };
+    let (ptr, cap) = (unfilled.as_mut_ptr(), unfilled.len());
+    // SAFETY: `ptr` and `cap` describe the buffer's own spare capacity, and
+    // `fd` belongs to the socket borrowed through `me`.
+    let got = unsafe { libc::read(fd, ptr.cast::<libc::c_void>(), cap) };
+    if got < 0 {
+        return Some(Err(io::Error::last_os_error()));
+    }
+    let n = got as usize;
+    // SAFETY: `read` reported writing exactly `n` bytes at `ptr`.
+    unsafe { buf.assume_init(n) };
+    buf.advance(n);
+    Some(Ok(()))
 }
 
 impl AsyncWrite for Stream {
