@@ -20,7 +20,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::model::OpenFileCache;
 
