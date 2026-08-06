@@ -28,7 +28,35 @@ thread_local! {
     });
 }
 
+/// The current wall-clock second.
+///
+/// The formatted strings above are cached, but *checking whether the second
+/// has advanced* still happens on every response, so this is one of the very
+/// few things on the request path that runs unconditionally. `CLOCK_REALTIME`
+/// reads a hardware timer; `CLOCK_REALTIME_COARSE` reads a value the kernel
+/// already updates on its own tick and costs a fraction as much. Its
+/// resolution is a few milliseconds, which is three orders of magnitude finer
+/// than the second we are comparing.
+///
+/// Measured against nginx, time reads were ~1.6% of our CPU and 0.07% of
+/// theirs — nginx updates a cached time once per event-loop turn and shares it
+/// across every connection in that batch.
+#[cfg(target_os = "linux")]
 fn now_secs() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `clock_gettime` only writes to the `timespec` we hand it.
+    if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut ts) } == 0 {
+        return ts.tv_sec as u64;
+    }
+    fallback_secs()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn now_secs() -> u64 {
+    fallback_secs()
+}
+
+fn fallback_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)

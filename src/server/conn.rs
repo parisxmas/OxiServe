@@ -10,7 +10,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -286,7 +286,6 @@ pub async fn serve_with_prefix<S>(
             requests,
         );
 
-        let started = Instant::now();
         let mut reply = match body_status {
             Some(code) => handler::error_reply(&ctx, code),
             None => handler::handle(&mut ctx).await,
@@ -317,7 +316,7 @@ pub async fn serve_with_prefix<S>(
         let written = match write_reply(&mut sock, &mut st.write, reply, server, head_only).await {
             Ok(w) => w,
             Err(_) => {
-                log_request(logs, &ctx, &Resp::new(), status, 0, 0, started);
+                log_request(logs, &ctx, &Resp::new(), status, 0, 0);
                 return;
             }
         };
@@ -329,7 +328,6 @@ pub async fn serve_with_prefix<S>(
             status,
             written.body_bytes,
             written.total_bytes,
-            started,
         );
 
         if !keep {
@@ -981,7 +979,6 @@ pub(crate) fn log_request(
     status: u16,
     body_bytes: u64,
     total_bytes: u64,
-    _started: Instant,
 ) {
     let confs = &ctx.server.access_logs;
     if confs.is_empty() {

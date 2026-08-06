@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Notify};
@@ -841,7 +841,6 @@ fn spawn_stream(
                 as u64,
         );
 
-        let started = Instant::now();
         let reply = handler::handle(&mut ctx).await;
         // `frame(true)` fills in Content-Length when the length is known. Its
         // chunked fallback is meaningless here — HTTP/2 frames the body with
@@ -859,9 +858,7 @@ fn spawn_stream(
         // must work over HTTP/2 exactly as it does over HTTP/1.
         let Reply { resp, body } = reply;
         let (body_bytes, total) = send_response(id, &resp, body, &flow, &sflow, &tx).await;
-        crate::server::conn::log_request(
-            &logs, &ctx, &resp, status, body_bytes, total, started,
-        );
+        crate::server::conn::log_request(&logs, &ctx, &resp, status, body_bytes, total);
     });
 }
 
