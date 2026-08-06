@@ -151,6 +151,10 @@ impl Decoder {
         out: &mut Vec<Header>,
     ) -> Result<(), HpackError> {
         let mut listed = 0usize;
+        // RFC 7541 section 4.2: a size update may only appear at the start of
+        // a block. Allowing one later would give two encodings for the same
+        // header list, and h2spec checks it.
+        let mut seen_field = false;
         while let Some(&first) = buf.first() {
             if first & 0x80 != 0 {
                 // 1xxxxxxx — indexed header field.
@@ -159,6 +163,7 @@ impl Decoder {
                 let h = self.lookup(idx)?;
                 listed = charge(listed, &h, max_list)?;
                 out.push(h);
+                seen_field = true;
             } else if first & 0x40 != 0 {
                 // 01xxxxxx — literal, and the peer wants it in the table.
                 let (idx, rest) = int(buf, 6)?;
@@ -167,8 +172,12 @@ impl Decoder {
                 listed = charge(listed, &h, max_list)?;
                 self.insert(h.clone());
                 out.push(h);
+                seen_field = true;
             } else if first & 0x20 != 0 {
                 // 001xxxxx — dynamic table size update.
+                if seen_field {
+                    return Err(HpackError::Compression);
+                }
                 let (n, rest) = int(buf, 5)?;
                 buf = rest;
                 let n = n as usize;
@@ -190,6 +199,7 @@ impl Decoder {
                 buf = rest;
                 listed = charge(listed, &h, max_list)?;
                 out.push(h);
+                seen_field = true;
             }
         }
         Ok(())
@@ -582,6 +592,18 @@ mod tests {
     }
 
     #[test]
+    fn a_size_update_after_a_field_is_a_decoding_error() {
+        // RFC 7541 section 4.2 puts size updates at the start of a block.
+        // Accepting one later would give two encodings for the same header
+        // list, which is the ambiguity HPACK is otherwise careful to avoid.
+        let mut d = Decoder::new(4096);
+        let mut b = hex("82"); // :method GET
+        write_int(0, 5, 0x20, &mut b);
+        let mut out = Vec::new();
+        assert_eq!(d.decode(&b, 1 << 20, &mut out), Err(HpackError::Compression));
+    }
+
+    #[test]
     fn a_size_update_within_the_limit_shrinks_and_evicts() {
         let mut d = Decoder::new(4096);
         decode_all(&mut d, &hex("4088 25a8 49e9 5ba9 7d7f 8925 a849 e95b b8e8 b4bf"));
@@ -709,5 +731,24 @@ mod tests {
         let mut out = Vec::new();
         d.decode(&block, 1 << 20, &mut out).expect("the block must stay decodable");
         assert_eq!(out.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod h2spec_regression {
+    use super::*;
+
+    #[test]
+    fn a_huffman_string_of_all_ones_is_a_decoding_error() {
+        // What h2spec 5.2.3 sends: a Huffman literal whose bits reach the EOS
+        // symbol. Thirty one-bits *is* EOS, so this must be refused rather
+        // than read as a run of padding.
+        let mut d = Decoder::new(4096);
+        let mut block = vec![0x00, 0x06];
+        block.extend_from_slice(b"x-test");
+        block.push(0x87); // huffman, length 7
+        block.extend_from_slice(&[0xff; 7]);
+        let mut out = Vec::new();
+        assert_eq!(d.decode(&block, 1 << 20, &mut out), Err(HpackError::Compression));
     }
 }

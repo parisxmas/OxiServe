@@ -92,14 +92,59 @@ struct StreamFlow {
     done: Cell<bool>,
 }
 
-/// A stream being assembled by the reader loop.
-struct Incoming {
-    header_block: Vec<u8>,
-    body: Vec<u8>,
-    end_stream: bool,
-    /// Set once HEADERS with END_HEADERS has been seen; a second HEADERS after
-    /// that is trailers, which we accept and ignore.
+/// RFC 9113 section 5.1, reduced to what a server needs. `Idle` is not a
+/// variant because an idle stream has no entry at all — see [`state_of`].
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum State {
+    Open,
+    /// The peer sent END_STREAM; it may not send more. A dispatched stream in
+    /// this state is closed as far as the peer is concerned — there is no
+    /// separate `Closed` variant, because the only difference that matters is
+    /// whether the request has been handed off.
+    HalfClosedRemote,
+    /// We sent RST_STREAM.
+    Reset,
+}
+
+/// A stream, from its first HEADERS until its response is written.
+///
+/// Entries outlive dispatch. An earlier version dropped them as soon as the
+/// request was handed off, which meant a stray DATA frame on a finished stream
+/// looked identical to one on a stream that never existed, and every later
+/// WINDOW_UPDATE was thrown away.
+struct Stream {
+    state: State,
+    flow: Rc<StreamFlow>,
+    /// The header block currently being assembled across CONTINUATION frames.
+    pending: Vec<u8>,
+    /// True when `pending` is a trailer block rather than the request's.
+    pending_is_trailers: bool,
+    headers: Vec<hpack::Header>,
     headers_done: bool,
+    body: Vec<u8>,
+    /// The declared `content-length`, checked against the body actually sent.
+    content_length: Option<u64>,
+    dispatched: bool,
+}
+
+impl Stream {
+    fn new(initial_window: i64) -> Stream {
+        Stream {
+            state: State::Open,
+            flow: Rc::new(StreamFlow {
+                window: Cell::new(initial_window),
+                reset: Cell::new(false),
+                done: Cell::new(false),
+            }),
+            pending: Vec::new(),
+            pending_is_trailers: false,
+            headers: Vec::new(),
+            headers_done: false,
+            body: Vec::new(),
+            content_length: None,
+            dispatched: false,
+        }
+    }
 }
 
 /// Everything a spawned stream task needs, owned.
@@ -237,15 +282,12 @@ where
     let _ = tx.send(out);
 
     let mut dec = hpack::Decoder::new(4096);
-    let mut streams: HashMap<u32, Incoming> = HashMap::new();
-    // Separate from `streams` because it must survive dispatch.
-    let mut flows: HashMap<u32, Rc<StreamFlow>> = HashMap::new();
+    let mut streams: HashMap<u32, Stream> = HashMap::new();
     let mut peer_initial_window: i64 = frame::DEFAULT_WINDOW;
     let mut recv_window: i64 = OUR_INITIAL_WINDOW as i64;
     let mut highest_client_stream = 0u32;
     // Set while a header block is open: only CONTINUATION may follow.
     let mut expect_continuation: Option<u32> = None;
-    let mut settings_acked = false;
 
     loop {
         let head_bytes = match buf.take_opt(&mut rd, frame::HEADER_LEN, idle).await? {
@@ -275,128 +317,174 @@ where
                 if head.stream == 0 {
                     return Err(ConnErr(Code::Protocol, "DATA on stream 0"));
                 }
-                // Flow control is charged on the padded length: the padding
-                // consumed window even though it carries nothing.
+                // Charged on the padded length: padding consumed window even
+                // though it carries nothing.
                 recv_window -= head.len as i64;
                 let data = frame::unpad(&payload, head.has(flag::PADDED))
                     .ok_or(ConnErr(Code::Protocol, "bad padding"))?;
+                replenish(&mut recv_window, tx);
 
-                let Some(st) = streams.get_mut(&head.stream) else {
-                    // Data for a stream we already finished. The window still
-                    // has to be returned or the connection slowly stalls.
-                    replenish(&mut recv_window, tx);
-                    continue;
-                };
+                match state_of(&streams, head.stream, highest_client_stream) {
+                    // Never opened. There is no stream to report an error on,
+                    // so it can only be a connection error.
+                    Where::Idle => return Err(ConnErr(Code::Protocol, "DATA on an idle stream")),
+                    // Closed by END_STREAM: the peer is contradicting itself
+                    // about a stream we both agreed was finished.
+                    Where::Closed => {
+                        return Err(ConnErr(Code::StreamClosed, "DATA on a closed stream"))
+                    }
+                    // We reset it. The peer may simply not have seen the
+                    // RST_STREAM yet, so this is its stream's problem, not the
+                    // connection's.
+                    Where::Reset => {
+                        reset_stream(&mut streams, head.stream, Code::StreamClosed, tx);
+                        continue;
+                    }
+                    Where::HalfClosed => {
+                        reset_stream(&mut streams, head.stream, Code::StreamClosed, tx);
+                        continue;
+                    }
+                    Where::Open => {}
+                }
+
+                let st = streams.get_mut(&head.stream).expect("open implies present");
                 if st.body.len() + data.len() > core.client_max_body_size as usize {
-                    let mut o = Vec::new();
-                    frame::rst(head.stream, Code::EnhanceYourCalm, &mut o);
-                    let _ = tx.send(o);
-                    streams.remove(&head.stream);
-                    replenish(&mut recv_window, tx);
+                    reset_stream(&mut streams, head.stream, Code::EnhanceYourCalm, tx);
                     continue;
                 }
                 st.body.extend_from_slice(data);
                 if head.has(flag::END_STREAM) {
-                    st.end_stream = true;
+                    st.state = State::HalfClosedRemote;
                 }
-                replenish(&mut recv_window, tx);
             }
 
             kind::HEADERS => {
                 if head.stream == 0 {
                     return Err(ConnErr(Code::Protocol, "HEADERS on stream 0"));
                 }
-                // Client streams are odd and must increase. A reused or
-                // lower id would make the two ends disagree about which
-                // stream is which.
                 if head.stream % 2 == 0 {
                     return Err(ConnErr(Code::Protocol, "even client stream id"));
                 }
-                if streams.contains_key(&head.stream) {
-                    // Trailers on a stream still open: accepted and ignored.
-                    if head.has(flag::END_STREAM) {
-                        if let Some(st) = streams.get_mut(&head.stream) {
-                            st.end_stream = true;
-                        }
+
+                let mut block = frame::unpad(&payload, head.has(flag::PADDED))
+                    .ok_or(ConnErr(Code::Protocol, "bad padding"))?;
+                if head.has(flag::PRIORITY) {
+                    // Deprecated by RFC 9113 section 5.3.2 but still sent, and
+                    // the five bytes have to be skipped regardless.
+                    if block.len() < 5 {
+                        return Err(ConnErr(Code::FrameSize, "short priority field"));
                     }
-                    if !head.has(flag::END_HEADERS) {
-                        expect_continuation = Some(head.stream);
+                    let dep = frame::u32_at(block, 0).unwrap_or(0) & 0x7fff_ffff;
+                    if dep == head.stream {
+                        // A stream cannot depend on itself: there is no
+                        // ordering that satisfies it.
+                        let mut o = Vec::new();
+                        frame::rst(head.stream, Code::Protocol, &mut o);
+                        let _ = tx.send(o);
+                        continue;
                     }
-                    continue;
+                    block = &block[5..];
                 }
+
+                match state_of(&streams, head.stream, highest_client_stream) {
+                    Where::Open | Where::HalfClosed => {
+                        // A second header block on a live stream is trailers,
+                        // and trailers must end the stream. Without
+                        // END_STREAM the peer is opening a block that can
+                        // never be closed.
+                        if !head.has(flag::END_STREAM) {
+                            reset_stream(&mut streams, head.stream, Code::Protocol, tx);
+                            continue;
+                        }
+                        let st = streams.get_mut(&head.stream).expect("live");
+                        st.pending.clear();
+                        st.pending.extend_from_slice(block);
+                        st.pending_is_trailers = true;
+                        st.state = State::HalfClosedRemote;
+                        if head.has(flag::END_HEADERS) {
+                            if let Err(e) = finish_block(&mut dec, &mut streams, head.stream, tx)? {
+                                return Err(e);
+                            }
+                        } else {
+                            expect_continuation = Some(head.stream);
+                        }
+                        continue;
+                    }
+                    Where::Closed | Where::Reset => {
+                        return Err(ConnErr(Code::StreamClosed, "HEADERS on a closed stream"))
+                    }
+                    Where::Idle => {}
+                }
+
                 if head.stream <= highest_client_stream {
                     return Err(ConnErr(Code::Protocol, "stream id went backwards"));
                 }
                 highest_client_stream = head.stream;
                 last_stream.set(head.stream);
 
-                // Drop the flow state of streams whose tasks have finished.
-                flows.retain(|_, f| !f.done.get());
+                // Drop the state of streams whose tasks have finished, so a
+                // long-lived connection does not accumulate one entry per
+                // request it ever served.
+                streams.retain(|_, s| !(s.dispatched && s.flow.done.get()));
 
-                if streams.len() >= MAX_CONCURRENT as usize {
+                let active = streams.values().filter(|s| !s.dispatched).count();
+                if active >= MAX_CONCURRENT as usize {
                     let mut o = Vec::new();
                     frame::rst(head.stream, Code::RefusedStream, &mut o);
                     let _ = tx.send(o);
                     continue;
                 }
 
-                let mut block = frame::unpad(&payload, head.has(flag::PADDED))
-                    .ok_or(ConnErr(Code::Protocol, "bad padding"))?;
-                if head.has(flag::PRIORITY) {
-                    // Deprecated by RFC 9113 section 5.3.2, but still sent.
-                    // The five bytes have to be skipped either way.
-                    if block.len() < 5 {
-                        return Err(ConnErr(Code::FrameSize, "short priority field"));
+                let mut st = Stream::new(peer_initial_window);
+                st.state = if head.has(flag::END_STREAM) {
+                    State::HalfClosedRemote
+                } else {
+                    State::Open
+                };
+                st.pending.extend_from_slice(block);
+                streams.insert(head.stream, st);
+                if head.has(flag::END_HEADERS) {
+                    if let Err(e) = finish_block(&mut dec, &mut streams, head.stream, tx)? {
+                        return Err(e);
                     }
-                    block = &block[5..];
-                }
-
-                streams.insert(
-                    head.stream,
-                    Incoming {
-                        header_block: block.to_vec(),
-                        body: Vec::new(),
-                        end_stream: head.has(flag::END_STREAM),
-                        headers_done: head.has(flag::END_HEADERS),
-                    },
-                );
-                flows.insert(
-                    head.stream,
-                    Rc::new(StreamFlow {
-                        window: Cell::new(peer_initial_window),
-                        reset: Cell::new(false),
-                        done: Cell::new(false),
-                    }),
-                );
-                if !head.has(flag::END_HEADERS) {
+                } else {
                     expect_continuation = Some(head.stream);
                 }
             }
 
             kind::CONTINUATION => {
-                let Some(st) = streams.get_mut(&head.stream) else {
+                if !streams.contains_key(&head.stream) {
                     return Err(ConnErr(Code::Protocol, "CONTINUATION without HEADERS"));
-                };
-                if st.header_block.len() + payload.len() > MAX_HEADER_LIST * 2 {
-                    return Err(ConnErr(Code::Protocol, "header block too large"));
                 }
-                st.header_block.extend_from_slice(&payload);
+                {
+                    let st = streams.get_mut(&head.stream).expect("checked");
+                    if st.pending.len() + payload.len() > MAX_HEADER_LIST * 2 {
+                        return Err(ConnErr(Code::Protocol, "header block too large"));
+                    }
+                    st.pending.extend_from_slice(&payload);
+                }
                 if head.has(flag::END_HEADERS) {
-                    st.headers_done = true;
                     expect_continuation = None;
+                    if let Err(e) = finish_block(&mut dec, &mut streams, head.stream, tx)? {
+                        return Err(e);
+                    }
                 }
             }
 
             kind::PRIORITY => {
-                // Deprecated and ignored, but the length is still checked:
-                // accepting a malformed frame would desynchronise nothing here
-                // yet signals we are not reading the stream properly.
                 if head.len != 5 {
                     return Err(ConnErr(Code::FrameSize, "bad PRIORITY length"));
                 }
                 if head.stream == 0 {
                     return Err(ConnErr(Code::Protocol, "PRIORITY on stream 0"));
                 }
+                let dep = frame::u32_at(&payload, 0).unwrap_or(0) & 0x7fff_ffff;
+                if dep == head.stream {
+                    let mut o = Vec::new();
+                    frame::rst(head.stream, Code::Protocol, &mut o);
+                    let _ = tx.send(o);
+                }
+                // Otherwise deprecated and ignored.
             }
 
             kind::RST_STREAM => {
@@ -406,12 +494,15 @@ where
                 if head.len != 4 {
                     return Err(ConnErr(Code::FrameSize, "bad RST_STREAM length"));
                 }
-                if head.stream > highest_client_stream {
+                if matches!(
+                    state_of(&streams, head.stream, highest_client_stream),
+                    Where::Idle
+                ) {
                     return Err(ConnErr(Code::Protocol, "RST_STREAM on an idle stream"));
                 }
-                streams.remove(&head.stream);
-                if let Some(f) = flows.get(&head.stream) {
-                    f.reset.set(true);
+                if let Some(st) = streams.get_mut(&head.stream) {
+                    st.state = State::Reset;
+                    st.flow.reset.set(true);
                 }
                 flow.wake.notify_waiters();
             }
@@ -424,7 +515,6 @@ where
                     if head.len != 0 {
                         return Err(ConnErr(Code::FrameSize, "SETTINGS ack with payload"));
                     }
-                    settings_acked = true;
                     continue;
                 }
                 if head.len % 6 != 0 {
@@ -452,6 +542,7 @@ where
                                 return Err(ConnErr(Code::Protocol, "bad ENABLE_PUSH"));
                             }
                         }
+                        setting::HEADER_TABLE_SIZE => dec.set_max_size(v as usize),
                         // Unknown settings must be ignored, not refused: that
                         // is how the protocol stays extensible.
                         _ => {}
@@ -461,8 +552,8 @@ where
                 // open stream by the delta — it is not a new absolute value.
                 let delta = peer_initial_window - old_initial;
                 if delta != 0 {
-                    for f in flows.values() {
-                        f.window.set(f.window.get() + delta);
+                    for s in streams.values() {
+                        s.flow.window.set(s.flow.window.get() + delta);
                     }
                     flow.wake.notify_waiters();
                 }
@@ -489,15 +580,20 @@ where
                 if head.len != 4 {
                     return Err(ConnErr(Code::FrameSize, "bad WINDOW_UPDATE length"));
                 }
+                if head.stream != 0
+                    && matches!(
+                        state_of(&streams, head.stream, highest_client_stream),
+                        Where::Idle
+                    )
+                {
+                    return Err(ConnErr(Code::Protocol, "WINDOW_UPDATE on an idle stream"));
+                }
                 let inc = frame::u32_at(&payload, 0).unwrap_or(0) & 0x7fff_ffff;
                 if inc == 0 {
                     if head.stream == 0 {
                         return Err(ConnErr(Code::Protocol, "zero connection window update"));
                     }
-                    let mut o = Vec::new();
-                    frame::rst(head.stream, Code::Protocol, &mut o);
-                    let _ = tx.send(o);
-                    streams.remove(&head.stream);
+                    reset_stream(&mut streams, head.stream, Code::Protocol, tx);
                     continue;
                 }
                 if head.stream == 0 {
@@ -506,20 +602,13 @@ where
                         return Err(ConnErr(Code::FlowControl, "connection window overflow"));
                     }
                     flow.conn_window.set(w);
-                } else if let Some(f) = flows.get(&head.stream) {
-                    // Looked up in `flows`, not `streams`: by the time most
-                    // WINDOW_UPDATEs arrive the request has been dispatched and
-                    // is no longer in the assembly map.
-                    let w = f.window.get() + inc as i64;
+                } else if let Some(s) = streams.get(&head.stream) {
+                    let w = s.flow.window.get() + inc as i64;
                     if w > frame::MAX_WINDOW {
-                        let mut o = Vec::new();
-                        frame::rst(head.stream, Code::FlowControl, &mut o);
-                        let _ = tx.send(o);
-                        streams.remove(&head.stream);
-                        f.reset.set(true);
+                        reset_stream(&mut streams, head.stream, Code::FlowControl, tx);
                         continue;
                     }
-                    f.window.set(w);
+                    s.flow.window.set(w);
                 }
                 flow.wake.notify_waiters();
             }
@@ -540,41 +629,139 @@ where
             _ => {}
         }
 
-        let _ = settings_acked;
-
         // Dispatch anything now complete.
         let ready: Vec<u32> = streams
             .iter()
-            .filter(|(_, s)| s.headers_done && s.end_stream)
+            .filter(|(_, s)| !s.dispatched && s.headers_done && s.state == State::HalfClosedRemote)
             .map(|(id, _)| *id)
             .collect();
         for id in ready {
-            let st = streams.remove(&id).expect("just listed");
-            let headers = match dec.decode_block(&st.header_block) {
-                Ok(h) => h,
-                // A compression error is not recoverable per stream: the
-                // tables are shared, so every later block would decode wrong.
-                Err(HpackError::Compression) => {
-                    return Err(ConnErr(Code::Compression, "hpack error"))
-                }
-                Err(HpackError::TooLarge) => {
-                    let mut o = Vec::new();
-                    frame::rst(id, Code::EnhanceYourCalm, &mut o);
-                    let _ = tx.send(o);
+            let st = streams.get_mut(&id).expect("just listed");
+            st.dispatched = true;
+
+            // RFC 9113 section 8.1.1: a content-length that disagrees with the
+            // body actually sent is malformed. Two intermediaries could read
+            // such a request differently, which is the whole shape of request
+            // smuggling — so it is refused rather than reconciled.
+            if let Some(n) = st.content_length {
+                if n != st.body.len() as u64 {
+                    let sf = st.flow.clone();
+                    sf.done.set(true);
+                    reset_stream(&mut streams, id, Code::Protocol, tx);
                     continue;
                 }
-            };
-            let sf = flows.get(&id).cloned().unwrap_or_else(|| {
-                Rc::new(StreamFlow {
-                    window: Cell::new(peer_initial_window),
-                    reset: Cell::new(false),
-                    done: Cell::new(false),
-                })
-            });
-            spawn_stream(id, headers, st, sf, shared, flow, tx.clone());
+            }
+
+            let headers = std::mem::take(&mut st.headers);
+            let body = std::mem::take(&mut st.body);
+            let sf = st.flow.clone();
+            spawn_stream(id, headers, body, sf, shared, flow, tx.clone());
         }
     }
 }
+
+/// Where a stream id sits, which decides whether a stray frame is the
+/// stream's problem or the connection's.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Where {
+    /// Never opened. There is no stream to blame, so errors are connection
+    /// errors.
+    Idle,
+    Open,
+    /// The peer said END_STREAM; it may not send more.
+    HalfClosed,
+    /// Finished normally.
+    Closed,
+    /// We sent RST_STREAM. Frames may still be in flight from before the peer
+    /// saw it, so this is treated more leniently than `Closed`.
+    Reset,
+}
+
+fn state_of(streams: &HashMap<u32, Stream>, id: u32, highest: u32) -> Where {
+    match streams.get(&id) {
+        Some(s) => match s.state {
+            State::Open => Where::Open,
+            State::HalfClosedRemote if s.dispatched => Where::Closed,
+            State::HalfClosedRemote => Where::HalfClosed,
+            State::Reset => Where::Reset,
+        },
+        // Pruned entries were dispatched and finished, so a higher-or-equal id
+        // that is absent is closed rather than idle.
+        None if id <= highest => Where::Closed,
+        None => Where::Idle,
+    }
+}
+
+/// Resets a stream and records that we did, so a DATA frame the peer had
+/// already sent is not then treated as a connection error.
+fn reset_stream(
+    streams: &mut HashMap<u32, Stream>,
+    id: u32,
+    code: Code,
+    tx: &mpsc::UnboundedSender<Vec<u8>>,
+) {
+    let mut o = Vec::new();
+    frame::rst(id, code, &mut o);
+    let _ = tx.send(o);
+    if let Some(s) = streams.get_mut(&id) {
+        s.state = State::Reset;
+        s.flow.reset.set(true);
+        s.flow.done.set(true);
+    }
+}
+
+/// Decodes a completed header block.
+///
+/// Decoding happens the moment END_HEADERS arrives rather than at dispatch,
+/// because HPACK is a running conversation: blocks must be decoded in the
+/// order they arrived on the connection. Deferring meant another stream's
+/// block could be decoded in between, and trailers were never decoded at all —
+/// both leave the two ends with different dynamic tables, after which every
+/// later header decodes to something neither side sent.
+#[allow(clippy::type_complexity)]
+fn finish_block(
+    dec: &mut hpack::Decoder,
+    streams: &mut HashMap<u32, Stream>,
+    id: u32,
+    tx: &mpsc::UnboundedSender<Vec<u8>>,
+) -> Result<Result<(), ConnErr>, ConnErr> {
+    let Some(st) = streams.get_mut(&id) else { return Ok(Ok(())) };
+    let block = std::mem::take(&mut st.pending);
+    let trailers = st.pending_is_trailers;
+
+    let mut out = Vec::with_capacity(16);
+    match dec.decode(&block, MAX_HEADER_LIST, &mut out) {
+        Ok(()) => {}
+        // Not recoverable per stream: the tables are shared, so every later
+        // block on this connection would decode wrong.
+        Err(HpackError::Compression) => {
+            return Err(ConnErr(Code::Compression, "hpack decoding error"))
+        }
+        Err(HpackError::TooLarge) => {
+            reset_stream(streams, id, Code::EnhanceYourCalm, tx);
+            return Ok(Ok(()));
+        }
+    }
+
+    if trailers {
+        // RFC 9113 section 8.1: trailers carry no pseudo-header fields. The
+        // block was still decoded above, because skipping it would desync the
+        // HPACK table even though we discard the result.
+        if out.iter().any(|h| h.name.starts_with(':')) {
+            reset_stream(streams, id, Code::Protocol, tx);
+        }
+        return Ok(Ok(()));
+    }
+
+    st.content_length = out
+        .iter()
+        .find(|h| h.name == "content-length")
+        .and_then(|h| h.value.parse::<u64>().ok());
+    st.headers = out;
+    st.headers_done = true;
+    Ok(Ok(()))
+}
+
 
 type R2 = Result<(), ConnErr>;
 
@@ -589,20 +776,12 @@ fn replenish(recv_window: &mut i64, tx: &mpsc::UnboundedSender<Vec<u8>>) {
     }
 }
 
-impl hpack::Decoder {
-    fn decode_block(&mut self, block: &[u8]) -> Result<Vec<hpack::Header>, HpackError> {
-        let mut out = Vec::with_capacity(16);
-        self.decode(block, MAX_HEADER_LIST, &mut out)?;
-        Ok(out)
-    }
-}
-
 /// Turns a decoded header list into a request and runs it.
 #[allow(clippy::too_many_arguments)]
 fn spawn_stream(
     id: u32,
     headers: Vec<hpack::Header>,
-    st: Incoming,
+    req_body: Vec<u8>,
     sflow: Rc<StreamFlow>,
     shared: &Task,
     flow: &Rc<Flow>,
@@ -632,8 +811,8 @@ fn spawn_stream(
         };
 
         let (buf, mut req) = Req::from_parts(&parsed.method, &parsed.path, &parsed.headers());
-        if !st.body.is_empty() {
-            req.body = ReqBody::Length(st.body.len() as u64);
+        if !req_body.is_empty() {
+            req.body = ReqBody::Length(req_body.len() as u64);
         }
 
         let server: &Arc<ServerConf> = listener.match_host(&parsed.authority);
@@ -648,7 +827,7 @@ fn spawn_stream(
         };
 
         let mut ctx = Ctx::new(
-            &buf, &req, &st.body, &http, server, normalised, remote, local, scheme, conn_id, id
+            &buf, &req, &req_body, &http, server, normalised, remote, local, scheme, conn_id, id
                 as u64,
         );
 
