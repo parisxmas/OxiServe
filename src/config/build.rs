@@ -288,6 +288,9 @@ struct CoreLayer {
     fcgi_read_timeout: Option<Duration>,
     fcgi_send_timeout: Option<Duration>,
     fcgi_keep_conn: Option<bool>,
+    fcgi_buffering: Option<bool>,
+    fcgi_buffer_size: Option<usize>,
+    fcgi_buffers: Option<usize>,
     fcgi_hide_headers: Option<Vec<Box<str>>>,
     cache_zone: Option<Option<Arc<str>>>,
     cache_key: Option<Arc<Template>>,
@@ -437,6 +440,9 @@ impl CoreLayer {
             || self.fcgi_read_timeout.is_some()
             || self.fcgi_send_timeout.is_some()
             || self.fcgi_keep_conn.is_some()
+            || self.fcgi_buffering.is_some()
+            || self.fcgi_buffer_size.is_some()
+            || self.fcgi_buffers.is_some()
             || self.fcgi_hide_headers.is_some()
         {
             let mut f = (*c.fastcgi).clone();
@@ -462,6 +468,16 @@ impl CoreLayer {
             }
             if let Some(v) = self.fcgi_keep_conn {
                 f.keep_conn = v;
+            }
+            if let Some(v) = self.fcgi_buffering {
+                f.buffering = v;
+            }
+            // nginx expresses the budget as a count times a size; either
+            // directive alone adjusts one factor of the same product.
+            if self.fcgi_buffer_size.is_some() || self.fcgi_buffers.is_some() {
+                let size = self.fcgi_buffer_size.unwrap_or(8 * 1024);
+                let count = self.fcgi_buffers.unwrap_or(8);
+                f.buffer_budget = size.saturating_mul(count).max(4 * 1024);
             }
             if let Some(v) = &self.fcgi_hide_headers {
                 f.hide_headers = v.clone();
@@ -1442,8 +1458,17 @@ impl Builder {
                     .get_or_insert_with(Vec::new)
                     .push(d.args[0].to_ascii_lowercase().into_boxed_str());
             }
-            "fastcgi_buffering" | "fastcgi_buffers" | "fastcgi_buffer_size"
-            | "fastcgi_busy_buffers_size" | "fastcgi_next_upstream"
+            "fastcgi_buffering" => c.fcgi_buffering = Some(flag(d)?),
+            "fastcgi_buffer_size" => c.fcgi_buffer_size = Some(size_arg(d, 0)? as usize),
+            "fastcgi_buffers" => {
+                want_args(d, 2)?;
+                let n: usize = d.args[0].parse().map_err(|_| BuildError {
+                    msg: format!("invalid number of buffers \"{}\"", d.args[0]),
+                    loc: format!("line {}", d.line),
+                })?;
+                c.fcgi_buffers = Some(n.max(2));
+            }
+            "fastcgi_busy_buffers_size" | "fastcgi_next_upstream"
             | "fastcgi_intercept_errors" | "fastcgi_request_buffering"
             | "fastcgi_temp_file_write_size" | "fastcgi_max_temp_file_size"
             | "fastcgi_ignore_headers" | "fastcgi_pass_header" => {}

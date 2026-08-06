@@ -121,6 +121,16 @@ automatic recovery), `backup` failover, weighted round-robin, real
 `keepalive` pool that probes a connection for liveness before reusing it.
 Health is shared across workers; the pool is per worker.
 
+**FastCGI** — `fastcgi_pass` over TCP or a Unix socket, with
+`fastcgi_split_path_info`, `fastcgi_index` and the CGI `Status:` / bare
+`Location:` rules. A response is collected whole while it fits
+`fastcgi_buffers × fastcgi_buffer_size` (64 KB by default), which is what lets
+it carry a `Content-Length`; past that it is forwarded as it arrives and the
+transfer is chunked. `fastcgi_buffering off` forwards from the first byte
+regardless. An application that declares its own `Content-Length` keeps it
+either way — it is the only party that knows the length of something we never
+hold.
+
 **Signals** — `-s stop | quit | reload | reopen`, found through the `pid` file
 the configuration names, so a host running two servers signals the right one.
 
@@ -257,8 +267,6 @@ regex captures `$1`–`$9`.
   **`Upgrade: h2c`** (the deprecated cleartext upgrade — prior-knowledge h2c
   works).
 - **uwsgi / SCGI / gRPC** — `uwsgi_pass` and friends (FastCGI *is* supported).
-- **FastCGI response streaming** — responses are fully buffered
-  (`fastcgi_buffering on`, capped at 64 MB) rather than streamed.
 - **`proxy_cache_background_update` / `proxy_cache_revalidate`** — parsed and
   ignored; a refresh is always a full fetch, never a conditional revalidation.
 - **`limit_conn`** connection limiting (`limit_req` is implemented).

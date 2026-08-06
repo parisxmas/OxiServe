@@ -418,7 +418,7 @@ pub struct FastCgiPass {
     pub target: ProxyTarget,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FastCgiConf {
     /// `fastcgi_param NAME value [if_not_empty]`, in configuration order.
     pub params: Vec<FastCgiParam>,
@@ -433,6 +433,39 @@ pub struct FastCgiConf {
     /// `fastcgi_keep_conn` — ask the application not to close the connection.
     pub keep_conn: bool,
     pub hide_headers: Vec<Box<str>>,
+    /// `fastcgi_buffering` — with it off, the response is forwarded as it
+    /// arrives instead of being collected first.
+    pub buffering: bool,
+    /// Total bytes of response body worth collecting before giving up on
+    /// buffering and streaming the rest, from `fastcgi_buffers` ×
+    /// `fastcgi_buffer_size`.
+    ///
+    /// Buffering a whole response is what lets us send a `Content-Length`; a
+    /// response that outgrows this becomes chunked, which is the trade nginx
+    /// makes at the same point.
+    pub buffer_budget: usize,
+}
+
+impl Default for FastCgiConf {
+    /// Written out rather than derived: `bool` derives to `false` and `usize`
+    /// to `0`, which would have turned buffering off for every configuration
+    /// that never mentions it and made the budget zero — streaming everything,
+    /// silently, as a "default".
+    fn default() -> FastCgiConf {
+        FastCgiConf {
+            params: Vec::new(),
+            index: None,
+            split_path_info: None,
+            connect_timeout: None,
+            read_timeout: None,
+            send_timeout: None,
+            keep_conn: false,
+            hide_headers: Vec::new(),
+            buffering: true,
+            // nginx's `fastcgi_buffers 8 8k` on a 64-bit page size.
+            buffer_budget: 64 * 1024,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

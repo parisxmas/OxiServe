@@ -26,9 +26,17 @@ const HOP_BY_HOP: &[&str] = &[
     "content-length", // we re-frame from the body we actually buffered
 ];
 
-/// Cap on a buffered response body. `fastcgi_buffering` is always on for now,
-/// so a runaway application cannot exhaust the worker's memory silently.
+/// Absolute cap on a buffered response body.
+///
+/// Reached only when an application keeps a single record stream open past
+/// every other bound; ordinary large responses switch to streaming at
+/// `fastcgi_buffers × fastcgi_buffer_size` long before this.
 const MAX_RESPONSE: usize = 64 * 1024 * 1024;
+
+/// A CGI header block larger than this is not a header block. Bounded
+/// separately from the body because the headers must be collected whole
+/// before anything can be streamed.
+const MAX_HEADERS: usize = 256 * 1024;
 
 pub async fn fastcgi(
     ctx: &mut Ctx<'_>,
@@ -82,22 +90,30 @@ pub async fn fastcgi(
     }
     let _ = sock.flush().await;
 
-    let (stdout, app_status) = read_response(&mut sock, conf).await?;
-    ctx.upstream_time = started.elapsed().as_secs_f64();
-
-    // A non-zero application status with no output is a crashed script.
-    if stdout.is_empty() {
-        if app_status != 0 {
-            return Err(502);
+    match read_response(sock, conf).await? {
+        Collected::Complete { stdout, app_status } => {
+            ctx.upstream_time = started.elapsed().as_secs_f64();
+            // A non-zero application status with no output is a crashed script.
+            if stdout.is_empty() {
+                if app_status != 0 {
+                    return Err(502);
+                }
+                // An empty but successful response is legal (e.g. a 204).
+                let mut resp = Resp::new();
+                ctx.upstream_status = 200;
+                resp.status = 200;
+                return Ok(Reply::new(resp, Body::Empty));
+            }
+            build_reply(ctx, conf, stdout)
         }
-        // An empty but successful response is legal (e.g. a 204).
-        let mut resp = Resp::new();
-        ctx.upstream_status = 200;
-        resp.status = 200;
-        return Ok(Reply::new(resp, Body::Empty));
+        Collected::Streaming { head, pre, reader } => {
+            // The clock stops at the headers, as it does for a proxied
+            // response: the rest is the client's transfer, not the
+            // application's think time.
+            ctx.upstream_time = started.elapsed().as_secs_f64();
+            build_streaming_reply(ctx, conf, head, pre, reader)
+        }
     }
-
-    build_reply(ctx, conf, stdout)
 }
 
 /// Applies `fastcgi_split_path_info`, filling `$fastcgi_script_name` and
@@ -171,66 +187,239 @@ fn build_params(ctx: &Ctx<'_>, conf: &FastCgiConf) -> Vec<u8> {
 ///
 /// `STDERR` is drained and discarded rather than mixed into the response —
 /// applications log to it, and folding that into the page would corrupt output.
-async fn read_response(
-    sock: &mut Stream,
-    conf: &FastCgiConf,
-) -> Result<(Vec<u8>, u32), u16> {
+/// What the response turned out to be.
+enum Collected {
+    /// The whole thing arrived: headers and body, with the request ended.
+    /// This is the ordinary case for a page, and the only one that can carry
+    /// a `Content-Length`.
+    Complete { stdout: Vec<u8>, app_status: u32 },
+    /// Headers are in hand and more body is still coming. The connection goes
+    /// with it — the rest is decoded as the client reads.
+    Streaming { head: Vec<u8>, pre: Vec<u8>, reader: FcgiBody },
+}
+
+/// Reads until the response is complete, or until it is clear it will not be.
+///
+/// Buffering the whole response is what lets us send a `Content-Length`, so it
+/// is worth doing for anything that fits. Past `fastcgi_buffers ×
+/// fastcgi_buffer_size` the trade inverts: holding a 200 MB export in memory
+/// to save the client a chunked encoding is how a worker dies. nginx switches
+/// at the same point.
+async fn read_response(sock: Stream, conf: &FastCgiConf) -> Result<Collected, u16> {
     let read_to = conf.read_timeout.unwrap_or(Duration::from_secs(60));
-    let mut buf = Vec::with_capacity(16 * 1024);
-    let mut stdout = Vec::with_capacity(16 * 1024);
-    let mut app_status = 0u32;
-    let mut consumed = 0usize;
+    let mut r = FcgiBody::new(sock, read_to);
+    let mut stdout: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut head_end: Option<usize> = None;
 
     loop {
-        // Drain every complete record currently buffered.
+        match r.pump(&mut stdout).await? {
+            Pump::Ended => {
+                return Ok(Collected::Complete { stdout, app_status: r.app_status })
+            }
+            Pump::More => {}
+        }
+
+        if head_end.is_none() {
+            head_end = find_header_end(&stdout).map(|(_, at)| at);
+        }
+        // Only stream once the headers are complete: they are what the reply
+        // is built from, and a half-read header block is not a response.
+        let Some(at) = head_end else {
+            // A header block this large is not a header block.
+            if stdout.len() > MAX_HEADERS {
+                return Err(502);
+            }
+            continue;
+        };
+        let over_budget = stdout.len() - at > conf.buffer_budget;
+        if !conf.buffering || over_budget {
+            let pre = stdout.split_off(at);
+            return Ok(Collected::Streaming { head: stdout, pre, reader: r });
+        }
+        if stdout.len() > MAX_RESPONSE {
+            return Err(502);
+        }
+    }
+}
+
+enum Pump {
+    /// Some progress; call again.
+    More,
+    /// `FCGI_END_REQUEST`, or the peer closed.
+    Ended,
+}
+
+/// Decodes `FCGI_STDOUT` out of a FastCGI connection.
+///
+/// Doubles as the body of a streamed response: [`AsyncRead`] hands the client
+/// the payload bytes with the record framing removed, which is why the
+/// connection travels into the [`Body::Stream`] rather than being drained
+/// first.
+pub struct FcgiBody {
+    sock: Stream,
+    /// Bytes read from the socket that have not been parsed into records yet.
+    raw: Vec<u8>,
+    /// How much of `raw` has been parsed.
+    consumed: usize,
+    /// Decoded payload the caller has not taken yet.
+    out: Vec<u8>,
+    out_at: usize,
+    app_status: u32,
+    done: bool,
+    read_to: Duration,
+}
+
+impl FcgiBody {
+    fn new(sock: Stream, read_to: Duration) -> FcgiBody {
+        FcgiBody {
+            sock,
+            raw: Vec::with_capacity(16 * 1024),
+            consumed: 0,
+            out: Vec::new(),
+            out_at: 0,
+            app_status: 0,
+            done: false,
+            read_to,
+        }
+    }
+
+    /// Parses whatever is buffered, appending payload to `sink`.
+    ///
+    /// Returns whether the request ended. Malformed framing is fatal: a record
+    /// stream we cannot follow leaves no way to tell payload from padding.
+    fn drain_records(&mut self, sink: &mut Vec<u8>) -> Result<bool, u16> {
         loop {
-            match p::parse_record(&buf[consumed..]) {
+            match p::parse_record(&self.raw[self.consumed..]) {
                 Ok(rec) => {
                     match rec.ty {
-                        p::RecordType::Stdout => {
-                            if stdout.len() + rec.body.len() > MAX_RESPONSE {
-                                return Err(502);
-                            }
-                            stdout.extend_from_slice(rec.body);
-                        }
+                        p::RecordType::Stdout => sink.extend_from_slice(rec.body),
                         p::RecordType::Stderr => { /* application log; not ours */ }
                         p::RecordType::EndRequest => {
                             if let Some((app, proto)) = p::end_request_status(rec.body) {
-                                app_status = app;
+                                self.app_status = app;
                                 // Anything but FCGI_REQUEST_COMPLETE (0) means
                                 // the application refused the request.
                                 if proto != 0 {
                                     return Err(502);
                                 }
                             }
-                            return Ok((stdout, app_status));
+                            self.consumed += rec.total;
+                            self.done = true;
+                            return Ok(true);
                         }
                         _ => {}
                     }
-                    consumed += rec.total;
+                    self.consumed += rec.total;
                 }
-                Err(p::ParseError::Incomplete) => break,
+                Err(p::ParseError::Incomplete) => return Ok(false),
                 Err(p::ParseError::Malformed) => return Err(502),
             }
         }
+    }
 
-        // Compact so the buffer does not grow without bound on long responses.
-        if consumed > 0 {
-            buf.drain(..consumed);
-            consumed = 0;
+    fn compact(&mut self) {
+        if self.consumed > 0 {
+            self.raw.drain(..self.consumed);
+            self.consumed = 0;
         }
+    }
+
+    /// One read plus a parse pass, for the header-collection phase.
+    async fn pump(&mut self, sink: &mut Vec<u8>) -> Result<Pump, u16> {
+        if self.drain_records(sink)? {
+            return Ok(Pump::Ended);
+        }
+        self.compact();
 
         let mut chunk = [0u8; 16 * 1024];
-        let n = match tokio::time::timeout(read_to, sock.read(&mut chunk)).await {
+        let n = match tokio::time::timeout(self.read_to, self.sock.read(&mut chunk)).await {
             Ok(Ok(0)) => {
-                // Closed before END_REQUEST. If output arrived, use it.
-                return if stdout.is_empty() { Err(502) } else { Ok((stdout, app_status)) };
+                // Closed before END_REQUEST. Whatever arrived is the response;
+                // the caller decides whether that is enough.
+                self.done = true;
+                return Ok(Pump::Ended);
             }
             Ok(Ok(n)) => n,
             Ok(Err(_)) => return Err(502),
             Err(_) => return Err(504),
         };
-        buf.extend_from_slice(&chunk[..n]);
+        self.raw.extend_from_slice(&chunk[..n]);
+        if self.drain_records(sink)? {
+            return Ok(Pump::Ended);
+        }
+        Ok(Pump::More)
+    }
+}
+
+impl tokio::io::AsyncRead for FcgiBody {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::task::Poll;
+        let me = self.get_mut();
+        loop {
+            // Hand over anything already decoded.
+            if me.out_at < me.out.len() {
+                let n = (me.out.len() - me.out_at).min(buf.remaining());
+                buf.put_slice(&me.out[me.out_at..me.out_at + n]);
+                me.out_at += n;
+                if me.out_at == me.out.len() {
+                    me.out.clear();
+                    me.out_at = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
+            if me.done {
+                // Zero filled: end of body.
+                return Poll::Ready(Ok(()));
+            }
+
+            // Parse whatever is already buffered before touching the socket.
+            let mut decoded = std::mem::take(&mut me.out);
+            decoded.clear();
+            match me.drain_records(&mut decoded) {
+                Ok(_) => {}
+                Err(_) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "malformed FastCGI record",
+                    )))
+                }
+            }
+            me.out = decoded;
+            me.compact();
+            if !me.out.is_empty() || me.done {
+                continue;
+            }
+
+            // Nothing decodable yet: read more.
+            let before = me.raw.len();
+            me.raw.resize(before + 16 * 1024, 0);
+            let mut rb = tokio::io::ReadBuf::new(&mut me.raw[before..]);
+            match std::pin::Pin::new(&mut me.sock).poll_read(cx, &mut rb) {
+                Poll::Pending => {
+                    me.raw.truncate(before);
+                    return Poll::Pending;
+                }
+                Poll::Ready(Err(e)) => {
+                    me.raw.truncate(before);
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Ready(Ok(())) => {
+                    let n = rb.filled().len();
+                    me.raw.truncate(before + n);
+                    if n == 0 {
+                        // The peer closed without END_REQUEST. There is no way
+                        // to signal truncation once the head is already on the
+                        // wire, so the body simply ends here — the same thing
+                        // the proxy path does for a length-less upstream.
+                        me.done = true;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -241,16 +430,57 @@ fn build_reply(ctx: &mut Ctx<'_>, conf: &FastCgiConf, stdout: Vec<u8>) -> Result
         // mid-header. Either way it is not a valid CGI response.
         return Err(502);
     };
+    let (resp, _) = parse_cgi_headers(ctx, conf, &stdout[..head_len]);
+    let body = stdout[body_at..].to_vec();
+    Ok(Reply::new(resp, Body::Bytes(body)))
+}
 
+/// The same response, when the body is still arriving.
+///
+/// The only difference that reaches the client is framing: a buffered response
+/// can carry a `Content-Length` computed from what we hold, a streamed one
+/// cannot, so it goes out chunked unless the application declared a length
+/// itself — which `Reply::frame` works out from the headers.
+fn build_streaming_reply(
+    ctx: &mut Ctx<'_>,
+    conf: &FastCgiConf,
+    head: Vec<u8>,
+    pre: Vec<u8>,
+    reader: FcgiBody,
+) -> Result<Reply, u16> {
+    let Some((head_len, _)) = find_header_end(&head) else {
+        return Err(502);
+    };
+    // An application that declared its own length is taken at its word: it is
+    // the only party that knows, and nginx trusts it the same way. Without one
+    // the length is unknown and framing falls to chunked.
+    let (resp, len) = parse_cgi_headers(ctx, conf, &head[..head_len]);
+    Ok(Reply::new(resp, Body::Stream { pre, io: Box::new(reader), len }))
+}
+
+/// Maps a CGI header block onto an HTTP response head.
+fn parse_cgi_headers(
+    ctx: &mut Ctx<'_>,
+    conf: &FastCgiConf,
+    head: &[u8],
+) -> (Resp, Option<u64>) {
     let mut resp = Resp::new();
     let mut status = 200u16;
     let mut saw_location_only = false;
+    // Captured before the hop-by-hop filter drops it. A buffered response
+    // re-frames from the bytes actually held, so the application's own value
+    // is redundant there — but a streamed one has no other way to know a
+    // length the application already worked out.
+    let mut declared_len = None;
 
-    for line in split_lines(&stdout[..head_len]) {
+    for line in split_lines(head) {
         let Some((name, value)) = split_header(line) else {
             continue;
         };
         let lname = name.to_ascii_lowercase();
+        if lname == "content-length" {
+            declared_len = value.trim().parse::<u64>().ok();
+        }
 
         // `Status: 404 Not Found` sets the HTTP status and is not forwarded.
         if lname == "status" {
@@ -279,13 +509,9 @@ fn build_reply(ctx: &mut Ctx<'_>, conf: &FastCgiConf, stdout: Vec<u8>) -> Result
 
     resp.status = status;
     ctx.upstream_status = status;
-
-    let body = stdout[body_at..].to_vec();
-    Ok(Reply::new(resp, Body::Bytes(body)))
+    (resp, declared_len)
 }
 
-/// Finds the blank line ending the header block, tolerating both `\r\n\r\n`
-/// and bare `\n\n` — applications emit both.
 fn find_header_end(b: &[u8]) -> Option<(usize, usize)> {
     let mut i = 0;
     while i < b.len() {

@@ -131,6 +131,49 @@ fn read_len(b: &[u8]) -> (usize, &[u8]) {
 }
 
 /// Starts a mock responder; returns its port and a receiver of captured requests.
+/// A backend that sends its headers, then dribbles the body out over time.
+///
+/// The all-at-once mock cannot tell buffering from streaming: whatever the
+/// server does internally, the client sees the same bytes at the same moment.
+/// Only a response that arrives slowly shows whether the server forwarded it
+/// as it came or waited for the end.
+fn start_fcgi_trickle(head: &'static str, chunk: &'static [u8], chunks: usize, gap: Duration) -> u16 {
+    let p = port();
+    let l = TcpListener::bind(("127.0.0.1", p)).unwrap();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut s = c;
+                // Read the request far enough to see the empty STDIN that ends
+                // it, then answer.
+                let mut buf = [0u8; 8192];
+                let _ = s.read(&mut buf);
+                let mut first = Vec::new();
+                push_rec(&mut first, 6, head.as_bytes());
+                if s.write_all(&first).is_err() {
+                    return;
+                }
+                let _ = s.flush();
+                for _ in 0..chunks {
+                    std::thread::sleep(gap);
+                    let mut r = Vec::new();
+                    push_rec(&mut r, 6, chunk);
+                    if s.write_all(&r).is_err() {
+                        return;
+                    }
+                    let _ = s.flush();
+                }
+                let mut end = Vec::new();
+                push_rec(&mut end, 6, &[]);
+                push_rec(&mut end, 3, &[0u8; 8]);
+                let _ = s.write_all(&end);
+                let _ = s.flush();
+            });
+        }
+    });
+    p
+}
+
 fn start_fcgi(
     reply: impl Fn(&FcgiRequest) -> Vec<u8> + Send + Clone + 'static,
 ) -> (u16, mpsc::Receiver<Vec<(String, String)>>) {
@@ -428,11 +471,117 @@ fn large_response_survives_record_splitting() {
         v
     });
     let s = Server::start("big", &conf(fp, ""), &[]);
-    let (status, h, body) = s.get("/big.php");
+    let (status, _h, body) = s.get("/big.php");
     assert_eq!(status, 200);
-    assert_eq!(header(&h, "Content-Length"), Some("200000"));
     assert_eq!(body.len(), 200_000);
     assert!(body.bytes().all(|b| b == b'z'));
+}
+
+/// A response that fits the buffer budget is still collected whole, which is
+/// what lets it carry a `Content-Length`. Streaming everything would have cost
+/// that for every ordinary page.
+#[test]
+fn a_response_within_the_buffer_budget_keeps_its_content_length() {
+    let (fp, _rx) = start_fcgi(|_| {
+        let mut v = b"Content-Type: text/plain\r\n\r\n".to_vec();
+        v.extend(std::iter::repeat(b'y').take(1000));
+        v
+    });
+    let s = Server::start("small", &conf(fp, ""), &[]);
+    let (status, h, body) = s.get("/small.php");
+    assert_eq!(status, 200);
+    assert_eq!(header(&h, "Content-Length"), Some("1000"));
+    assert_eq!(header(&h, "Transfer-Encoding"), None);
+    assert_eq!(body.len(), 1000);
+}
+
+/// Past the budget the response is forwarded as it arrives, so there is no
+/// length to declare and the transfer is chunked. Holding a large export in
+/// memory to avoid that is how a worker runs out of it.
+#[test]
+fn a_response_past_the_buffer_budget_is_streamed_chunked() {
+    // ASCII, because the harness hands the body back as a `String` and binary
+    // would come back through a lossy conversion rather than as itself.
+    let want: String = (0..300_000u32).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+    let payload = want.clone();
+    let (fp, _rx) = start_fcgi(move |_| {
+        let mut v = b"Content-Type: text/plain\r\n\r\n".to_vec();
+        v.extend_from_slice(payload.as_bytes());
+        v
+    });
+    let s = Server::start("stream", &conf(fp, ""), &[]);
+    let (status, h, body) = s.get("/export.php");
+    assert_eq!(status, 200);
+    assert_eq!(header(&h, "Content-Length"), None, "a streamed body has no known length");
+    assert_eq!(header(&h, "Transfer-Encoding"), Some("chunked"));
+    assert_eq!(body.len(), want.len());
+    assert_eq!(body, want, "the streamed body must be byte-exact");
+}
+
+/// An application that declares its own length keeps it even when streamed —
+/// the client gets a real `Content-Length` and no chunking.
+#[test]
+fn a_declared_content_length_survives_streaming() {
+    let (fp, _rx) = start_fcgi(|_| {
+        let mut v = b"Content-Type: text/plain\r\nContent-Length: 300000\r\n\r\n".to_vec();
+        v.extend(std::iter::repeat(b'q').take(300_000));
+        v
+    });
+    let s = Server::start("declared", &conf(fp, ""), &[]);
+    let (status, h, body) = s.get("/declared.php");
+    assert_eq!(status, 200);
+    assert_eq!(header(&h, "Content-Length"), Some("300000"));
+    assert_eq!(header(&h, "Transfer-Encoding"), None);
+    assert_eq!(body.len(), 300_000);
+}
+
+/// The property streaming exists for: bytes reach the client while the
+/// application is still producing them.
+///
+/// The backend holds each chunk back, so a server that buffered would deliver
+/// nothing until the last one. Timing is the only way to see the difference —
+/// the bytes themselves are identical either way.
+#[test]
+fn buffering_off_forwards_the_body_as_it_arrives() {
+    let gap = Duration::from_millis(250);
+    let chunks = 6;
+    let fp = start_fcgi_trickle("Content-Type: text/plain\r\n\r\n", b"0123456789", chunks, gap);
+    let s = Server::start("trickle", &conf(fp, "fastcgi_buffering off;"), &[]);
+
+    let started = Instant::now();
+    let mut c = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    c.write_all(b"GET /t.php HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+
+    // Read until the first body byte appears past the head.
+    let mut seen = Vec::new();
+    let mut first_body_at = None;
+    let mut buf = [0u8; 4096];
+    while first_body_at.is_none() {
+        let n = c.read(&mut buf).expect("read");
+        if n == 0 {
+            break;
+        }
+        seen.extend_from_slice(&buf[..n]);
+        if let Some(i) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+            if seen.len() > i + 4 {
+                first_body_at = Some(started.elapsed());
+            }
+        }
+    }
+    let first = first_body_at.expect("no body arrived");
+    let total = gap * chunks as u32;
+    assert!(
+        first < total / 2,
+        "first body bytes took {first:?}; the backend takes {total:?} in total, so this was buffered"
+    );
+
+    // And the whole thing still arrives intact.
+    let _ = c.read_to_end(&mut seen);
+    let text = String::from_utf8_lossy(&seen);
+    let body_at = text.find("\r\n\r\n").unwrap() + 4;
+    let got: String = text[body_at..].chars().filter(|c| c.is_ascii_digit()).collect();
+    assert_eq!(got.len(), 10 * chunks, "every chunk must arrive: {got:?}");
 }
 
 #[test]
