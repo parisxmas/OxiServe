@@ -63,13 +63,28 @@ pub async fn handle(ctx: &mut Ctx<'_>) -> Reply {
     }
 
     let mut named: Option<Arc<str>> = None;
-    let mut internal = false;
+    // An `auth_request` subrequest counts as internal from its first routing
+    // pass. The auth location is almost always marked `internal;` — that is
+    // what keeps clients from calling the authoriser directly — so entering it
+    // as an outside request would 404 every time and turn every verdict into a
+    // 500.
+    let mut internal = ctx.auth_depth > 0;
     let mut status_override: Option<u16> = None;
 
     loop {
         let step = match &named {
             Some(n) => match ctx.server.locations.named.get(&**n) {
-                Some(loc) => dispatch(ctx, &loc.clone(), true).await,
+                Some(loc) => {
+                    let loc = loc.clone();
+                    // `route` records the matched location for everything that
+                    // reads it afterwards — `add_header`, `expires`,
+                    // `$document_root`. Jumping straight to a named location
+                    // skipped that, so a `@name` reached by `error_page` was
+                    // decorated with the *server's* directives instead of its
+                    // own and its `add_header` silently did nothing.
+                    ctx.matched = Some(loc.clone());
+                    dispatch(ctx, &loc, true).await
+                }
                 None => Step::Fail(500),
             },
             None => route(ctx, internal).await,
@@ -240,6 +255,15 @@ async fn dispatch(ctx: &mut Ctx<'_>, loc: &Arc<Location>, internal: bool) -> Ste
         }
     }
 
+    // Authorisation runs before any content work — that is the whole point of
+    // delegating it — but after `limit_except`, so a method that is not
+    // allowed here is refused without bothering the auth service.
+    if let Some(uri) = &loc.core.auth_request {
+        if let Err(code) = run_auth_request(ctx, uri, &loc.core).await {
+            return Step::Fail(code);
+        }
+    }
+
     if let Some(step) = run_rewrites(ctx, &loc.rewrites) {
         match step {
             Step::Internal(_) | Step::Named(_) | Step::Done(_) | Step::Fail(_) => return step,
@@ -267,6 +291,84 @@ async fn dispatch(ctx: &mut Ctx<'_>, loc: &Arc<Location>, internal: bool) -> Ste
             Err(c) => Step::Fail(c),
         },
         Action::Static => served_to_step(files::serve(ctx, Some(loc)).await),
+    }
+}
+
+/// Runs an `auth_request` subrequest and decides whether to continue.
+///
+/// The subrequest is a fresh `GET` at the configured URI carrying the client's
+/// headers and **no body**: the authorisation service is being asked about the
+/// request, not asked to process it, and streaming a 2 GB upload past it would
+/// be absurd. nginx makes the same choice.
+///
+/// `2xx` continues. `401` and `403` are returned to the client as they stand —
+/// they are the service's answer, not our error. Anything else is a `500`,
+/// because an authorisation service that cannot say yes or no has failed, and
+/// failing open would be the one truly unacceptable outcome.
+async fn run_auth_request(
+    ctx: &mut Ctx<'_>,
+    uri: &str,
+    core: &CoreConf,
+) -> Result<(), u16> {
+    // An auth location that itself requires authorisation would recurse until
+    // the stack ran out.
+    if ctx.auth_depth > 0 {
+        return Err(500);
+    }
+
+    // The client's headers travel with the subrequest — cookies and
+    // `Authorization` are usually the whole basis for the decision — but never
+    // the framing of a body that is not being sent.
+    let mut headers: Vec<(&str, &str)> = Vec::with_capacity(ctx.req.headers.len());
+    for h in &ctx.req.headers {
+        let name = ctx.req.slice(ctx.buf, &h.name);
+        let lower = name.to_ascii_lowercase();
+        if matches!(lower.as_str(), "content-length" | "transfer-encoding" | "expect") {
+            continue;
+        }
+        headers.push((name, ctx.req.slice(ctx.buf, &h.value)));
+    }
+
+    let (buf, req) = crate::http::request::Req::from_parts("GET", uri, &headers);
+    let normalised = match crate::http::uri::normalize(req.path_str(&buf)) {
+        Ok(u) => u,
+        Err(_) => return Err(500),
+    };
+
+    let reply = {
+        let mut sub = Ctx::new(
+            &buf,
+            &req,
+            &[],
+            ctx.http,
+            ctx.server,
+            normalised,
+            ctx.remote,
+            ctx.local,
+            ctx.scheme,
+            ctx.conn_id,
+            ctx.conn_requests,
+        );
+        sub.auth_depth = ctx.auth_depth + 1;
+        // The full pipeline, so the auth location can be a `proxy_pass`, a
+        // `fastcgi_pass`, a `return`, or anything else a location can be.
+        Box::pin(handle(&mut sub)).await
+    };
+
+    let status = reply.resp.status;
+    // Kept whatever the verdict: `auth_request_set` is evaluated below, and a
+    // `401` carrying `WWW-Authenticate` is exactly when its headers matter.
+    ctx.upstream_headers = reply.resp.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect();
+
+    for (name, tmpl) in &core.auth_request_set {
+        let value = tmpl.render(&*ctx);
+        ctx.set(name, value);
+    }
+
+    match status {
+        200..=299 => Ok(()),
+        401 | 403 => Err(status),
+        _ => Err(500),
     }
 }
 

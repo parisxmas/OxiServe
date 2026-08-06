@@ -296,6 +296,12 @@ pub struct CoreConf {
     pub limit_rate_after: u64,
     pub satisfy_any: bool,
     pub internal: bool,
+    /// `auth_request URI` — the subrequest that decides whether this location
+    /// may be served at all. `None` is `auth_request off`.
+    pub auth_request: Option<Arc<str>>,
+    /// `auth_request_set $var value`, evaluated after the subrequest with its
+    /// response headers visible as `$upstream_http_*`.
+    pub auth_request_set: Vec<(Arc<str>, Arc<Template>)>,
     pub open_file_cache: OpenFileCache,
     pub fastcgi: Arc<FastCgiConf>,
     pub proxy_cache: ProxyCacheConf,

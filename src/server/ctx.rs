@@ -60,6 +60,13 @@ pub struct Ctx<'a> {
 
     /// How many internal redirects have happened, to break `try_files` loops.
     pub redirects: u32,
+    /// Response headers from the most recent subrequest upstream, which is
+    /// what `$upstream_http_*` reads and what makes `auth_request_set` able to
+    /// carry a value out of the authorisation service.
+    pub upstream_headers: Vec<(String, String)>,
+    /// How deep we are in `auth_request` subrequests. An auth location that
+    /// itself requires authorisation would otherwise recurse forever.
+    pub auth_depth: u32,
     /// The location `route` selected, cached so response decoration and
     /// `error_page` lookup do not each repeat the location search.
     pub matched: Option<Arc<crate::config::model::Location>>,
@@ -106,6 +113,8 @@ impl<'a> Ctx<'a> {
             cache_status: None,
             upstream_time: 0.0,
             redirects: 0,
+            upstream_headers: Vec::new(),
+            auth_depth: 0,
             matched: None,
         }
     }
@@ -306,6 +315,13 @@ impl<'a> Ctx<'a> {
             // never TLS), so there is nothing to report and nginx leaves them
             // empty here too.
             Var::SslPrereadServerName | Var::SslPrereadAlpnProtocols | Var::SslPrereadProtocol => {}
+            Var::UpstreamHttp(name) => {
+                if let Some((_, v)) =
+                    self.upstream_headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name))
+                {
+                    out.push_str(v);
+                }
+            }
             Var::User(name) => self.user_var(name, out, depth),
             // Resolved only once a response exists; see `LogVars`.
             Var::Status | Var::BodyBytesSent | Var::BytesSent | Var::SentHttp(_) => {}

@@ -66,6 +66,9 @@ pub enum Var {
     ProxyPort,
     /// The client's `X-Forwarded-For` with `$remote_addr` appended.
     ProxyAddXForwardedFor,
+    /// `$upstream_http_x_user` — a header from the last upstream response,
+    /// which for `auth_request_set` is the authorisation subrequest's.
+    UpstreamHttp(Arc<str>),
     /// `$upstream_addr` and friends.
     UpstreamAddr,
     UpstreamStatus,
@@ -95,6 +98,9 @@ impl Var {
     pub fn parse(name: &str) -> Var {
         if let Some(rest) = name.strip_prefix("http_") {
             return Var::Http(header_name(rest));
+        }
+        if let Some(rest) = name.strip_prefix("upstream_http_") {
+            return Var::UpstreamHttp(header_name(rest));
         }
         if let Some(rest) = name.strip_prefix("sent_http_") {
             return Var::SentHttp(header_name(rest));
@@ -207,6 +213,7 @@ impl Var {
             Var::ProxyPort => "proxy_port",
             Var::ProxyAddXForwardedFor => "proxy_add_x_forwarded_for",
             Var::UpstreamAddr => "upstream_addr",
+            Var::UpstreamHttp(h) => return format!("upstream_http_{}", h.replace('-', "_")),
             Var::UpstreamStatus => "upstream_status",
             Var::UpstreamCacheStatus => "upstream_cache_status",
             Var::UpstreamResponseTime => "upstream_response_time",

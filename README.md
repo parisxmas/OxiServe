@@ -121,6 +121,29 @@ automatic recovery), `backup` failover, weighted round-robin, real
 `keepalive` pool that probes a connection for liveness before reusing it.
 Health is shared across workers; the pool is per worker.
 
+**`auth_request`** — the yes/no is delegated to another service, which is how
+an API gateway does authentication without the gateway knowing anything about
+it:
+
+```nginx
+location /private/ {
+    auth_request /_auth;
+    auth_request_set $user $upstream_http_x_user;
+    proxy_pass http://app;
+}
+location = /_auth {
+    internal;
+    proxy_pass http://auth-service;
+}
+```
+
+The subrequest is a fresh `GET` carrying the client's headers and **no body** —
+the service is being asked *about* the request, not asked to process it. `2xx`
+continues; `401` and `403` are returned to the client as they stand, since they
+are the service's answer and not our error; anything else, including an
+unreachable service, is a `500`. Failing open is the one outcome an
+authorisation check must never have.
+
 **FastCGI** — `fastcgi_pass` over TCP or a Unix socket, with
 `fastcgi_split_path_info`, `fastcgi_index` and the CGI `Status:` / bare
 `Location:` rules. A response is collected whole while it fits
@@ -270,7 +293,7 @@ regex captures `$1`–`$9`.
 - **`proxy_cache_background_update` / `proxy_cache_revalidate`** — parsed and
   ignored; a refresh is always a full fetch, never a conditional revalidation.
 - **`limit_conn`** connection limiting (`limit_req` is implemented).
-- **`auth_basic`**, `auth_request`.
+- **`auth_basic`** / `auth_basic_user_file` (`auth_request` is implemented).
 - **`mail`** block; **UDP** inside `stream` (`ssl_preread` is implemented).
 - **Binary upgrade** (`USR2`/`WINCH`) — replacing the executable without
   dropping connections. `-s reload` covers configuration changes.

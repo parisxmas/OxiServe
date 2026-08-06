@@ -226,6 +226,8 @@ pub fn default_core() -> CoreConf {
         limit_rate_after: 0,
         satisfy_any: false,
         internal: false,
+        auth_request: None,
+        auth_request_set: Vec::new(),
         open_file_cache: OpenFileCache::default(),
         fastcgi: Arc::new(FastCgiConf::default()),
         proxy_cache: ProxyCacheConf::default(),
@@ -288,6 +290,10 @@ struct CoreLayer {
     fcgi_read_timeout: Option<Duration>,
     fcgi_send_timeout: Option<Duration>,
     fcgi_keep_conn: Option<bool>,
+    // `Option<Option<_>>`: the outer says whether this level mentioned the
+    // directive at all, the inner distinguishes a URI from `off`.
+    auth_request: Option<Option<Arc<str>>>,
+    auth_request_set: Option<Vec<(Arc<str>, Arc<Template>)>>,
     fcgi_buffering: Option<bool>,
     fcgi_buffer_size: Option<usize>,
     fcgi_buffers: Option<usize>,
@@ -433,6 +439,15 @@ impl CoreLayer {
             c.limit_req_status = v;
         }
 
+        if let Some(v) = &self.auth_request {
+            c.auth_request = v.clone();
+        }
+        // A level that names any `auth_request_set` replaces the inherited
+        // list, the same rule `add_header` follows.
+        if let Some(v) = &self.auth_request_set {
+            c.auth_request_set = v.clone();
+        }
+
         if self.fcgi_params.is_some()
             || self.fcgi_index.is_some()
             || self.fcgi_split.is_some()
@@ -571,7 +586,7 @@ pub struct Builder {
 /// someone porting a config.
 const KNOWN_UNIMPLEMENTED: &[&str] = &[
     "uwsgi_pass", "scgi_pass", "grpc_pass", "memcached_pass",
-    "auth_basic", "auth_basic_user_file", "auth_request",
+    "auth_basic", "auth_basic_user_file",
     "limit_conn", "limit_conn_zone",
     "ssi", "sub_filter", "sub_filter_types", "addition_before_body",
     "dav_methods", "mp4", "flv", "xslt_stylesheet", "image_filter",
@@ -1451,6 +1466,27 @@ impl Builder {
             "fastcgi_connect_timeout" => c.fcgi_connect_timeout = Some(time_arg(d, 0)?),
             "fastcgi_read_timeout" => c.fcgi_read_timeout = Some(time_arg(d, 0)?),
             "fastcgi_send_timeout" => c.fcgi_send_timeout = Some(time_arg(d, 0)?),
+            "auth_request" => {
+                want_args(d, 1)?;
+                c.auth_request = Some(if d.args[0] == "off" {
+                    None
+                } else {
+                    if !d.args[0].starts_with('/') {
+                        bail!(d, "\"auth_request\" must name an internal URI beginning with \"/\"");
+                    }
+                    Some(Arc::from(d.args[0].as_str()))
+                });
+            }
+            "auth_request_set" => {
+                want_args(d, 2)?;
+                let name = d.args[0].strip_prefix('$').ok_or_else(|| BuildError {
+                    msg: format!("invalid variable name \"{}\"", d.args[0]),
+                    loc: format!("line {}", d.line),
+                })?;
+                c.auth_request_set
+                    .get_or_insert_with(Vec::new)
+                    .push((Arc::from(name), Arc::new(Template::compile(&d.args[1]))));
+            }
             "fastcgi_keep_conn" => c.fcgi_keep_conn = Some(flag(d)?),
             "fastcgi_hide_header" => {
                 want_args(d, 1)?;

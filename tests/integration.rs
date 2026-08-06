@@ -2180,3 +2180,32 @@ fn health_check_config_is_validated() {
     let err = oxiserve::config::load(&f, dir).unwrap_err().to_string();
     assert!(err.contains("health_check"), "got: {err}");
 }
+
+/// A named location reached by `error_page` must be decorated with its own
+/// directives, not the server's. It was being handed the server's set, so a
+/// `@name` that added a header added nothing — the shape every
+/// `error_page 401 = @unauth` challenge takes.
+#[test]
+fn a_named_location_applies_its_own_add_header() {
+    let s = Server::start(
+        "namedadd",
+        &format!("{BASE}
+    add_header X-Server server always;
+    server {{ listen {{PORT}}; root {{ROOT}};
+        error_page 404 = @notfound;
+        location / {{ }}
+        location @notfound {{ add_header X-Named named always; return 404 \"gone\"; }}
+    }}
+}}"),
+        &[],
+    );
+    let r = s.get("/definitely-missing");
+    assert_eq!(r.status, 404);
+    assert_eq!(r.body_str(), "gone", "the named location must produce the body");
+    assert_eq!(r.header("X-Named").as_deref(), Some("named"), "headers: {:?}", r.headers);
+    assert_eq!(
+        r.header("X-Server"),
+        None,
+        "a location that defines add_header replaces the inherited set"
+    );
+}
