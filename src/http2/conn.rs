@@ -386,72 +386,74 @@ where
                     block = &block[5..];
                 }
 
-                match state_of(&streams, head.stream, highest_client_stream) {
-                    Where::Open | Where::HalfClosed => {
-                        // A second header block on a live stream is trailers,
-                        // and trailers must end the stream. Without
-                        // END_STREAM the peer is opening a block that can
-                        // never be closed.
-                        if !head.has(flag::END_STREAM) {
-                            reset_stream(&mut streams, head.stream, Code::Protocol, tx);
-                            continue;
-                        }
+                let live = match state_of(&streams, head.stream, highest_client_stream) {
+                    Where::Open | Where::HalfClosed => true,
+                    Where::Closed | Where::Reset => {
+                        return Err(ConnErr(Code::StreamClosed, "HEADERS on a closed stream"))
+                    }
+                    Where::Idle => false,
+                };
+
+                // Falls through to the dispatch step at the bottom of the loop
+                // rather than `continue`-ing: trailers are what completes a
+                // request, so skipping dispatch here left the response
+                // waiting for some unrelated later frame to arrive.
+                let mut open_block = true;
+                if live {
+                    // A second header block on a live stream is trailers, and
+                    // trailers must end the stream — without END_STREAM the
+                    // peer is opening a block that can never be closed.
+                    if !head.has(flag::END_STREAM) {
+                        reset_stream(&mut streams, head.stream, Code::Protocol, tx);
+                        open_block = false;
+                    } else {
                         let st = streams.get_mut(&head.stream).expect("live");
                         st.pending.clear();
                         st.pending.extend_from_slice(block);
                         st.pending_is_trailers = true;
                         st.state = State::HalfClosedRemote;
-                        if head.has(flag::END_HEADERS) {
-                            if let Err(e) = finish_block(&mut dec, &mut streams, head.stream, tx)? {
-                                return Err(e);
-                            }
+                    }
+                } else {
+                    if head.stream <= highest_client_stream {
+                        return Err(ConnErr(Code::Protocol, "stream id went backwards"));
+                    }
+                    highest_client_stream = head.stream;
+                    last_stream.set(head.stream);
+
+                    // Drop the state of streams whose tasks have finished, so
+                    // a long-lived connection does not accumulate one entry
+                    // per request it ever served.
+                    streams.retain(|_, s| !(s.dispatched && s.flow.done.get()));
+
+                    // Everything still in flight counts, not just requests
+                    // waiting to be dispatched: a stream whose response is
+                    // still being written is very much concurrent.
+                    let active = streams.values().filter(|s| !s.flow.done.get()).count();
+                    if active >= MAX_CONCURRENT as usize {
+                        let mut o = Vec::new();
+                        frame::rst(head.stream, Code::RefusedStream, &mut o);
+                        let _ = tx.send(o);
+                        open_block = false;
+                    } else {
+                        let mut st = Stream::new(peer_initial_window);
+                        st.state = if head.has(flag::END_STREAM) {
+                            State::HalfClosedRemote
                         } else {
-                            expect_continuation = Some(head.stream);
+                            State::Open
+                        };
+                        st.pending.extend_from_slice(block);
+                        streams.insert(head.stream, st);
+                    }
+                }
+
+                if open_block {
+                    if head.has(flag::END_HEADERS) {
+                        if let Err(e) = finish_block(&mut dec, &mut streams, head.stream, tx)? {
+                            return Err(e);
                         }
-                        continue;
+                    } else {
+                        expect_continuation = Some(head.stream);
                     }
-                    Where::Closed | Where::Reset => {
-                        return Err(ConnErr(Code::StreamClosed, "HEADERS on a closed stream"))
-                    }
-                    Where::Idle => {}
-                }
-
-                if head.stream <= highest_client_stream {
-                    return Err(ConnErr(Code::Protocol, "stream id went backwards"));
-                }
-                highest_client_stream = head.stream;
-                last_stream.set(head.stream);
-
-                // Drop the state of streams whose tasks have finished, so a
-                // long-lived connection does not accumulate one entry per
-                // request it ever served.
-                streams.retain(|_, s| !(s.dispatched && s.flow.done.get()));
-
-                // Everything still in flight counts, not just the requests
-                // waiting to be dispatched: a stream whose response is still
-                // being written is very much concurrent.
-                let active = streams.values().filter(|s| !s.flow.done.get()).count();
-                if active >= MAX_CONCURRENT as usize {
-                    let mut o = Vec::new();
-                    frame::rst(head.stream, Code::RefusedStream, &mut o);
-                    let _ = tx.send(o);
-                    continue;
-                }
-
-                let mut st = Stream::new(peer_initial_window);
-                st.state = if head.has(flag::END_STREAM) {
-                    State::HalfClosedRemote
-                } else {
-                    State::Open
-                };
-                st.pending.extend_from_slice(block);
-                streams.insert(head.stream, st);
-                if head.has(flag::END_HEADERS) {
-                    if let Err(e) = finish_block(&mut dec, &mut streams, head.stream, tx)? {
-                        return Err(e);
-                    }
-                } else {
-                    expect_continuation = Some(head.stream);
                 }
             }
 
