@@ -318,9 +318,11 @@ fn string(buf: &[u8]) -> Result<(String, &[u8]), HpackError> {
     let huffman_coded = buf.first().ok_or(HpackError::Compression)? & 0x80 != 0;
     let (len, rest) = int(buf, 7)?;
     let len = len as usize;
-    if len > MAX_STRING {
-        return Err(HpackError::TooLarge);
-    }
+    // A declared length reaching past the end of the block is malformed, not
+    // merely large: there is no string there to read, and no later frame can
+    // supply one because a header block is complete by the time it is decoded.
+    // Reporting it as "too large" downgraded a connection error to a stream
+    // reset, which is what h2spec 5.2.3 catches.
     if rest.len() < len {
         return Err(HpackError::Compression);
     }
@@ -654,6 +656,30 @@ mod tests {
         );
     }
 
+    /// h2spec 5.2.3, byte for byte. The value declares a length of 622462
+    /// inside a thirteen-byte block. Malformed, not merely large — and the
+    /// difference decides whether the connection dies or one stream does.
+    #[test]
+    fn h2spec_5_2_3_is_a_connection_level_decoding_error() {
+        let mut d = Decoder::new(4096);
+        let rep = hex("0085f2b24a87fffffffd25427f");
+        let mut out = Vec::new();
+        assert_eq!(d.decode(&rep, 1 << 20, &mut out), Err(HpackError::Compression));
+    }
+
+    #[test]
+    fn a_huffman_string_reaching_the_eos_symbol_is_a_decoding_error() {
+        // Thirty one-bits *is* EOS, which RFC 7541 section 5.2 forbids inside
+        // a string — it must not be read as a long run of padding.
+        let mut d = Decoder::new(4096);
+        let mut block = vec![0x00, 0x06];
+        block.extend_from_slice(b"x-test");
+        block.push(0x87); // huffman, length 7
+        block.extend_from_slice(&[0xff; 7]);
+        let mut out = Vec::new();
+        assert_eq!(d.decode(&block, 1 << 20, &mut out), Err(HpackError::Compression));
+    }
+
     #[test]
     fn what_we_encode_decodes_back() {
         let mut e = Encoder::new(4096);
@@ -731,24 +757,5 @@ mod tests {
         let mut out = Vec::new();
         d.decode(&block, 1 << 20, &mut out).expect("the block must stay decodable");
         assert_eq!(out.len(), 2);
-    }
-}
-
-#[cfg(test)]
-mod h2spec_regression {
-    use super::*;
-
-    #[test]
-    fn a_huffman_string_of_all_ones_is_a_decoding_error() {
-        // What h2spec 5.2.3 sends: a Huffman literal whose bits reach the EOS
-        // symbol. Thirty one-bits *is* EOS, so this must be refused rather
-        // than read as a run of padding.
-        let mut d = Decoder::new(4096);
-        let mut block = vec![0x00, 0x06];
-        block.extend_from_slice(b"x-test");
-        block.push(0x87); // huffman, length 7
-        block.extend_from_slice(&[0xff; 7]);
-        let mut out = Vec::new();
-        assert_eq!(d.decode(&block, 1 << 20, &mut out), Err(HpackError::Compression));
     }
 }
