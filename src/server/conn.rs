@@ -67,6 +67,77 @@ pub struct ConnState {
     pub req: Req,
 }
 
+/// The largest buffers worth keeping in the pool.
+///
+/// A request that grew `read` to megabytes must not leave that memory parked
+/// on a worker for the process's life; such a connection returns its buffers
+/// to the allocator instead.
+const POOL_KEEP_MAX: usize = 64 * 1024;
+
+/// How many idle connection states a worker holds. nginx preallocates
+/// `worker_connections` of these at startup and reuses them forever; this is
+/// the same idea without the fixed upfront cost.
+const POOL_MAX: usize = 512;
+
+thread_local! {
+    static POOL: RefCell<Vec<ConnState>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A [`ConnState`] borrowed from the per-worker pool, returned on drop.
+///
+/// Setting up a connection otherwise costs three allocations — two 8 KB
+/// buffers and the header vector — that are freed microseconds later. At six
+/// figures of connections per second that churn is the dominant per-connection
+/// cost of a short-lived connection, and it is why nginx preallocates its
+/// connection structures rather than allocating per accept.
+///
+/// A guard rather than an explicit hand-back because `serve` returns from a
+/// dozen places, and a single missed path would silently turn the pool back
+/// into an allocator.
+struct Pooled(Option<ConnState>);
+
+impl Pooled {
+    fn take() -> Pooled {
+        Pooled(Some(POOL.with(|p| p.borrow_mut().pop()).unwrap_or_default()))
+    }
+}
+
+impl std::ops::Deref for Pooled {
+    type Target = ConnState;
+    fn deref(&self) -> &ConnState {
+        self.0.as_ref().expect("held until drop")
+    }
+}
+
+impl std::ops::DerefMut for Pooled {
+    fn deref_mut(&mut self) -> &mut ConnState {
+        self.0.as_mut().expect("held until drop")
+    }
+}
+
+impl Drop for Pooled {
+    fn drop(&mut self) {
+        let Some(mut st) = self.0.take() else { return };
+        if st.read.capacity() > POOL_KEEP_MAX
+            || st.write.capacity() > POOL_KEEP_MAX
+            || st.body.capacity() > POOL_KEEP_MAX
+        {
+            return;
+        }
+        st.read.clear();
+        st.write.clear();
+        st.body.clear();
+        st.consumed = 0;
+        st.req.reset();
+        POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.len() < POOL_MAX {
+                p.push(st);
+            }
+        });
+    }
+}
+
 impl Default for ConnState {
     fn default() -> Self {
         ConnState {
@@ -116,7 +187,11 @@ pub async fn serve_with_prefix<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + RawStream,
 {
-    let mut st = ConnState::default();
+    // Reborrowed as `&mut ConnState` so the borrow checker can still split
+    // `st.read` from `st.write` field-wise; going through `Deref` on the guard
+    // would make every field borrow a borrow of the whole guard.
+    let mut guard = Pooled::take();
+    let st = &mut *guard;
     if !prefix.is_empty() {
         st.read.extend_from_slice(&prefix);
     }
@@ -138,7 +213,7 @@ pub async fn serve_with_prefix<S>(
 
         // ---- read the request head ----------------------------------------
         let max_head = core.large_client_header_buffers.0 * core.large_client_header_buffers.1;
-        let parse = match read_head(&mut sock, &mut st, header_timeout, max_head).await {
+        let parse = match read_head(&mut sock, st, header_timeout, max_head).await {
             Ok(p) => p,
             // A clean EOF while idle is a normal keep-alive close.
             Err(HeadError::Eof) => return,
@@ -184,7 +259,7 @@ pub async fn serve_with_prefix<S>(
         st.body.clear();
         let body_result = read_body(
             &mut sock,
-            &mut st,
+            st,
             server.core.client_max_body_size,
             server.core.client_body_timeout,
         )
