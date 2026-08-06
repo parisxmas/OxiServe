@@ -260,6 +260,13 @@ where
                 // Distinct $connection ranges per process; purely cosmetic,
                 // but collisions in logs would look like cross-talk.
                 CONN_ID.store((w as u64) << 56, Ordering::Relaxed);
+                // Name the process what it is, as nginx labels its workers.
+                // Fifteen bytes is the comm limit; "oxiserve-worker" is
+                // exactly that, deliberately.
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    libc::prctl(libc::PR_SET_NAME, c"oxiserve-worker".as_ptr());
+                }
                 let code = match build(w) {
                     Ok(inp) => {
                         if let Some(c) = inp.core {
@@ -345,25 +352,11 @@ where
     unreachable!("process_mode is only ever true on unix")
 }
 
-// A note for whoever benchmarks connection churn next.
-//
-// On that workload nginx is ~5% ahead, and the cause is contention between our
-// own worker threads: with one worker each, OxiServe measures 1.03x nginx;
-// with two, 0.93x. nginx never pays this because it forks worker *processes*,
-// which share no file-descriptor table — and a connection costs four
-// descriptor operations (accept, open, close, close), each taking the
-// `files_struct` spinlock.
-//
-// `unshare(CLONE_FILES)` per worker thread buys the separation and was tried:
-// it moved the number about half a point and broke eleven FastCGI tests with
-// an unexplained `EINVAL` from worker startup, serially as well as in
-// parallel. Half a point does not buy an unexplained failure mode, so it was
-// reverted rather than shipped.
-//
-// The real fix is the one nginx made: worker processes rather than threads.
-// That is not a patch — upstream health, the cache index and `limit_req`
-// counters are all shared through `Arc` today, and processes would need the
-// shared-memory zones nginx has for exactly this reason.
+// The connection-churn story, for whoever benchmarks next: with worker
+// THREADS this workload measured 0.93x nginx and no syscall-level fix moved
+// it — the loss was contention on process-shared state (see ADR-0003). Worker
+// processes closed it. If a future change reintroduces threads on the hot
+// path, re-run `bench/nginx-compare.sh` before trusting it.
 
 type TlsMap = Arc<Vec<Option<Arc<rustls::ServerConfig>>>>;
 
