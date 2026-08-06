@@ -20,7 +20,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::model::OpenFileCache;
 
@@ -109,15 +109,57 @@ fn open_direct(path: &str) -> Cached {
         Ok(f) => f,
         Err(e) => return Cached::Error(super::files::io_status(&e)),
     };
-    match f.metadata() {
-        Ok(md) if md.is_dir() => Cached::Dir,
-        Ok(md) => Cached::File {
-            size: md.len(),
-            mtime: md.modified().unwrap_or(UNIX_EPOCH),
-            file: Arc::new(f),
-        },
+    match stat_fd(&f) {
+        Ok(Stat { is_dir: true, .. }) => Cached::Dir,
+        Ok(st) => Cached::File { size: st.size, mtime: st.mtime, file: Arc::new(f) },
         Err(e) => Cached::Error(super::files::io_status(&e)),
     }
+}
+
+struct Stat {
+    is_dir: bool,
+    size: u64,
+    mtime: SystemTime,
+}
+
+/// `fstat(2)` on the open descriptor.
+///
+/// Not `File::metadata()`: on Linux the standard library reaches for `statx`,
+/// which returns strictly more than we use — birth time, mount id, attribute
+/// flags — and costs more to serve than the `fstat` nginx calls here. Since
+/// this runs once per uncached request, the difference is on the request path
+/// rather than beside it.
+#[cfg(target_os = "linux")]
+fn stat_fd(f: &File) -> std::io::Result<Stat> {
+    use std::os::fd::AsRawFd;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fstat` only writes to the `stat` we hand it, and the descriptor
+    // is valid for as long as `f` is borrowed.
+    if unsafe { libc::fstat(f.as_raw_fd(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mtime = if st.st_mtime >= 0 {
+        UNIX_EPOCH + Duration::new(st.st_mtime as u64, st.st_mtime_nsec as u32)
+    } else {
+        // Pre-1970 timestamps exist on restored archives; going backwards from
+        // the epoch keeps `Last-Modified` honest instead of clamping to it.
+        UNIX_EPOCH - Duration::from_secs(st.st_mtime.unsigned_abs())
+    };
+    Ok(Stat {
+        is_dir: st.st_mode & libc::S_IFMT == libc::S_IFDIR,
+        size: st.st_size as u64,
+        mtime,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stat_fd(f: &File) -> std::io::Result<Stat> {
+    let md = f.metadata()?;
+    Ok(Stat {
+        is_dir: md.is_dir(),
+        size: md.len(),
+        mtime: md.modified().unwrap_or(UNIX_EPOCH),
+    })
 }
 
 /// Frees roughly 10% of `max`, preferring entries that never reached
