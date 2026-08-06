@@ -248,15 +248,18 @@ and the generator at ~6%, which is what makes the server the thing being
 measured. `sendfile on`, `gzip off`, `reuseport` and identical keepalive
 settings on both. Warmup runs discarded.
 
+Median of 5 rounds, alternating which server runs first. Reproduce with
+`bench/nginx-compare.sh`, which prints the worker pinning it verified before
+measuring anything.
+
 | Scenario | nginx | OxiServe | |
 |---|---:|---:|---|
-| HTTPS/1.1, keepalive, 100 B | 224,120 rps | **307,045 rps** | **1.37×** |
-| HTTP/2 over TLS (100 conns × 32 streams) | 259,724 rps | **350,568 rps** | **1.35×** |
-| HTTP/1.1, keepalive, 100 B, `open_file_cache` | 413,386 rps | **513,910 rps** | **1.24×** |
-| HTTP/1.1, keepalive, 100 B | 290,609 rps | **330,445 rps** | **1.14×** |
-| HTTP/1.1, keepalive, 10 KB | 252,240 rps | 260,276 rps | 1.03× |
-| HTTP/1.1, keepalive, 1 MB | 21,919 rps | 22,356 rps | 1.02× |
-| HTTP/1.1, **new connection per request** | **169,560 rps** | 166,404 rps | **0.98×** |
+| HTTP/2 over TLS (100 conns × 32 streams) | 279,351 rps | **387,486 rps** | **1.39×** |
+| HTTPS/1.1, keepalive, 100 B | 227,995 rps | **292,530 rps** | **1.28×** |
+| HTTP/1.1, keepalive, 100 B | 286,808 rps | **338,482 rps** | **1.18×** |
+| HTTP/1.1, keepalive, 1 MB | 23,244 rps | 23,652 rps | 1.02× |
+| HTTP/1.1, keepalive, 10 KB | 269,216 rps | 273,363 rps | 1.02× |
+| HTTP/1.1, **new connection per request** | **144,055 rps** | 139,329 rps | **0.97×** |
 
 Two honest caveats about the table above.
 
@@ -265,28 +268,40 @@ and 26 GB/s they are loopback and memory bandwidth, not server code — both
 implementations are waiting on the same ceiling, and a 1.01× there means
 "indistinguishable", not "narrowly ahead".
 
-**The last row is a real loss, and it is only partly explained.** It is genuine
+**The last row is a real loss and it is still unexplained.** It is genuine
 connection churn — the kernel's `PassiveOpens` counter reads exactly 1.000 new
 TCP connections per request, against 0.000 for the keepalive rows.
 
-Chasing it took OxiServe from 11.15 syscalls per connection to **9.06, against
-nginx's 10.07** — we now make ~10% *fewer* syscalls per connection and are
-still ~2–3% behind. What was found and fixed:
+Chasing it took OxiServe from 11.15 syscalls per connection to **8.07, against
+nginx's 10.00**. We now make ~19% *fewer* syscalls per connection and are still
+~2.6% slower on this workload, which is the useful finding: syscall count is
+not what the row is measuring. What was found and fixed along the way, each
+kept because it is right on its own terms:
 
 - **Reactor registration.** Every accepted socket was registered with epoll on
   arrival and deregistered on drop; nginx registers once and lets `close`
   remove it. Accepted sockets now stay unregistered and upgrade in place the
   first time a syscall would block, so a connection that arrives with its
-  request already buffered never touches epoll. Worth ~3 points.
-- **`accept4(SOCK_NONBLOCK)`** instead of accept plus `ioctl(FIONBIO)`, and a
-  redundant `shutdown()` before close.
+  request already buffered never touches epoll.
+- **`accept4(SOCK_NONBLOCK)`** rather than accept plus `ioctl(FIONBIO)`.
+- **`fstat` rather than `statx`.** `File::metadata()` reaches for `statx` on
+  Linux, which returns strictly more than a static file server uses — birth
+  time, mount id, attribute flags — and costs more to serve.
+- **`tcp_nodelay` applied on demand.** Nagle only delays a partial segment
+  while earlier data is unacknowledged, so a connection whose first write is
+  also its last can never be affected by it. The option is now set before the
+  second write and when a socket reaches the reactor — the first moments it
+  could matter — instead of on every accept.
+- A redundant `shutdown()` before close, which neither flushes nor prevents
+  the RST that unread inbound data causes.
 
-What was tested and found *not* to be the cause: per-connection allocation
-churn (buffers are pooled per worker now anyway), the per-connection task
+Tested and found **not** to be the cause: per-connection allocation churn
+(buffers are pooled per worker regardless now), the per-connection task
 (serving inline without spawning moves the number 0.5%), the accept readiness
-path, and file I/O (the gap survives `open_file_cache` on both sides). The
-remaining few percent is not explained by anything measurable with these
-tools, and is recorded as open rather than guessed at.
+path, and file I/O (the gap survives `open_file_cache` enabled on both sides).
+
+Whatever remains is not visible to `strace` or `perf` at this level, and
+guessing at it would be worse than saying so.
 
 ### Real-world check: WordPress
 
