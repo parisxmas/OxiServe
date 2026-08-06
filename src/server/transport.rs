@@ -295,13 +295,21 @@ impl Listener {
                 // socket with the reactor immediately, and most connections
                 // never need it. See [`Stream::Pending`].
                 loop {
-                    let mut guard = l.readable().await?;
-                    match guard.try_io(|inner| accept_nonblocking(inner.get_ref())) {
-                        Ok(Ok((s, peer))) => return Ok((Stream::Pending(Some(s)), peer)),
-                        Ok(Err(e)) => return Err(e),
-                        // The readiness was stale — another worker took it.
-                        Err(_would_block) => continue,
+                    // Try the accept before consulting the reactor at all.
+                    // Under load there is almost always a connection already
+                    // queued, and the readiness bookkeeping is pure overhead
+                    // when the answer is "yes, take one".
+                    match accept_nonblocking(l.get_ref()) {
+                        Ok((s, peer)) => return Ok((Stream::Pending(Some(s)), peer)),
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e),
                     }
+                    // Genuinely empty. Tell the reactor the readiness we were
+                    // holding is used up, or it hands back the same stale
+                    // "readable" and this spins.
+                    let mut guard = l.readable().await?;
+                    guard.clear_ready();
                 }
             }
             // A Unix peer has no address; nginx reports `$remote_addr` as
