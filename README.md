@@ -261,12 +261,12 @@ measuring anything.
 
 | Scenario | nginx | OxiServe | |
 |---|---:|---:|---|
-| HTTPS/1.1, keepalive, 100 B | 247,147 rps | **352,102 rps** | **1.42×** |
-| HTTP/2 over TLS (100 conns × 32 streams) | 301,259 rps | **410,572 rps** | **1.36×** |
-| HTTP/1.1, keepalive, 100 B | 300,723 rps | **401,825 rps** | **1.34×** |
-| HTTP/1.1, keepalive, 10 KB | 295,158 rps | **328,653 rps** | **1.11×** |
-| HTTP/1.1, keepalive, 1 MB | 27,594 rps | 28,201 rps | 1.02× |
-| HTTP/1.1, new connection per request | 173,547 rps | 173,814 rps | 1.00× |
+| HTTPS/1.1, keepalive, 100 B | 249,262 rps | **363,975 rps** | **1.46×** |
+| HTTP/2 over TLS (100 conns × 32 streams) | 296,122 rps | **408,493 rps** | **1.38×** |
+| HTTP/1.1, keepalive, 100 B | 296,595 rps | **395,471 rps** | **1.33×** |
+| HTTP/1.1, keepalive, 10 KB | 294,015 rps | **334,101 rps** | **1.14×** |
+| HTTP/1.1, keepalive, 1 MB | 27,942 rps | 28,532 rps | 1.02× |
+| HTTP/1.1, new connection per request | 177,955 rps | 177,891 rps | 1.00× |
 
 No scenario remains where nginx is ahead. The last row was the stubborn one
 and its story is [ADR-0003]: with worker *threads* it measured 0.93× and no
@@ -276,8 +276,8 @@ one worker thread scored 1.03×, two worker threads 0.93×, and two single-worke
 *processes* 1.00×. The whole loss was contention on state threads share and
 processes do not. So `worker_processes N` now means what it says — N forked
 worker processes under a supervising master, as nginx runs — and the churn row
-reads dead even (nine asserted alternating rounds, median 1.002×, every round
-within ±0.6%). Moving to processes also lifted every other row: 10 KB, which
+reads dead even — across three assertion-guarded runs the medians were
+1.002×, 1.002× and 1.000×, the sign flipping inside a ±0.2% band. Moving to processes also lifted every other row: 10 KB, which
 was bandwidth-tied at 1.03×, opened to 1.11×.
 
 Process mode forced one piece of real shared-memory engineering: `limit_req`
