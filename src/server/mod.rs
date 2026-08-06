@@ -348,9 +348,7 @@ async fn accept_loop(
             }
         };
         if nodelay {
-            if let transport::Stream::Tcp(t) = &sock {
-                let _ = t.set_nodelay(true);
-            }
+            sock.set_nodelay(true);
         }
 
         let conf = conf.clone();

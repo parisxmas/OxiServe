@@ -90,6 +90,20 @@ impl Stream {
 }
 
 impl Stream {
+    /// Applies `tcp_nodelay`.
+    ///
+    /// Not inheritable from the listening socket on Linux, so it costs one
+    /// `setsockopt` per connection here exactly as it does in nginx. Handled
+    /// on the enum because an accepted socket is not a `tokio::net::TcpStream`
+    /// yet — matching on that variant silently stopped applying it.
+    pub fn set_nodelay(&self, on: bool) {
+        let _ = match self {
+            Stream::Tcp(s) => s.set_nodelay(on),
+            Stream::Pending(s) => s.as_ref().expect("present").set_nodelay(on),
+            Stream::Unix(_) => Ok(()),
+        };
+    }
+
     /// True when the socket looks usable for a new request.
     ///
     /// A pooled connection may have been closed by the peer while it sat idle.
@@ -282,11 +296,8 @@ impl Listener {
                 // never need it. See [`Stream::Pending`].
                 loop {
                     let mut guard = l.readable().await?;
-                    match guard.try_io(|inner| inner.get_ref().accept()) {
-                        Ok(Ok((s, peer))) => {
-                            s.set_nonblocking(true)?;
-                            return Ok((Stream::Pending(Some(s)), Some(peer)));
-                        }
+                    match guard.try_io(|inner| accept_nonblocking(inner.get_ref())) {
+                        Ok(Ok((s, peer))) => return Ok((Stream::Pending(Some(s)), peer)),
                         Ok(Err(e)) => return Err(e),
                         // The readiness was stale — another worker took it.
                         Err(_would_block) => continue,
@@ -301,6 +312,51 @@ impl Listener {
             }
         }
     }
+}
+
+/// Accepts a connection, non-blocking from the moment it exists.
+///
+/// On Linux `accept4` sets `SOCK_NONBLOCK` as part of the accept.
+/// `std::net::TcpListener::accept` cannot ask for that, so it costs an extra
+/// `ioctl(FIONBIO)` per connection — a measurable fraction of the syscalls a
+/// short connection costs. Elsewhere there is no `accept4` and the extra call
+/// is unavoidable.
+#[cfg(target_os = "linux")]
+fn accept_nonblocking(
+    l: &std::net::TcpListener,
+) -> io::Result<(std::net::TcpStream, Option<std::net::SocketAddr>)> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: `storage` is large enough for any address family the kernel can
+    // return and `len` says so. The returned descriptor is handed straight to
+    // `TcpStream`, which owns it from then on, so it is closed exactly once.
+    let fd = unsafe {
+        libc::accept4(
+            l.as_raw_fd(),
+            &mut storage as *mut _ as *mut libc::sockaddr,
+            &mut len,
+            libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let sock = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    // SAFETY: the kernel just filled `storage` and wrote the used length into
+    // `len`.
+    let peer = unsafe { socket2::SockAddr::new(storage, len) }.as_socket();
+    Ok((sock, peer))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn accept_nonblocking(
+    l: &std::net::TcpListener,
+) -> io::Result<(std::net::TcpStream, Option<std::net::SocketAddr>)> {
+    let (s, peer) = l.accept()?;
+    s.set_nonblocking(true)?;
+    Ok((s, Some(peer)))
 }
 
 /// Removes a stale socket file left behind by an unclean shutdown.
