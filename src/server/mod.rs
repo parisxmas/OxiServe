@@ -330,7 +330,7 @@ async fn accept_loop(
     let nodelay = conf.servers[conf.default_server].core.tcp_nodelay;
 
     loop {
-        let (sock, remote) = match listener.accept().await {
+        let (mut sock, remote) = match listener.accept().await {
             Ok(p) => p,
             Err(e) => {
                 // A connection aborted between SYN and accept is routine.

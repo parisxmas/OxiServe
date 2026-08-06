@@ -35,7 +35,7 @@ pub enum Stream {
     /// [`Stream::Tcp`] the moment a syscall would block. `Option` only so the
     /// socket can be moved out through `&mut self` during the upgrade; it is
     /// never `None` outside that moment.
-    Pending(Option<std::net::TcpStream>),
+    Pending(Option<PendingTcp>),
     Unix(UnixStream),
 }
 
@@ -48,8 +48,11 @@ impl Stream {
     /// the handover.
     fn register(&mut self) -> io::Result<()> {
         if let Stream::Pending(slot) = self {
-            let std = slot.take().expect("a pending socket always holds one");
-            *self = Stream::Tcp(TcpStream::from_std(std)?);
+            let mut p = slot.take().expect("a pending socket always holds one");
+            // A socket that reaches the reactor is going to live long enough
+            // for Nagle to matter.
+            p.apply_nodelay();
+            *self = Stream::Tcp(TcpStream::from_std(p.sock)?);
         }
         Ok(())
     }
@@ -89,19 +92,48 @@ impl Stream {
     }
 }
 
+/// An accepted socket that has not been handed to the reactor yet.
+pub struct PendingTcp {
+    sock: std::net::TcpStream,
+    /// `tcp_nodelay` is configured on but not applied to the socket yet.
+    nodelay_wanted: bool,
+    /// Whether anything has been written to this socket.
+    wrote: bool,
+}
+
+impl PendingTcp {
+    fn new(sock: std::net::TcpStream) -> PendingTcp {
+        PendingTcp { sock, nodelay_wanted: false, wrote: false }
+    }
+
+    /// Applies a deferred `tcp_nodelay`, if one is owed.
+    fn apply_nodelay(&mut self) {
+        if self.nodelay_wanted {
+            self.nodelay_wanted = false;
+            let _ = self.sock.set_nodelay(true);
+        }
+    }
+}
+
 impl Stream {
-    /// Applies `tcp_nodelay`.
+    /// Records `tcp_nodelay`, applying it only once it can matter.
     ///
-    /// Not inheritable from the listening socket on Linux, so it costs one
-    /// `setsockopt` per connection here exactly as it does in nginx. Handled
-    /// on the enum because an accepted socket is not a `tokio::net::TcpStream`
-    /// yet — matching on that variant silently stopped applying it.
-    pub fn set_nodelay(&self, on: bool) {
-        let _ = match self {
-            Stream::Tcp(s) => s.set_nodelay(on),
-            Stream::Pending(s) => s.as_ref().expect("present").set_nodelay(on),
-            Stream::Unix(_) => Ok(()),
-        };
+    /// Nagle delays a *partial* segment only while earlier data is still
+    /// unacknowledged. A freshly accepted connection has nothing outstanding,
+    /// so its first write leaves immediately whatever this option says — which
+    /// means setting it up front costs a `setsockopt` on every connection to
+    /// change nothing. It is applied before the second write, and when the
+    /// socket is handed to the reactor (which is what a keep-alive or slow
+    /// connection does), so from the first moment Nagle could bite, the option
+    /// is already set.
+    pub fn set_nodelay(&mut self, on: bool) {
+        match self {
+            Stream::Tcp(s) => {
+                let _ = s.set_nodelay(on);
+            }
+            Stream::Pending(p) => p.as_mut().expect("present").nodelay_wanted = on,
+            Stream::Unix(_) => {}
+        }
     }
 
     /// True when the socket looks usable for a new request.
@@ -137,7 +169,7 @@ impl AsyncRead for Stream {
             // with an already-initialised slice, so `ReadBuf` has nothing
             // left to zero. It keeps this path out of `unsafe` entirely.
             let dst = buf.initialize_unfilled();
-            match slot.as_mut().expect("present").read(dst) {
+            match slot.as_mut().expect("present").sock.read(dst) {
                 Ok(n) => {
                     buf.advance(n);
                     return Poll::Ready(Ok(()));
@@ -172,8 +204,18 @@ impl AsyncWrite for Stream {
         let me = self.get_mut();
         if let Stream::Pending(slot) = me {
             use std::io::Write;
-            match slot.as_mut().expect("present").write(buf) {
-                Ok(n) => return Poll::Ready(Ok(n)),
+            let p = slot.as_mut().expect("present");
+            // From the second write on, an earlier segment may still be
+            // unacknowledged, which is exactly when Nagle would hold this one
+            // back.
+            if p.wrote {
+                p.apply_nodelay();
+            }
+            match p.sock.write(buf) {
+                Ok(n) => {
+                    p.wrote = true;
+                    return Poll::Ready(Ok(n));
+                }
                 // The send buffer is full, so the rest of this response needs
                 // the reactor to tell us when there is room.
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -241,7 +283,7 @@ impl AsyncWrite for Stream {
             // Shut the write side down directly. Registering with the reactor
             // purely to close would reintroduce both syscalls this exists to
             // avoid.
-            let r = slot.as_mut().expect("present").shutdown(std::net::Shutdown::Write);
+            let r = slot.as_mut().expect("present").sock.shutdown(std::net::Shutdown::Write);
             return Poll::Ready(match r {
                 Ok(()) => Ok(()),
                 // The peer closed first; nothing left to shut down.
@@ -300,7 +342,7 @@ impl Listener {
                     // queued, and the readiness bookkeeping is pure overhead
                     // when the answer is "yes, take one".
                     match accept_nonblocking(l.get_ref()) {
-                        Ok((s, peer)) => return Ok((Stream::Pending(Some(s)), peer)),
+                        Ok((s, peer)) => return Ok((Stream::Pending(Some(PendingTcp::new(s))), peer)),
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                         Err(e) => return Err(e),
