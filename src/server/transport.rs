@@ -136,6 +136,43 @@ impl Stream {
         }
     }
 
+    /// Reads whatever is already buffered, without ever awaiting.
+    ///
+    /// `None` means this stream has no synchronous path and the caller should
+    /// use the async one.
+    ///
+    /// The point is not the read — it is skipping `tokio::time::timeout`
+    /// around it. Arming a timer reads the clock, and clock reads were the
+    /// largest kernel-side difference left against nginx on connection-churn
+    /// workloads: nginx arms no timer per read and reads the clock once per
+    /// event-loop turn, shared across every connection in the batch. A request
+    /// that is already sitting in the socket buffer needs neither.
+    pub fn try_read_into(&mut self, out: &mut Vec<u8>) -> io::Result<usize> {
+        match self {
+            Stream::Pending(slot) => {
+                use std::os::fd::AsRawFd;
+                let fd = slot.as_ref().expect("present").sock.as_raw_fd();
+                let spare = out.spare_capacity_mut();
+                let (ptr, cap) = (spare.as_mut_ptr(), spare.len());
+                // SAFETY: `ptr`/`cap` describe the vector's own spare
+                // capacity, and `fd` belongs to the socket borrowed here. No
+                // reference is created over the uninitialised bytes; the
+                // kernel initialises exactly what it reports writing, and only
+                // that much is claimed by `set_len`.
+                let got = unsafe { libc::read(fd, ptr.cast::<libc::c_void>(), cap) };
+                if got < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let n = got as usize;
+                // SAFETY: `read` wrote `n` bytes into the spare capacity.
+                unsafe { out.set_len(out.len() + n) };
+                Ok(n)
+            }
+            Stream::Tcp(s) => s.try_read_buf(out),
+            Stream::Unix(s) => s.try_read_buf(out),
+        }
+    }
+
     /// True when the socket looks usable for a new request.
     ///
     /// A pooled connection may have been closed by the peer while it sat idle.
@@ -326,6 +363,10 @@ impl AsyncWrite for Stream {
 }
 
 impl RawStream for Stream {
+    fn try_read_into(&mut self, out: &mut Vec<u8>) -> io::Result<usize> {
+        Stream::try_read_into(self, out)
+    }
+
     fn as_tcp(&mut self) -> Option<&TcpStream> {
         if matches!(self, Stream::Pending(_)) {
             return self.as_registered_tcp();

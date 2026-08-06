@@ -43,6 +43,15 @@ pub trait RawStream {
     fn as_tcp(&mut self) -> Option<&tokio::net::TcpStream> {
         None
     }
+
+    /// Reads whatever is already buffered, without awaiting.
+    ///
+    /// The default reports `WouldBlock`, which sends the caller down the
+    /// ordinary async path — correct for TLS, where the bytes on the socket
+    /// are not the bytes the caller wants.
+    fn try_read_into(&mut self, _out: &mut Vec<u8>) -> io::Result<usize> {
+        Err(io::Error::new(io::ErrorKind::WouldBlock, "no synchronous read path"))
+    }
 }
 
 impl RawStream for tokio::net::TcpStream {
@@ -593,7 +602,7 @@ async fn read_head<S>(
     max_head: usize,
 ) -> Result<ParseResult, HeadError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + RawStream,
 {
     loop {
         if !st.read.is_empty() {
@@ -611,19 +620,30 @@ where
         if st.read.capacity() - start < 2048 {
             st.read.reserve(READ_BUF_INIT);
         }
-        // `read_buf` writes straight into the vector's spare capacity. The old
-        // `resize(capacity, 0)` zeroed the whole 8 KB buffer before every
-        // single read — a memset per request that the kernel then overwrote,
-        // and one of the larger single costs on this path.
-        let n = match tokio::time::timeout(timeout, sock.read_buf(&mut st.read)).await {
-            Ok(Ok(n)) => n,
-            Ok(Err(_)) => {
-                st.read.truncate(start);
-                return Err(HeadError::Io);
+        // Into the vector's spare capacity. The old `resize(capacity, 0)`
+        // zeroed the whole 8 KB buffer before every read, of bytes the kernel
+        // was about to overwrite.
+        //
+        // Tried synchronously first: under load the request is already in the
+        // socket buffer, and arming the timeout below reads the clock.
+        let n = match sock.try_read_into(&mut st.read) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                match tokio::time::timeout(timeout, sock.read_buf(&mut st.read)).await {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(_)) => {
+                        st.read.truncate(start);
+                        return Err(HeadError::Io);
+                    }
+                    Err(_) => {
+                        st.read.truncate(start);
+                        return Err(HeadError::Timeout);
+                    }
+                }
             }
             Err(_) => {
                 st.read.truncate(start);
-                return Err(HeadError::Timeout);
+                return Err(HeadError::Io);
             }
         };
         st.read.truncate(start + n);
