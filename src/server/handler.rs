@@ -759,6 +759,20 @@ fn decorate(ctx: &Ctx<'_>, mut r: Reply) -> Reply {
         apply_expires(&mut r.resp, e);
     }
 
+    // Advertise HTTP/3, so a browser arriving over TCP knows to try QUIC next
+    // time. nginx has no automatic `Alt-Svc` and expects an explicit
+    // `add_header`, which is a deliberate deviation here: without the header a
+    // `listen ... quic` line serves no browser at all, and a feature that
+    // silently does nothing is worse than one that differs from nginx.
+    //
+    // A config that sets its own `Alt-Svc` wins — that is the escape hatch for
+    // an operator who wants a different `ma=`, a different port, or none.
+    if let Some(alt) = &ctx.server.alt_svc {
+        if !r.resp.iter().any(|(n, _)| n.eq_ignore_ascii_case("alt-svc")) {
+            r.resp.header("Alt-Svc", alt);
+        }
+    }
+
     maybe_gzip(ctx, core, &mut r);
     r
 }

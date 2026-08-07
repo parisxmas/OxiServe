@@ -869,7 +869,8 @@ impl Builder {
             bail!(d, "no server blocks defined in http");
         }
 
-        let listeners = self.listeners(&servers)?;
+        let listeners = self.listeners(&servers, false)?;
+        let quic_listeners = self.listeners(&servers, true)?;
 
         // Materialise each zone's shared state once, at load time.
         let mut limit_req_zones: HashMap<Box<str>, Arc<crate::server::limit_req::Zone>> =
@@ -919,6 +920,7 @@ impl Builder {
             limit_conn_zones,
             limit_conn_keys,
             listeners,
+            quic_listeners,
             upstreams,
             maps,
             mime: Arc::new(mime),
@@ -1139,6 +1141,7 @@ impl Builder {
                 default_server: false,
                 ssl: false,
                 http2: false,
+                quic: false,
                 reuseport: false,
                 backlog: None,
                 rcvbuf: None,
@@ -1168,6 +1171,15 @@ impl Builder {
 
         let locations = self.loc_set(&level.locations, &core)?;
 
+        // `ma=86400` is the value nginx's own documentation uses in its
+        // `add_header Alt-Svc` example: a day is long enough that a browser
+        // does not re-discover h3 on every visit, and short enough that
+        // turning QUIC off does not strand clients for a week.
+        let alt_svc = listens
+            .iter()
+            .find(|l| l.quic)
+            .map(|l| format!("h3=\":{}\"; ma=86400", l.addr.port()).into_boxed_str());
+
         Ok(ServerConf {
             names,
             core,
@@ -1179,6 +1191,7 @@ impl Builder {
             action: level.action.unwrap_or(Action::None),
             tls,
             listens,
+            alt_svc,
             raw_line: d.line,
         })
     }
@@ -1220,6 +1233,7 @@ impl Builder {
             default_server: false,
             ssl: false,
             http2: false,
+            quic: false,
             reuseport: false,
             backlog: None,
             rcvbuf: None,
@@ -1232,7 +1246,15 @@ impl Builder {
             match p.as_str() {
                 "default_server" | "default" => l.default_server = true,
                 "ssl" => l.ssl = true,
-                "http2" | "spdy" | "quic" => l.http2 = true,
+                "http2" | "spdy" => l.http2 = true,
+                // QUIC is always TLS 1.3, so the `ssl` parameter is implied
+                // rather than required — nginx reads `listen 443 quic;` the
+                // same way. `http3` is accepted as the spelling some configs
+                // use for the same thing.
+                "quic" | "http3" => {
+                    l.quic = true;
+                    l.ssl = true;
+                }
                 "reuseport" => l.reuseport = true,
                 "deferred" => l.deferred = true,
                 "bind" | "fastopen" | "accept_filter" | "so_keepalive" | "proxy_protocol" => {}
@@ -1253,12 +1275,24 @@ impl Builder {
                 }
             }
         }
+        // QUIC runs on UDP, and a Unix datagram socket is not that. Caught
+        // here rather than at bind time so `oxiserve -t` reports it.
+        if l.quic && matches!(l.addr, ListenAddr::Unix(_)) {
+            bail!(d, "\"quic\" cannot be used with a unix: listen address");
+        }
         Ok(l)
     }
 
     /// Groups every server's `listen` directives into one [`Listener`] per
     /// bound address.
-    fn listeners(&mut self, servers: &[Arc<ServerConf>]) -> R<Vec<Arc<Listener>>> {
+    /// Groups every `listen` line into bound-socket descriptions, once for TCP
+    /// and once for QUIC.
+    ///
+    /// `want_quic` partitions rather than filters a shared result: a port
+    /// carrying both — the ordinary `listen 443 ssl; listen 443 quic;` pair —
+    /// is two sockets of different types, and merging them by address would
+    /// produce one listener that is neither.
+    fn listeners(&mut self, servers: &[Arc<ServerConf>], want_quic: bool) -> R<Vec<Arc<Listener>>> {
         struct Acc {
             spec: ListenSpec,
             servers: Vec<Arc<ServerConf>>,
@@ -1268,6 +1302,9 @@ impl Builder {
 
         for s in servers {
             for l in &s.listens {
+                if l.quic != want_quic {
+                    continue;
+                }
                 let entry = match by_addr.iter_mut().find(|(a, _)| *a == l.addr) {
                     Some((_, acc)) => acc,
                     None => {
@@ -1282,6 +1319,7 @@ impl Builder {
                 // them; nginx warns on conflicts, we take the first non-default.
                 entry.spec.ssl |= l.ssl;
                 entry.spec.http2 |= l.http2;
+                entry.spec.quic |= l.quic;
                 entry.spec.reuseport |= l.reuseport;
                 entry.spec.deferred |= l.deferred;
                 entry.spec.backlog = entry.spec.backlog.or(l.backlog);
@@ -1310,6 +1348,7 @@ impl Builder {
                     reuseport: acc.spec.reuseport,
                     ssl: acc.spec.ssl,
                     http2: acc.spec.http2,
+                    quic: acc.spec.quic,
                     ipv6_only: acc.spec.ipv6_only,
                     deferred: acc.spec.deferred,
                     rcvbuf: acc.spec.rcvbuf,
@@ -2485,6 +2524,58 @@ mod tests {
         assert_eq!(http.listeners.len(), 2);
         let p80 = http.listeners.iter().find(|l| l.addr.port() == 80).unwrap();
         assert_eq!(p80.servers.len(), 2);
+    }
+
+    #[test]
+    fn quic_is_a_separate_listener_from_http2() {
+        // Regression: `quic` used to share the `http2` arm, so `listen 443
+        // quic;` silently switched the *TCP* listener to HTTP/2 and no UDP
+        // socket existed at all.
+        let c = build(
+            "events {} http { server { listen 443 ssl; listen 443 quic; server_name a.com; \
+             ssl_certificate c.pem; ssl_certificate_key k.pem; } }",
+        )
+        .unwrap();
+        let http = c.http.unwrap();
+
+        assert_eq!(http.listeners.len(), 1, "one TCP listener");
+        let tcp = &http.listeners[0];
+        assert!(tcp.ssl, "the TCP side is still TLS");
+        assert!(!tcp.http2, "`quic` must not turn on HTTP/2 over TCP");
+        assert!(!tcp.quic);
+
+        assert_eq!(http.quic_listeners.len(), 1, "and one QUIC listener on the same port");
+        let q = &http.quic_listeners[0];
+        assert_eq!(q.addr.port(), 443);
+        assert!(q.quic);
+        assert!(q.ssl, "QUIC is always TLS, so `ssl` is implied");
+    }
+
+    #[test]
+    fn quic_and_tcp_group_independently_by_address() {
+        let c = build(
+            "events {} http { \
+             server { listen 443 ssl; listen 443 quic; server_name a.com; \
+               ssl_certificate c.pem; ssl_certificate_key k.pem; } \
+             server { listen 443 ssl; listen 443 quic; server_name b.com; \
+               ssl_certificate c.pem; ssl_certificate_key k.pem; } \
+             server { listen 80; server_name c.com; } }",
+        )
+        .unwrap();
+        let http = c.http.unwrap();
+        assert_eq!(http.listeners.len(), 2, "443 and 80 on TCP");
+        assert_eq!(http.quic_listeners.len(), 1, "only 443 on UDP");
+        assert_eq!(
+            http.quic_listeners[0].servers.len(),
+            2,
+            "both servers are selectable on the QUIC listener"
+        );
+    }
+
+    #[test]
+    fn quic_on_a_unix_socket_is_a_config_error() {
+        let e = build("events {} http { server { listen unix:/tmp/x.sock quic; } }").unwrap_err();
+        assert!(e.msg.contains("unix:"), "{}", e.msg);
     }
 
     #[test]

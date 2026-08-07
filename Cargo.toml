@@ -1,6 +1,6 @@
 [package]
 name = "oxiserve"
-version = "0.2.29"
+version = "0.2.30"
 edition = "2021"
 rust-version = "1.80"
 description = "A high-performance, nginx-config-compatible web server written in Rust"
@@ -25,11 +25,13 @@ flate2 = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls-pemfile = "2"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
 
 [dev-dependencies]
 # Backdating file timestamps so cache-manager age rules can be tested
 # without the suite sleeping.
 filetime = "0.2"
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 mimalloc = { version = "0.1", default-features = false }

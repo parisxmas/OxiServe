@@ -746,6 +746,13 @@ pub struct ServerConf {
     pub action: Action,
     pub tls: Option<Arc<TlsConf>>,
     pub listens: Vec<ListenSpec>,
+    /// Pre-rendered `Alt-Svc` value advertising this server's QUIC port, or
+    /// `None` when it has no `listen ... quic`.
+    ///
+    /// Built here rather than per request because the request path never
+    /// re-reads configuration — the port and the lifetime are both fixed the
+    /// moment the `listen` lines are parsed.
+    pub alt_svc: Option<Box<str>>,
     pub raw_line: u32,
 }
 
@@ -794,6 +801,11 @@ pub struct ListenSpec {
     pub default_server: bool,
     pub ssl: bool,
     pub http2: bool,
+    /// `listen ... quic` — this address is served over QUIC, on UDP. A `listen`
+    /// line is either TCP or UDP, never both, so this partitions the specs
+    /// rather than decorating them: `listen 443 ssl; listen 443 quic;` is two
+    /// sockets on one port, which is exactly how HTTP/3 is deployed.
+    pub quic: bool,
     pub reuseport: bool,
     pub backlog: Option<i32>,
     pub rcvbuf: Option<usize>,
@@ -810,6 +822,9 @@ pub struct Listener {
     pub reuseport: bool,
     pub ssl: bool,
     pub http2: bool,
+    /// A UDP/QUIC listener. Lives in `Http::quic_listeners`, never in
+    /// `Http::listeners`, so nothing on the TCP accept path has to ask.
+    pub quic: bool,
     pub ipv6_only: bool,
     pub deferred: bool,
     pub rcvbuf: Option<usize>,
@@ -1006,6 +1021,10 @@ pub struct Http {
     pub limit_conn_zones: HashMap<Box<str>, Arc<crate::server::limit_conn::Zone>>,
     pub limit_conn_keys: HashMap<Box<str>, Arc<Template>>,
     pub listeners: Vec<Arc<Listener>>,
+    /// QUIC listeners, grouped by address exactly as `listeners` is but bound
+    /// on UDP. Separate because a port can carry both and they are different
+    /// sockets with different accept loops.
+    pub quic_listeners: Vec<Arc<Listener>>,
     pub upstreams: HashMap<Box<str>, Arc<Upstream>>,
     pub maps: Vec<Arc<MapConf>>,
     pub mime: Arc<MimeTypes>,
@@ -1174,6 +1193,7 @@ mod tests {
             action: Action::None,
             tls: None,
             listens: vec![],
+            alt_svc: None,
             raw_line: 0,
         })
     }
@@ -1185,6 +1205,7 @@ mod tests {
             reuseport: false,
             ssl: false,
             http2: false,
+            quic: false,
             ipv6_only: true,
             deferred: false,
             rcvbuf: None,

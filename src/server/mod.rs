@@ -25,6 +25,7 @@ pub mod log;
 pub mod msgpack;
 pub mod preread;
 pub mod proxy;
+pub mod quic;
 pub mod reply;
 pub mod shm;
 pub mod stream;
@@ -119,6 +120,11 @@ struct Generation {
     stream_conf: Option<Arc<crate::config::model::StreamConf>>,
     error_log: crate::config::model::ErrorLogConf,
     tls: TlsMap,
+    /// One quinn config per entry in `http.quic_listeners`, `None` where the
+    /// listener has no certificate. The sockets themselves are not pre-bound:
+    /// QUIC binds per worker with `SO_REUSEPORT`, always. See
+    /// [`quic`](crate::server::quic) for why that is structural.
+    quic_configs: Vec<Option<Arc<quinn::ServerConfig>>>,
     shared: Vec<Option<BoundSocket>>,
     stream_bound: Vec<Option<BoundSocket>>,
     workers: usize,
@@ -144,6 +150,7 @@ impl Generation {
                     limit_conn_zones: Default::default(),
                     limit_conn_keys: Default::default(),
                     listeners: Vec::new(),
+                    quic_listeners: Vec::new(),
                     upstreams: Default::default(),
                     maps: Vec::new(),
                     mime: Arc::new(Default::default()),
@@ -197,12 +204,21 @@ impl Generation {
         }
 
         let tls = build_tls(&http)?;
+        let quic_configs = quic::build_configs(&http)?;
+        if announce {
+            for (i, l) in http.quic_listeners.iter().enumerate() {
+                if quic_configs[i].is_some() {
+                    eprintln!("oxiserve: listening on {} quic (udp, reuseport)", l.addr);
+                }
+            }
+        }
         Ok(Some(Generation {
             workers: config.worker_processes.resolve(),
             error_log: config.error_log,
             http,
             stream_conf,
             tls,
+            quic_configs,
             shared,
             stream_bound,
         }))
@@ -247,14 +263,24 @@ impl Generation {
                 stream_listeners.push((l.clone(), sock));
             }
         }
+        let quic = self
+            .http
+            .quic_listeners
+            .iter()
+            .zip(&self.quic_configs)
+            .filter_map(|(l, c)| c.as_ref().map(|c| (l.clone(), c.clone())))
+            .collect();
+
         Ok(WorkerInputs {
             http: self.http.clone(),
             error_log: self.error_log.clone(),
             tls: self.tls.clone(),
             core,
             listeners,
+            quic,
             stream_conf: self.stream_conf.clone(),
             stream_listeners,
+            own_state: false,
         })
     }
 }
@@ -298,16 +324,7 @@ pub fn run_from(config: Config, source: Option<(PathBuf, PathBuf)>) -> io::Resul
                         // Pinning keeps a connection's buffers in one core's cache.
                         core_affinity::set_for_current(c);
                     }
-                    if let Err(e) = worker(
-                        w,
-                        inp.http,
-                        inp.listeners,
-                        inp.error_log,
-                        inp.tls,
-                        inp.stream_conf,
-                        inp.stream_listeners,
-                        false,
-                    ) {
+                    if let Err(e) = worker(w, inp) {
                         eprintln!("oxiserve: worker {w} exited: {e}");
                     }
                 })?,
@@ -351,8 +368,14 @@ struct WorkerInputs {
     tls: TlsMap,
     core: Option<core_affinity::CoreId>,
     listeners: Vec<(Arc<Listener>, Option<BoundSocket>)>,
+    /// QUIC listeners that have a certificate, with the config to serve them.
+    quic: Vec<(Arc<Listener>, Arc<quinn::ServerConfig>)>,
     stream_conf: Option<Arc<crate::config::model::StreamConf>>,
     stream_listeners: Vec<(Arc<crate::config::model::StreamListener>, Option<BoundSocket>)>,
+    /// True in process mode: this worker's upstream-health state is private to
+    /// its process, so relying on worker 0's probes would leave every other
+    /// process blind. Each probes for itself.
+    own_state: bool,
 }
 
 /// Runs `workers` forked worker processes and supervises them.
@@ -441,16 +464,7 @@ fn prefork(
                         if let Some(c) = inp.core {
                             core_affinity::set_for_current(c);
                         }
-                        match worker(
-                            w,
-                            inp.http,
-                            inp.listeners,
-                            inp.error_log,
-                            inp.tls,
-                            inp.stream_conf,
-                            inp.stream_listeners,
-                            true,
-                        ) {
+                        match worker(w, WorkerInputs { own_state: true, ..inp }) {
                             Ok(()) => 0,
                             Err(e) => {
                                 eprintln!("oxiserve: worker {w} exited: {e}");
@@ -621,20 +635,18 @@ fn prefork(
 
 type TlsMap = Arc<Vec<Option<Arc<rustls::ServerConfig>>>>;
 
-#[allow(clippy::too_many_arguments)]
-fn worker(
-    id: usize,
-    http: Arc<Http>,
-    listeners: Vec<(Arc<Listener>, Option<BoundSocket>)>,
-    error_log: crate::config::model::ErrorLogConf,
-    tls: TlsMap,
-    stream_conf: Option<Arc<crate::config::model::StreamConf>>,
-    stream_listeners: Vec<(Arc<crate::config::model::StreamListener>, Option<BoundSocket>)>,
-    // True in process mode: this worker's upstream-health state is private to
-    // its process, so relying on worker 0's probes would leave every other
-    // process blind. Each probes for itself.
-    own_state: bool,
-) -> io::Result<()> {
+fn worker(id: usize, inp: WorkerInputs) -> io::Result<()> {
+    let WorkerInputs {
+        http,
+        error_log,
+        tls,
+        core: _,
+        listeners,
+        quic,
+        stream_conf,
+        stream_listeners,
+        own_state,
+    } = inp;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -665,6 +677,27 @@ fn worker(
 
             tasks.push(tokio::task::spawn_local(async move {
                 accept_loop(listener, lconf, http, logs, tls_cfg).await;
+            }));
+        }
+
+        // QUIC endpoints are created here rather than in the master: the
+        // socket must belong to this worker for the reuseport hash to keep a
+        // connection on one core.
+        for (lconf, cfg) in quic {
+            let ep = match quic::endpoint(&lconf, cfg, &logs) {
+                Ok(ep) => ep,
+                Err(e) => {
+                    logs.borrow_mut().error(
+                        LogLevel::Alert,
+                        &format!("quic listen on {} failed: {e}", lconf.addr),
+                    );
+                    continue;
+                }
+            };
+            let http = http.clone();
+            let logs = logs.clone();
+            tasks.push(tokio::task::spawn_local(async move {
+                quic::accept_loop(ep, lconf, http, logs).await;
             }));
         }
 
@@ -1097,6 +1130,30 @@ fn bind(l: &Listener) -> io::Result<BoundSocket> {
     Ok(BoundSocket::Tcp(sock.into()))
 }
 
+/// Collects every certificate on `l` into one SNI resolver.
+///
+/// Shared by the TCP and QUIC config builders: a `server` block names its
+/// certificate once, and which transport serves it is not that directive's
+/// business. Returns `None` when the listener has no certificate at all.
+fn sni_resolver_for(l: &Listener) -> io::Result<Option<SniResolver>> {
+    let mut resolver = SniResolver::default();
+    for s in &l.servers {
+        let Some(t) = &s.tls else { continue };
+        let key = load_certified_key(&t.cert, &t.key)?;
+        let names: Vec<String> = s
+            .names
+            .iter()
+            .filter_map(|n| match n {
+                crate::config::model::ServerName::Exact(e) if !e.is_empty() => Some(e.to_string()),
+                crate::config::model::ServerName::LeadingWildcard(x) => Some(format!("*.{x}")),
+                _ => None,
+            })
+            .collect();
+        resolver.add(names, Arc::new(key));
+    }
+    Ok(if resolver.is_empty() { None } else { Some(resolver) })
+}
+
 /// Builds one rustls config per listener, with SNI resolution across every
 /// server sharing that listener.
 fn build_tls(http: &Http) -> io::Result<TlsMap> {
@@ -1106,27 +1163,10 @@ fn build_tls(http: &Http) -> io::Result<TlsMap> {
             out.push(None);
             continue;
         }
-        let mut resolver = SniResolver::default();
-        for s in &l.servers {
-            let Some(t) = &s.tls else { continue };
-            let key = load_certified_key(&t.cert, &t.key)?;
-            let names: Vec<String> = s
-                .names
-                .iter()
-                .filter_map(|n| match n {
-                    crate::config::model::ServerName::Exact(e) if !e.is_empty() => {
-                        Some(e.to_string())
-                    }
-                    crate::config::model::ServerName::LeadingWildcard(x) => Some(format!("*.{x}")),
-                    _ => None,
-                })
-                .collect();
-            resolver.add(names, Arc::new(key));
-        }
-        if resolver.is_empty() {
+        let Some(resolver) = sni_resolver_for(l)? else {
             out.push(None);
             continue;
-        }
+        };
 
         let mut cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()

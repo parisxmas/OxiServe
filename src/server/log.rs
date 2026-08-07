@@ -55,8 +55,17 @@ impl Sink {
 
     fn write_line(&mut self, line: &[u8]) {
         if self.cap == 0 {
-            let _ = self.file.write_all(line);
-            let _ = self.file.write_all(b"\n");
+            // One write, not two. Worker processes append to the same file, so
+            // a second `write_all` for the newline leaves a window in which
+            // another process's line lands between a record and its terminator
+            // and the two run together. `buf` is reused as scratch rather than
+            // allocating, since an unbuffered access log takes this path on
+            // every request.
+            self.buf.clear();
+            self.buf.extend_from_slice(line);
+            self.buf.push(b'\n');
+            let _ = self.file.write_all(&self.buf);
+            self.buf.clear();
             return;
         }
         self.buf.extend_from_slice(line);
@@ -297,6 +306,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Records must never run together when several worker *processes* append
+    /// to one log.
+    ///
+    /// This is what a two-`write_all` unbuffered path gets wrong: a child can
+    /// land between a record and its newline, and the two merge into a line no
+    /// parser can split. The check is one-sided by construction — a malformed
+    /// line is always a real bug, while a clean run only means this scheduling
+    /// did not hit the window — so it can fail honestly but never spuriously.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_processes_never_merge_two_records() {
+        const KIDS: usize = 4;
+        const LINES: usize = 200;
+
+        let d = tmpdir("interleave");
+        let p = d.join("shared.log");
+        // Every child inherits its own O_APPEND descriptor, exactly as forked
+        // workers do.
+        std::fs::write(&p, b"").unwrap();
+
+        let mut pids = Vec::new();
+        for k in 0..KIDS {
+            // The line is built before the fork so the child allocates nothing.
+            let line = format!("child-{k}-{}", "x".repeat(64)).into_bytes();
+            match unsafe { libc::fork() } {
+                0 => {
+                    let mut sink = Sink::open(&p, 0, None).unwrap();
+                    for _ in 0..LINES {
+                        sink.write_line(&line);
+                    }
+                    unsafe { libc::_exit(0) };
+                }
+                pid if pid > 0 => pids.push(pid),
+                _ => panic!("fork failed: {}", std::io::Error::last_os_error()),
+            }
+        }
+        for pid in pids {
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        }
+
+        let text = std::fs::read_to_string(&p).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        for l in &lines {
+            assert!(
+                l.starts_with("child-") && l.len() == "child-0-".len() + 64,
+                "two records merged into one line: {l:?}"
+            );
+        }
+        assert_eq!(lines.len(), KIDS * LINES, "every record must appear exactly once");
     }
 
     #[test]

@@ -285,7 +285,7 @@ fn charge(listed: usize, h: &Header, max: usize) -> Result<usize, HpackError> {
 /// continuation is 7 bits per byte, and it is capped: a peer can otherwise
 /// send an arbitrarily long run of continuation bytes, and a naive decoder
 /// either overflows or spins.
-fn int(buf: &[u8], prefix: u32) -> Result<(u64, &[u8]), HpackError> {
+pub(crate) fn int(buf: &[u8], prefix: u32) -> Result<(u64, &[u8]), HpackError> {
     let mask = (1u64 << prefix) - 1;
     let first = *buf.first().ok_or(HpackError::Compression)? as u64 & mask;
     if first < mask {
@@ -407,7 +407,7 @@ impl Encoder {
     }
 }
 
-fn write_int(mut v: u64, prefix: u32, flags: u8, out: &mut Vec<u8>) {
+pub(crate) fn write_int(mut v: u64, prefix: u32, flags: u8, out: &mut Vec<u8>) {
     let mask = (1u64 << prefix) - 1;
     if v < mask {
         out.push(flags | v as u8);

@@ -25,7 +25,7 @@ oxiserve: listening on 0.0.0.0:80
 ## Status
 
 This is an early but genuinely working server, not a demo. It serves real
-traffic for the feature set below, with 484 tests (316 unit + 168 end-to-end
+traffic for the feature set below, with 528 tests (349 unit + 179 end-to-end
 over real sockets). It is **not yet a drop-in nginx replacement** —
 see [Not implemented](#not-implemented) for exactly what is missing, and run
 `oxiserve -t` against your own config to get a precise list for *your* setup.
@@ -239,6 +239,65 @@ than that test.
 
 [h2spec]: https://github.com/summerwind/h2spec
 
+**HTTP/3** — `listen 443 quic;` serves HTTP/3 over QUIC, and an `Alt-Svc`
+header on the TCP side tells browsers to use it:
+
+```nginx
+server {
+    listen 443 ssl;
+    listen 443 quic;
+    server_name example.com;
+    ssl_certificate     /etc/ssl/example.crt;
+    ssl_certificate_key /etc/ssl/example.key;
+}
+```
+
+The split is deliberate and is written up in [ADR-0004]. **The QUIC transport
+is [quinn]** — packet and header protection, the TLS 1.3 handshake, loss
+recovery, congestion control, connection IDs, path validation. Those are the
+parts where a mistake is an exploit rather than a bug, where a decade of
+congestion-control tuning is the difference between HTTP/3 being an
+improvement and being a downgrade, and where no `nginx.conf` can tell one
+conformant implementation from another.
+
+**The HTTP/3 framing and QPACK are ours** (`src/http3/`), because that layer
+sits between the config and the wire exactly as HPACK does. QPACK reuses the
+Huffman coder and the prefixed-integer coding already written for HPACK — RFC
+9204 shares both with RFC 7541 — and is checked byte-for-byte against RFC
+9204's own test vector rather than only against itself.
+
+`SETTINGS_QPACK_MAX_TABLE_CAPACITY` is **0**, on purpose. That is a conformant
+configuration, not a gap: a peer given a capacity of zero may not send a table
+insertion, so no field section can arrive that we would fail to decode. It
+removes the entire reason QPACK is bigger than HPACK — blocked streams, insert
+counts, section acknowledgements — at the cost of some compression on repeated
+request headers, which the 99-entry static table already covers. The HPACK
+encoder makes the same trade in the other direction.
+
+As with HTTP/2, HTTP/3 is a *transport* swap: a decoded request becomes the
+same `Req` the HTTP/1 parser produces and runs through the same handler, so
+`proxy_pass`, `proxy_cache`, `limit_req`, `limit_conn`, FastCGI, `try_files`
+and every variable behave identically — there is a test asserting `limit_req`
+still rejects over h3. `src/http3/conn.rs` is a third the size of the HTTP/2
+one, because stream states, flow-control windows and CONTINUATION reassembly
+are the transport's problem now.
+
+> **Connection migration does not survive a worker change.** QUIC listeners are
+> bound per worker with `SO_REUSEPORT` — one shared UDP socket would hand a
+> connection's packets to workers that cannot decrypt them — and the kernel
+> hashes the 4-tuple, so a client that changes address lands on a worker that
+> has never seen its connection ID. It reconnects, costing a round trip.
+> nginx has the same limitation and fixes it with an eBPF steering program;
+> that is Linux-only and not written yet.
+
+> `sendfile` cannot apply here either, for the same reason it cannot apply to
+> HTTP/2 — and 0-RTT is deliberately not offered, because early data is
+> replayable and which requests may accept a replay is a policy question with
+> a config surface, not a default.
+
+[quinn]: https://github.com/quinn-rs/quinn
+[ADR-0004]: docs/decisions/0004-quic-transport.md
+
 **Layer 4 (`stream`)** — TCP proxying with no HTTP parsing, so it fronts
 PostgreSQL, Redis, MQTT or anything else with a TCP protocol. Shares upstream
 selection, passive health and `least_conn` with the HTTP proxy; `proxy_timeout`
@@ -297,11 +356,12 @@ regex captures `$1`–`$9`.
 `oxiserve -t` reports these per-config, distinguishing "not implemented yet" from
 "unknown directive". Currently missing:
 
-- **HTTP/3** (QUIC). `listen ... quic` is parsed and ignored.
 - **HTTP/2 server push** — deprecated by RFC 9113 and advertised as disabled;
   **HTTP/2 CONNECT**; **HTTP/2 trailers** (accepted and discarded);
   **`Upgrade: h2c`** (the deprecated cleartext upgrade — prior-knowledge h2c
   works).
+- **HTTP/3 0-RTT early data**, **QUIC connection migration across workers**
+  (see [ADR-0004]), and **Extended CONNECT** — so no WebSockets over HTTP/3.
 - **uwsgi / SCGI / gRPC** — `uwsgi_pass` and friends (FastCGI *is* supported).
 - **`proxy_cache_background_update` / `proxy_cache_revalidate`** — parsed and
   ignored; a refresh is always a full fetch, never a conditional revalidation.

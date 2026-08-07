@@ -873,15 +873,15 @@ impl Drop for DoneGuard {
 }
 
 /// The pseudo-headers plus the ordinary ones, validated.
-struct Parsed {
-    method: String,
-    path: String,
-    authority: String,
-    ordinary: Vec<(String, String)>,
+pub(crate) struct Parsed {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) authority: String,
+    pub(crate) ordinary: Vec<(String, String)>,
 }
 
 impl Parsed {
-    fn headers(&self) -> Vec<(&str, &str)> {
+    pub(crate) fn headers(&self) -> Vec<(&str, &str)> {
         let mut v: Vec<(&str, &str)> = Vec::with_capacity(self.ordinary.len() + 1);
         // HTTP/2 replaces `Host` with `:authority`. Everything downstream —
         // `server_name` matching, `$host`, `proxy_set_header Host` — reads a
@@ -896,7 +896,11 @@ impl Parsed {
 }
 
 /// Validates a decoded header list against RFC 9113 section 8.3.
-fn parse_headers(headers: &[hpack::Header]) -> Result<Parsed, Code> {
+///
+/// Shared with HTTP/3: RFC 9114 section 4.3 states the same rules over the
+/// same pseudo-headers, so the validation is one implementation rather than
+/// two that could drift.
+pub(crate) fn parse_headers(headers: &[hpack::Header]) -> Result<Parsed, Code> {
     let (mut method, mut path, mut authority, mut scheme) = (None, None, None, None);
     let mut ordinary = Vec::with_capacity(headers.len());
     let mut seen_ordinary = false;
@@ -1122,13 +1126,13 @@ async fn pump(
 }
 
 #[cfg(unix)]
-fn read_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
+pub(crate) fn read_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
     use std::os::unix::fs::FileExt;
     f.read_at(buf, off)
 }
 
 #[cfg(not(unix))]
-fn read_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
+pub(crate) fn read_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = f;
     f.seek(SeekFrom::Start(off))?;
