@@ -234,6 +234,11 @@ pub fn default_core() -> CoreConf {
         modsecurity_rules: None,
         #[cfg(feature = "modsecurity")]
         modsecurity: true,
+        #[cfg(feature = "modsecurity")]
+        modsecurity_response_body: false,
+        // Matches ModSecurity's own SecResponseBodyLimit default.
+        #[cfg(feature = "modsecurity")]
+        modsecurity_response_body_limit: 512 * 1024,
         open_file_cache: OpenFileCache::default(),
         fastcgi: Arc::new(FastCgiConf::default()),
         proxy_cache: ProxyCacheConf::default(),
@@ -311,6 +316,10 @@ struct CoreLayer {
     modsecurity_engine: Option<Arc<crate::waf::Engine>>,
     #[cfg(feature = "modsecurity")]
     modsecurity: Option<bool>,
+    #[cfg(feature = "modsecurity")]
+    modsecurity_response_body: Option<bool>,
+    #[cfg(feature = "modsecurity")]
+    modsecurity_response_body_limit: Option<usize>,
     fcgi_buffering: Option<bool>,
     fcgi_buffer_size: Option<usize>,
     fcgi_buffers: Option<usize>,
@@ -486,6 +495,12 @@ impl CoreLayer {
             }
             if let Some(v) = self.modsecurity {
                 c.modsecurity = v;
+            }
+            if let Some(v) = self.modsecurity_response_body {
+                c.modsecurity_response_body = v;
+            }
+            if let Some(v) = self.modsecurity_response_body_limit {
+                c.modsecurity_response_body_limit = v;
             }
         }
         // A level that names any `auth_request_set` replaces the inherited
@@ -1696,11 +1711,22 @@ impl Builder {
             }
             #[cfg(feature = "modsecurity")]
             "modsecurity" => c.modsecurity = Some(flag(d)?),
+            #[cfg(feature = "modsecurity")]
+            "modsecurity_response_body" => c.modsecurity_response_body = Some(flag(d)?),
+            #[cfg(feature = "modsecurity")]
+            "modsecurity_response_body_limit" => {
+                want_args(d, 1)?;
+                c.modsecurity_response_body_limit = Some(size_arg(d, 0)? as usize);
+            }
             // Without the feature these are real directives that this binary
             // cannot honour. Saying so beats "unknown directive", which reads
             // like a typo and sends the operator looking in the wrong place.
             #[cfg(not(feature = "modsecurity"))]
-            "modsecurity" | "modsecurity_rules_file" | "modsecurity_rules" => {
+            "modsecurity"
+            | "modsecurity_rules_file"
+            | "modsecurity_rules"
+            | "modsecurity_response_body"
+            | "modsecurity_response_body_limit" => {
                 let msg = format!(
                     "{}: \"{}\" needs a build with the \"modsecurity\" feature; \
                      this binary has no rule engine, so nothing is being inspected",

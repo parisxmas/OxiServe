@@ -74,6 +74,12 @@ pub struct Ctx<'a> {
     /// is dropped, which the connection loop does only after the response has
     /// been written — the same point at which nginx runs its cleanup handler.
     pub limit_conns: Vec<crate::server::limit_conn::Guard>,
+    /// The ModSecurity transaction, opened during the request phases and kept
+    /// so the response phases run against the *same* one. Phase 3 rules read
+    /// what phase 2 recorded, and the anomaly score CRS accumulates spans
+    /// both — a fresh transaction for the response would score from zero.
+    #[cfg(feature = "modsecurity")]
+    pub modsec: Option<crate::waf::Transaction>,
 }
 
 impl<'a> Ctx<'a> {
@@ -121,6 +127,8 @@ impl<'a> Ctx<'a> {
             auth_depth: 0,
             matched: None,
             limit_conns: Vec::new(),
+            #[cfg(feature = "modsecurity")]
+            modsec: None,
         }
     }
 

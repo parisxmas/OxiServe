@@ -39,16 +39,16 @@ There is no glibc version to match and nothing to install alongside it, so the
 same file runs on Debian, Ubuntu, RHEL, Alpine or anything else with a kernel
 new enough to matter.
 
-The latest release is **v0.2.36**. `$(uname -m)` picks the right architecture,
+The latest release is **v0.2.37**. `$(uname -m)` picks the right architecture,
 so these run as they are on both x86_64 and aarch64:
 
 ```console
-$ curl -fsSLO https://github.com/parisxmas/OxiServe/releases/download/v0.2.36/oxiserve-0.2.36-linux-$(uname -m).tar.gz
-$ curl -fsSLO https://github.com/parisxmas/OxiServe/releases/download/v0.2.36/SHA256SUMS
+$ curl -fsSLO https://github.com/parisxmas/OxiServe/releases/download/v0.2.37/oxiserve-0.2.37-linux-$(uname -m).tar.gz
+$ curl -fsSLO https://github.com/parisxmas/OxiServe/releases/download/v0.2.37/SHA256SUMS
 $ sha256sum -c --ignore-missing SHA256SUMS
 
-$ tar -xzf oxiserve-0.2.36-linux-$(uname -m).tar.gz
-$ sudo install -m 755 oxiserve-0.2.36-linux-$(uname -m)/oxiserve /usr/local/bin/
+$ tar -xzf oxiserve-0.2.37-linux-$(uname -m).tar.gz
+$ sudo install -m 755 oxiserve-0.2.37-linux-$(uname -m)/oxiserve /usr/local/bin/
 ```
 
 `SHA256SUMS` covers every archive in the release, hence `--ignore-missing` —
@@ -60,7 +60,7 @@ worth running against your real `nginx.conf` before anything else:
 
 ```console
 $ oxiserve -v
-oxiserve version: oxiserve/0.2.36
+oxiserve version: oxiserve/0.2.37
 
 $ oxiserve -t -c /etc/nginx/nginx.conf
 ```
@@ -560,16 +560,35 @@ instead of the server starting and discovering it on the first request. A
 blocked request logs which rule blocked it, at `[warn]`, alongside everything
 else.
 
-### What runs, and what does not
+### Response-phase rules
 
-Wired: connection, URI, request headers, request body — verified against CRS
-4.7.0, which blocks SQLi, XSS and path traversal here while leaving a benign
-query alone.
+All five phases run: connection, URI and request headers (1–2), response
+headers (3), response body (4), logging (5). One transaction spans them, which
+matters for CRS — its anomaly score accumulates across phases, and a fresh
+transaction for the response would start that count from zero and let a request
+that scored 4 going in and 3 coming out look like two harmless halves.
 
-**Response-phase rules do not run yet.** A `SecRule RESPONSE_BODY` or
-`RESPONSE_HEADERS` in a loaded file is parsed and never consulted, so the CRS
-rules that catch a backend leaking SQL errors or stack traces are not in force.
-Everything that inspects the *request* is.
+Phase 4 is **off by default**, because inspecting a response body means holding
+it in memory — the opposite of what `sendfile` and the mmap path exist to do:
+
+```nginx
+http {
+    modsecurity_response_body on;
+    modsecurity_response_body_limit 512k;   # the default
+}
+```
+
+A body over the limit is served without being inspected rather than buffered
+without bound. That is a real gap, so it is worth setting the limit above the
+responses you actually care about rather than leaving a 2 MB error page
+unexamined. Proxied bodies are buffered up to the limit and then forwarded
+unchanged — verified byte-for-byte on a 400 KB response, both under and over
+the limit. A `Connection: upgrade` tunnel is never inspected: past the upgrade
+there is no response body in the HTTP sense.
+
+Verified against CRS 4.7.0 — SQLi, XSS and path traversal blocked on the way
+in, and a backend leaking `SQL syntax error` blocked on the way out, with
+benign traffic untouched in both directions.
 
 One implementation note that is easy to be bitten by: libmodsecurity's rule
 parser is a non-reentrant flex scanner, and two threads calling it at once

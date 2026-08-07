@@ -40,7 +40,34 @@ enum Step {
     Named(Arc<str>),
 }
 
+/// Handles the request, then lets the rule engine see the response.
+///
+/// The response phases live here rather than in each protocol's connection
+/// loop because HTTP/1, HTTP/2 and HTTP/3 all come through this function —
+/// hooking it once is what keeps them from drifting apart.
 pub async fn handle(ctx: &mut Ctx<'_>) -> Reply {
+    #[cfg(not(feature = "modsecurity"))]
+    {
+        handle_inner(ctx).await
+    }
+    #[cfg(feature = "modsecurity")]
+    {
+        let mut reply = handle_inner(ctx).await;
+        // `matched` is the location the request actually reached, which is
+        // where `modsecurity off` for one path has to be read from.
+        let core = match &ctx.matched {
+            Some(loc) => loc.core.clone(),
+            None => ctx.server.core.clone(),
+        };
+        match super::modsec::inspect_response(ctx, &core, &mut reply).await {
+            Some(super::modsec::Blocked::Status(code)) => error_reply(ctx, code),
+            Some(super::modsec::Blocked::Redirect(r)) => r,
+            None => reply,
+        }
+    }
+}
+
+async fn handle_inner(ctx: &mut Ctx<'_>) -> Reply {
     // Phase 1: server-level rewrites and conditions.
     //
     // The `Arc` is cloned, not the directive lists. Cloning the `Vec<Rewrite>`
@@ -261,7 +288,7 @@ async fn dispatch(ctx: &mut Ctx<'_>, loc: &Arc<Location>, internal: bool) -> Ste
     // double-count in the audit log.
     #[cfg(feature = "modsecurity")]
     if !internal {
-        match super::modsec::inspect(ctx, &loc.core) {
+        match super::modsec::inspect_request(ctx, &loc.core) {
             Some(super::modsec::Blocked::Status(code)) => return Step::Fail(code),
             Some(super::modsec::Blocked::Redirect(reply)) => return Step::Done(reply),
             None => {}

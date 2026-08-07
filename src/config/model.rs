@@ -305,6 +305,15 @@ pub struct CoreConf {
     /// in one location is the ordinary way to exempt a path.
     #[cfg(feature = "modsecurity")]
     pub modsecurity: bool,
+    /// Whether phase 4 runs. Off by default because inspecting a response body
+    /// means holding it in memory, which is the opposite of what `sendfile`
+    /// and the mmap path exist to do — the cost should be asked for.
+    #[cfg(feature = "modsecurity")]
+    pub modsecurity_response_body: bool,
+    /// How much of a response body to inspect. Past this the response is
+    /// served unread by the rules rather than buffered without bound.
+    #[cfg(feature = "modsecurity")]
+    pub modsecurity_response_body_limit: usize,
     pub server_tokens: ServerTokens,
     pub etag: bool,
     pub msie_padding: bool,

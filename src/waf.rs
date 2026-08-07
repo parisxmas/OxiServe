@@ -24,7 +24,7 @@
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::os::raw::c_uchar;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// libmodsecurity parses rules with a flex scanner that is not reentrant —
 /// two threads calling `msc_rules_add*` concurrently abort the process with
@@ -133,6 +133,8 @@ extern "C" {
     ) -> c_int;
     fn msc_process_response_headers(t: *mut TransactionT, code: c_int, protocol: *const c_char)
         -> c_int;
+    fn msc_append_response_body(t: *mut TransactionT, body: *const c_uchar, size: usize) -> c_int;
+    fn msc_process_response_body(t: *mut TransactionT) -> c_int;
     fn msc_process_logging(t: *mut TransactionT) -> c_int;
     fn msc_intervention(t: *mut TransactionT, it: *mut Intervention) -> c_int;
     fn msc_transaction_cleanup(t: *mut TransactionT);
@@ -211,14 +213,17 @@ impl Engine {
         Ok(())
     }
 
-    pub fn transaction(&self) -> Option<Transaction<'_>> {
-        // Safety: both handles outlive the transaction — the borrow ties the
-        // transaction's lifetime to this engine.
+    /// Takes `&Arc<Self>` so the transaction can own a reference to the engine.
+    /// A borrow would be simpler, but the transaction has to survive from the
+    /// request phases to the response phases — stored in the request context in
+    /// between — and a lifetime tied to a `&self` cannot cross that.
+    pub fn transaction(self: &Arc<Self>) -> Option<Transaction> {
+        // Safety: both handles live as long as the Arc the transaction holds.
         let t = unsafe { msc_new_transaction(self.msc, self.rules, std::ptr::null_mut()) };
         if t.is_null() {
             return None;
         }
-        Some(Transaction { t, _engine: std::marker::PhantomData })
+        Some(Transaction { t, _engine: self.clone() })
     }
 }
 
@@ -256,12 +261,13 @@ fn take_error(err: *const c_char, fallback: impl FnOnce() -> String) -> String {
 ///
 /// Deliberately not `Send`: libmodsecurity does not promise a transaction can
 /// move between threads, and a request never needs it to.
-pub struct Transaction<'a> {
+pub struct Transaction {
     t: *mut TransactionT,
-    _engine: std::marker::PhantomData<&'a Engine>,
+    /// Keeps the rule set alive; the transaction points into it.
+    _engine: Arc<Engine>,
 }
 
-impl Transaction<'_> {
+impl Transaction {
     pub fn connection(&mut self, client: &str, client_port: u16, server: &str, server_port: u16) {
         let (Ok(c), Ok(s)) = (CString::new(client), CString::new(server)) else {
             return;
@@ -333,6 +339,17 @@ impl Transaction<'_> {
         self.intervention()
     }
 
+    /// Phase 4. `body` is what the client is about to receive; a caller that
+    /// cannot produce it should skip this rather than pass an empty slice,
+    /// which would tell the rules the response was empty.
+    pub fn response_body(&mut self, body: &[u8]) -> Verdict {
+        if !body.is_empty() {
+            unsafe { msc_append_response_body(self.t, body.as_ptr(), body.len()) };
+        }
+        unsafe { msc_process_response_body(self.t) };
+        self.intervention()
+    }
+
     /// Runs the logging phase. Rules with `nolog` produce nothing; the audit
     /// engine is configured by the rules themselves, not from here.
     pub fn logging(&mut self) {
@@ -394,7 +411,7 @@ fn take_owned_string(p: *mut c_char) -> Option<String> {
     Some(s)
 }
 
-impl Drop for Transaction<'_> {
+impl Drop for Transaction {
     fn drop(&mut self) {
         // Safety: the pointer came from msc_new_transaction and is freed once.
         unsafe { msc_transaction_cleanup(self.t) };
@@ -405,10 +422,10 @@ impl Drop for Transaction<'_> {
 mod tests {
     use super::*;
 
-    fn engine_with(rules: &str) -> Engine {
+    fn engine_with(rules: &str) -> Arc<Engine> {
         let mut e = Engine::new().expect("engine");
         e.add_rules_inline(rules).expect("rules");
-        e
+        Arc::new(e)
     }
 
     #[test]
@@ -487,6 +504,64 @@ mod tests {
         // cannot promise every rule in a file is sound — only that the file
         // parses.
         assert!(e.add_rules_inline("SecRule ARGS \"@rx (\" \"id:9\"\n").is_ok());
+    }
+
+    #[test]
+    fn a_response_header_rule_blocks_in_phase_3() {
+        let e = engine_with(
+            "SecRuleEngine On\n\
+             SecRule RESPONSE_HEADERS:X-Powered-By \"@rx .\" \"id:20,phase:3,deny,status:500\"\n",
+        );
+        let mut t = e.transaction().unwrap();
+        t.connection("10.0.0.1", 1234, "10.0.0.2", 80);
+        t.uri("/", "GET", "1.1");
+        let _ = t.process_request_headers();
+        let _ = t.request_body(b"");
+        t.response_header(b"Content-Type", b"text/html");
+        t.response_header(b"X-Powered-By", b"PHP/8.1");
+        assert_eq!(t.process_response_headers(200, "1.1"), Verdict::Block { status: 500 });
+    }
+
+    #[test]
+    fn a_response_body_rule_blocks_in_phase_4() {
+        // The leak case: the request was clean, so nothing before phase 4 has
+        // any reason to object.
+        let e = engine_with(
+            "SecRuleEngine On\n\
+             SecResponseBodyAccess On\n\
+             SecResponseBodyMimeType text/plain text/html\n\
+             SecRule RESPONSE_BODY \"@rx (?i)sql syntax error\" \"id:21,phase:4,deny,status:500\"\n",
+        );
+        let mut t = e.transaction().unwrap();
+        t.connection("10.0.0.1", 1234, "10.0.0.2", 80);
+        t.uri("/", "GET", "1.1");
+        let _ = t.process_request_headers();
+        let _ = t.request_body(b"");
+        t.response_header(b"Content-Type", b"text/html");
+        assert_eq!(t.process_response_headers(200, "1.1"), Verdict::Allow);
+        assert_eq!(
+            t.response_body(b"SQL syntax error near unexpected token"),
+            Verdict::Block { status: 500 }
+        );
+    }
+
+    #[test]
+    fn a_clean_response_passes_every_phase() {
+        let e = engine_with(
+            "SecRuleEngine On\n\
+             SecResponseBodyAccess On\n\
+             SecResponseBodyMimeType text/plain text/html\n\
+             SecRule RESPONSE_BODY \"@rx (?i)sql syntax error\" \"id:22,phase:4,deny,status:500\"\n",
+        );
+        let mut t = e.transaction().unwrap();
+        t.connection("10.0.0.1", 1234, "10.0.0.2", 80);
+        t.uri("/", "GET", "1.1");
+        assert_eq!(t.process_request_headers(), Verdict::Allow);
+        assert_eq!(t.request_body(b""), Verdict::Allow);
+        t.response_header(b"Content-Type", b"text/html");
+        assert_eq!(t.process_response_headers(200, "1.1"), Verdict::Allow);
+        assert_eq!(t.response_body(b"an ordinary page"), Verdict::Allow);
+        t.logging();
     }
 
     #[test]
