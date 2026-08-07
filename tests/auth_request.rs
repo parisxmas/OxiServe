@@ -339,3 +339,39 @@ fn a_relative_auth_request_uri_is_a_config_error() {
     let err = oxiserve::config::load(&f, dir).unwrap_err().to_string();
     assert!(err.contains("auth_request"), "got: {err}");
 }
+
+/// A subrequest is not a request the client made, so neither limiter may
+/// charge it — the auth location inherits the server's limits and would
+/// otherwise compete with the very request it is authorising. `limit_conn`
+/// makes that a deadlock rather than an overcount: the main request holds the
+/// only slot, its own subrequest is refused, and the verdict comes back as a
+/// 500 that has nothing to do with authorisation.
+#[test]
+fn a_server_wide_limit_conn_does_not_break_its_own_auth_subrequest() {
+    let a = Auth::start(|_| ok(""));
+    let s = Server::start(
+        "authlimitconn",
+        &format!(
+            "limit_conn_zone $binary_remote_addr zone=perip:1m;\n{}",
+            conf(a.port, "limit_conn perip 1;")
+        ),
+    );
+    let (status, _, body) = s.get("/private");
+    assert_eq!(status, 200, "the subrequest must not compete with its own parent");
+    assert_eq!(body, "secret");
+}
+
+#[test]
+fn a_server_wide_limit_req_does_not_break_its_own_auth_subrequest() {
+    let a = Auth::start(|_| ok(""));
+    let s = Server::start(
+        "authlimitreq",
+        &format!(
+            "limit_req_zone $binary_remote_addr zone=perip2:1m rate=1r/s;\n{}",
+            conf(a.port, "limit_req zone=perip2;")
+        ),
+    );
+    let (status, _, body) = s.get("/private");
+    assert_eq!(status, 200, "the subrequest must not spend the parent's rate budget");
+    assert_eq!(body, "secret");
+}

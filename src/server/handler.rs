@@ -200,8 +200,8 @@ async fn route(ctx: &mut Ctx<'_>, internal: bool) -> Step {
         // declared at server level still applies. Missing this meant a config
         // with no location block was not rate limited at all.
         let srv = ctx.server.clone();
-        if !internal && !srv.core.limit_reqs.is_empty() {
-            if let Some(status) = apply_limit_req(ctx, &srv.core).await {
+        if !internal {
+            if let Some(status) = apply_limits(ctx, &srv.core).await {
                 return Step::Fail(status);
             }
         }
@@ -235,11 +235,11 @@ async fn dispatch(ctx: &mut Ctx<'_>, loc: &Arc<Location>, internal: bool) -> Ste
         return Step::Fail(404);
     }
 
-    // Rate limiting runs before any work is done for the request, and only on
-    // the real client request — an internal redirect is the same request and
-    // must not be charged twice.
-    if !internal && !loc.core.limit_reqs.is_empty() {
-        if let Some(status) = apply_limit_req(ctx, &loc.core).await {
+    // Limiting runs before any work is done for the request, and only on the
+    // real client request — an internal redirect is the same request and must
+    // not be charged twice.
+    if !internal {
+        if let Some(status) = apply_limits(ctx, &loc.core).await {
             return Step::Fail(status);
         }
     }
@@ -370,6 +370,65 @@ async fn run_auth_request(
         401 | 403 => Err(status),
         _ => Err(500),
     }
+}
+
+/// Applies `limit_conn` and then `limit_req`, in nginx's module order.
+///
+/// The order is load-bearing: a `limit_req` delay holds the request, and the
+/// connection slot has to be held across that wait — otherwise a delayed
+/// request would stop counting against `limit_conn` precisely while it is
+/// occupying the server.
+///
+/// Both callers gate this on the request not being internal, which is what
+/// keeps an `auth_request` subrequest from being charged as a second request.
+/// With `limit_conn` that would be a self-deadlock, not just an overcount: the
+/// main request holds the only slot while its own subrequest asks for another.
+async fn apply_limits(ctx: &mut Ctx<'_>, core: &CoreConf) -> Option<u16> {
+    if !core.limit_conns.is_empty() {
+        if let Some(status) = apply_limit_conn(ctx, core) {
+            return Some(status);
+        }
+    }
+    if !core.limit_reqs.is_empty() {
+        return apply_limit_req(ctx, core).await;
+    }
+    None
+}
+
+/// Takes a slot in every `limit_conn` zone that applies, parking the guards on
+/// the context so they are released when the request ends.
+///
+/// A rejection leaves the slots already taken in place rather than unwinding
+/// them; they come back with the rest at the end of the request, which is
+/// exactly what nginx's per-limit cleanup handlers do.
+fn apply_limit_conn(ctx: &mut Ctx<'_>, core: &CoreConf) -> Option<u16> {
+    // Lifted out of the loop so the zone lookups borrow the configuration
+    // rather than `ctx`, which the guards are pushed onto.
+    let http = ctx.http;
+    let mut key = String::with_capacity(32);
+    for l in core.limit_conns.iter() {
+        let Some(zone) = http.limit_conn_zones.get(&l.zone) else {
+            // Config load rejects unknown zones, so this is unreachable.
+            continue;
+        };
+        key.clear();
+        if let Some(t) = http.limit_conn_keys.get(&l.zone) {
+            t.render_into(&*ctx, &mut key);
+        }
+        if key.is_empty() {
+            // nginx skips a request whose key evaluates empty.
+            continue;
+        }
+        match zone.acquire(&key, l.limit) {
+            Some(g) => ctx.limit_conns.push(g),
+            // Dry run still had its chance to take a slot, and did not get
+            // one; the point of the mode is that the request goes through
+            // anyway, so the operator can size the limit before it bites.
+            None if core.limit_conn_dry_run => {}
+            None => return Some(core.limit_conn_status),
+        }
+    }
+    None
 }
 
 /// Evaluates every `limit_req` that applies. Returns the rejection status if

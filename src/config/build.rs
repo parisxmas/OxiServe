@@ -235,6 +235,9 @@ pub fn default_core() -> CoreConf {
         proxy_cache: ProxyCacheConf::default(),
         limit_reqs: Arc::new(Vec::new()),
         limit_req_status: 503,
+        limit_conns: Arc::new(Vec::new()),
+        limit_conn_status: 503,
+        limit_conn_dry_run: false,
     }
 }
 
@@ -312,6 +315,9 @@ struct CoreLayer {
     cache_lock_timeout: Option<Duration>,
     limit_reqs: Option<Vec<LimitReq>>,
     limit_req_status: Option<u16>,
+    limit_conns: Option<Vec<LimitConn>>,
+    limit_conn_status: Option<u16>,
+    limit_conn_dry_run: Option<bool>,
     ofc_min_uses: Option<u32>,
     ofc_errors: Option<bool>,
     // proxy_* are accumulated rather than replaced, matching nginx's
@@ -442,6 +448,16 @@ impl CoreLayer {
         }
         if let Some(v) = self.limit_req_status {
             c.limit_req_status = v;
+        }
+        // `limit_conn` follows the same list rule.
+        if let Some(v) = &self.limit_conns {
+            c.limit_conns = Arc::new(v.clone());
+        }
+        if let Some(v) = self.limit_conn_status {
+            c.limit_conn_status = v;
+        }
+        if let Some(v) = self.limit_conn_dry_run {
+            c.limit_conn_dry_run = v;
         }
 
         if let Some(v) = &self.auth_request {
@@ -604,7 +620,6 @@ pub struct Builder {
 const KNOWN_UNIMPLEMENTED: &[&str] = &[
     "uwsgi_pass", "scgi_pass", "grpc_pass", "memcached_pass",
     "auth_basic", "auth_basic_user_file",
-    "limit_conn", "limit_conn_zone",
     "ssi", "sub_filter", "sub_filter_types", "addition_before_body",
     "dav_methods", "mp4", "flv", "xslt_stylesheet", "image_filter",
     "stub_status", "perl", "js_content",
@@ -769,6 +784,7 @@ impl Builder {
 
         let mut upstreams: HashMap<Box<str>, Arc<Upstream>> = HashMap::new();
         let mut zone_defs: Vec<LimitReqZoneDef> = Vec::new();
+        let mut conn_zone_defs: Vec<LimitConnZoneDef> = Vec::new();
         let mut cache_defs: Vec<Arc<crate::server::cache::Zone>> = Vec::new();
         let mut maps = Vec::new();
         let mut level = Level::default();
@@ -808,6 +824,10 @@ impl Builder {
                 "limit_req_zone" => {
                     want_args_range(c, 3, 4)?;
                     zone_defs.push(parse_limit_req_zone(c)?);
+                }
+                "limit_conn_zone" => {
+                    want_args(c, 2)?;
+                    conn_zone_defs.push(parse_limit_conn_zone(c)?);
                 }
                 "upstream" => {
                     want_args(c, 1)?;
@@ -862,12 +882,22 @@ impl Builder {
             );
             limit_req_keys.insert(z.name.clone(), z.key.clone());
         }
-        // A `limit_req` naming a zone that was never declared is a config
-        // error, not a silently disabled limit.
+        let mut limit_conn_zones: HashMap<Box<str>, Arc<crate::server::limit_conn::Zone>> =
+            HashMap::new();
+        let mut limit_conn_keys: HashMap<Box<str>, Arc<Template>> = HashMap::new();
+        for z in &conn_zone_defs {
+            limit_conn_zones.insert(
+                z.name.clone(),
+                Arc::new(crate::server::limit_conn::Zone::new(&z.name, z.max_entries)),
+            );
+            limit_conn_keys.insert(z.name.clone(), z.key.clone());
+        }
+        // A `limit_req` or `limit_conn` naming a zone that was never declared
+        // is a config error, not a silently disabled limit.
         for s in &servers {
-            check_zones_exist(&s.core, &limit_req_zones)?;
+            check_zones_exist(&s.core, &limit_req_zones, &limit_conn_zones)?;
             for l in s.locations.prefix.iter().chain(&s.locations.regex).chain(&s.locations.exact) {
-                check_zones_exist(&l.core, &limit_req_zones)?;
+                check_zones_exist(&l.core, &limit_req_zones, &limit_conn_zones)?;
             }
         }
 
@@ -886,6 +916,8 @@ impl Builder {
             cache_zones,
             limit_req_zones,
             limit_req_keys,
+            limit_conn_zones,
+            limit_conn_keys,
             listeners,
             upstreams,
             maps,
@@ -1639,6 +1671,38 @@ impl Builder {
                 }
             }
             "limit_req_log_level" => {}
+            "limit_conn" => {
+                want_args(d, 2)?;
+                let limit: u32 = d.args[1].parse().ok().filter(|n| *n > 0).ok_or_else(|| {
+                    BuildError {
+                        msg: format!(
+                            "invalid number of connections \"{}\" in \"limit_conn\"",
+                            d.args[1]
+                        ),
+                        loc: d.loc(),
+                    }
+                })?;
+                if limit > crate::server::limit_conn::MAX_CONNS {
+                    bail!(
+                        d,
+                        "\"limit_conn\" number {limit} exceeds the maximum of {}",
+                        crate::server::limit_conn::MAX_CONNS
+                    );
+                }
+                lv.core
+                    .limit_conns
+                    .get_or_insert_with(Vec::new)
+                    .push(LimitConn { zone: d.args[0].as_str().into(), limit });
+            }
+            "limit_conn_status" => {
+                want_args(d, 1)?;
+                c.limit_conn_status = d.args[0].parse().ok().filter(|s| (400..600).contains(s));
+                if c.limit_conn_status.is_none() {
+                    bail!(d, "invalid status \"{}\" in \"limit_conn_status\"", d.args[0]);
+                }
+            }
+            "limit_conn_dry_run" => c.limit_conn_dry_run = Some(flag(d)?),
+            "limit_conn_log_level" => {}
             "open_file_cache" => {
                 want_args_range(d, 1, 3)?;
                 if d.args[0] == "off" {
@@ -2212,6 +2276,7 @@ fn check_cache_zone(
 fn check_zones_exist(
     core: &CoreConf,
     zones: &HashMap<Box<str>, Arc<crate::server::limit_req::Zone>>,
+    conn_zones: &HashMap<Box<str>, Arc<crate::server::limit_conn::Zone>>,
 ) -> R<()> {
     for l in core.limit_reqs.iter() {
         if !zones.contains_key(&l.zone) {
@@ -2221,7 +2286,41 @@ fn check_zones_exist(
             });
         }
     }
+    for l in core.limit_conns.iter() {
+        if !conn_zones.contains_key(&l.zone) {
+            return Err(BuildError {
+                msg: format!("unknown limit_conn zone \"{}\"", l.zone),
+                loc: "limit_conn".into(),
+            });
+        }
+    }
     Ok(())
+}
+
+/// `limit_conn_zone $key zone=name:10m;`
+///
+/// Unlike `limit_req_zone` there is no rate: the size is the whole
+/// configuration, because what a `limit_conn` costs is one tracked key.
+fn parse_limit_conn_zone(d: &Directive) -> R<LimitConnZoneDef> {
+    let key = Arc::new(Template::compile(&d.args[0]));
+    let v = d.args[1].strip_prefix("zone=").ok_or_else(|| BuildError {
+        msg: format!("invalid parameter \"{}\" in \"limit_conn_zone\"", d.args[1]),
+        loc: d.loc(),
+    })?;
+    let (name, size) = v.split_once(':').ok_or_else(|| BuildError {
+        msg: format!("invalid \"zone=\" value \"{v}\", expected name:size"),
+        loc: d.loc(),
+    })?;
+    let bytes = parse_size(size).ok_or_else(|| BuildError {
+        msg: format!("invalid zone size \"{size}\""),
+        loc: d.loc(),
+    })?;
+    if name.is_empty() {
+        bail!(d, "\"limit_conn_zone\" requires a zone name");
+    }
+    // nginx budgets roughly 64 bytes per tracked key, as for limit_req.
+    let max_entries = ((bytes / 64) as usize).max(1);
+    Ok(LimitConnZoneDef { name: name.into(), key, max_entries })
 }
 
 /// `limit_req_zone $key zone=name:10m rate=5r/s;`
@@ -2471,9 +2570,9 @@ mod tests {
 
     #[test]
     fn known_unimplemented_gets_a_clearer_message() {
-        let c = build(&format!("{MIN} location / {{ limit_conn addr 10; }} }} }}")).unwrap();
+        let c = build(&format!("{MIN} location / {{ ssi on; }} }} }}")).unwrap();
         assert!(
-            c.unsupported.iter().any(|u| u.contains("not implemented yet") && u.contains("limit_conn")),
+            c.unsupported.iter().any(|u| u.contains("not implemented yet") && u.contains("ssi")),
             "{:?}",
             c.unsupported
         );
@@ -2608,6 +2707,79 @@ mod tests {
         assert!(loc.core.limit_reqs[0].nodelay);
         assert_eq!(loc.core.limit_req_status, 429);
         assert!(c.unsupported.is_empty(), "{:?}", c.unsupported);
+    }
+
+    #[test]
+    fn limit_conn_zone_and_directive_parse() {
+        let c = build(
+            "events {} http { limit_conn_zone $binary_remote_addr zone=perip:10m; \
+             limit_conn_status 429; \
+             server { listen 80; location / { limit_conn perip 5; } } }",
+        )
+        .unwrap();
+        let http = c.http.unwrap();
+        let z = http.limit_conn_zones.get("perip").expect("zone registered");
+        assert_eq!(z.max_entries, 10 * 1024 * 1024 / 64);
+        assert!(http.limit_conn_keys.contains_key("perip"), "the zone's key must be kept");
+        let loc = &http.servers[0].locations.prefix[0];
+        assert_eq!(loc.core.limit_conns.len(), 1);
+        assert_eq!(&*loc.core.limit_conns[0].zone, "perip");
+        assert_eq!(loc.core.limit_conns[0].limit, 5);
+        assert_eq!(loc.core.limit_conn_status, 429);
+        assert!(c.unsupported.is_empty(), "{:?}", c.unsupported);
+    }
+
+    #[test]
+    fn limit_conn_inherits_and_replaces_wholesale() {
+        let c = build(
+            "events {} http { limit_conn_zone $binary_remote_addr zone=a:1m; \
+             limit_conn_zone $server_name zone=b:1m; \
+             server { listen 80; limit_conn a 3; \
+               location /inherit { return 200; } \
+               location /own { limit_conn b 7; } } }",
+        )
+        .unwrap();
+        let http = c.http.unwrap();
+        let srv = &http.servers[0];
+        assert_eq!(srv.core.limit_conns.len(), 1);
+        let by = |p: &str| {
+            srv.locations
+                .prefix
+                .iter()
+                .find(|l| l.matcher.prefix() == Some(p))
+                .unwrap_or_else(|| panic!("no location {p}"))
+                .clone()
+        };
+        assert_eq!(&*by("/inherit").core.limit_conns[0].zone, "a", "server level inherits down");
+        let own = by("/own");
+        assert_eq!(own.core.limit_conns.len(), 1, "a level that declares any replaces the set");
+        assert_eq!(&*own.core.limit_conns[0].zone, "b");
+    }
+
+    #[test]
+    fn limit_conn_rejects_bad_arguments() {
+        let e = build(
+            "events {} http { limit_conn_zone $binary_remote_addr zone=z:1m; \
+             server { listen 80; location / { limit_conn z 0; } } }",
+        )
+        .unwrap_err();
+        assert!(e.msg.contains("invalid number of connections"), "{}", e.msg);
+
+        let e = build("events {} http { server { listen 80; location / { limit_conn z 1; } } }")
+            .unwrap_err();
+        assert!(e.msg.contains("unknown limit_conn zone"), "{}", e.msg);
+
+        let e = build(
+            "events {} http { limit_conn_zone $binary_remote_addr zone=z:1m; \
+             server { listen 80; location / { limit_conn z 70000; } } }",
+        )
+        .unwrap_err();
+        assert!(e.msg.contains("exceeds the maximum"), "{}", e.msg);
+
+        let e = build("events {} http { limit_conn_zone $binary_remote_addr perip:1m; \
+             server { listen 80; } }")
+            .unwrap_err();
+        assert!(e.msg.contains("limit_conn_zone"), "{}", e.msg);
     }
 
     #[test]

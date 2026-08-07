@@ -19,12 +19,14 @@ pub mod fcache;
 pub mod fcgi_proto;
 pub mod files;
 pub mod handler;
+pub mod limit_conn;
 pub mod limit_req;
 pub mod log;
 pub mod msgpack;
 pub mod preread;
 pub mod proxy;
 pub mod reply;
+pub mod shm;
 pub mod stream;
 pub mod transport;
 pub mod upstream;
@@ -139,6 +141,8 @@ impl Generation {
                     cache_zones: Default::default(),
                     limit_req_zones: Default::default(),
                     limit_req_keys: Default::default(),
+                    limit_conn_zones: Default::default(),
+                    limit_conn_keys: Default::default(),
                     listeners: Vec::new(),
                     upstreams: Default::default(),
                     maps: Vec::new(),

@@ -70,6 +70,10 @@ pub struct Ctx<'a> {
     /// The location `route` selected, cached so response decoration and
     /// `error_page` lookup do not each repeat the location search.
     pub matched: Option<Arc<crate::config::model::Location>>,
+    /// `limit_conn` slots this request holds. They are released when the `Ctx`
+    /// is dropped, which the connection loop does only after the response has
+    /// been written — the same point at which nginx runs its cleanup handler.
+    pub limit_conns: Vec<crate::server::limit_conn::Guard>,
 }
 
 impl<'a> Ctx<'a> {
@@ -116,6 +120,7 @@ impl<'a> Ctx<'a> {
             upstream_headers: Vec::new(),
             auth_depth: 0,
             matched: None,
+            limit_conns: Vec::new(),
         }
     }
 

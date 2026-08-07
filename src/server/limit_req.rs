@@ -41,6 +41,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use super::shm::Shared;
+
 /// nginx stores `rate` and `excess` scaled by 1000 so a fractional
 /// requests-per-second value stays exact in integer arithmetic.
 pub const SCALE: u64 = 1000;
@@ -116,63 +118,6 @@ fn unpack(w: u64) -> (u64, u64) {
     ((w >> EXCESS_BITS) & MS_MASK, w & EXCESS_MASK)
 }
 
-/// A `MAP_SHARED | MAP_ANONYMOUS` region of atomics.
-///
-/// `Vec<AtomicU64>` would carry the same bits, but its pages would be private
-/// to the process: after `fork` each worker would write to its own copy and
-/// the zone would stop being one zone. `MAP_SHARED` is the entire point.
-struct Shared {
-    ptr: *mut AtomicU64,
-    words: usize,
-}
-
-// SAFETY: every access goes through &AtomicU64; the mapping outlives the Zone
-// that owns it and is unmapped exactly once, on drop.
-unsafe impl Send for Shared {}
-unsafe impl Sync for Shared {}
-
-impl Shared {
-    fn new(words: usize) -> Shared {
-        let bytes = words * std::mem::size_of::<AtomicU64>();
-        // SAFETY: an anonymous mapping with no file behind it; checked for
-        // MAP_FAILED before use. Zero-filled by the kernel, and zero is this
-        // table's "empty" in both words.
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                bytes,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert!(
-            !std::ptr::eq(ptr, libc::MAP_FAILED),
-            "mmap for a limit_req zone failed: {}",
-            std::io::Error::last_os_error()
-        );
-        Shared { ptr: ptr.cast(), words }
-    }
-
-    #[inline]
-    fn at(&self, i: usize) -> &AtomicU64 {
-        debug_assert!(i < self.words);
-        // SAFETY: `i` is always produced by masking with `slots - 1`, and the
-        // mapping holds `words` atomics.
-        unsafe { &*self.ptr.add(i) }
-    }
-}
-
-impl Drop for Shared {
-    fn drop(&mut self) {
-        // SAFETY: exactly the region mapped in `new`.
-        unsafe {
-            libc::munmap(self.ptr.cast(), self.words * std::mem::size_of::<AtomicU64>());
-        }
-    }
-}
-
 /// One `limit_req_zone` at runtime: the shared state behind a zone name.
 ///
 /// Layout: `slots` entries of two words each — `[hash, state]` — where a hash
@@ -220,7 +165,7 @@ impl Zone {
                 h.finish()
             },
             slots,
-            mem: Shared::new(slots * 2),
+            mem: Shared::new(slots * 2, "limit_req"),
         }
     }
 

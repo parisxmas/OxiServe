@@ -207,6 +207,25 @@ pub struct LimitReq {
     pub delay_after: u64,
 }
 
+/// A `limit_conn_zone` declaration, before its runtime state exists.
+#[derive(Debug, Clone)]
+pub struct LimitConnZoneDef {
+    pub name: Box<str>,
+    /// The key to count against, e.g. `$binary_remote_addr`.
+    pub key: Arc<Template>,
+    /// Derived from `zone=name:SIZE` the way nginx does.
+    pub max_entries: usize,
+}
+
+/// One `limit_conn zone number;` applied at a level. As with `limit_req`,
+/// several may apply and every one of them has to admit the request.
+#[derive(Debug, Clone)]
+pub struct LimitConn {
+    pub zone: Box<str>,
+    /// Requests this key may have in flight at once.
+    pub limit: u32,
+}
+
 /// `proxy_cache_valid [code…] time;` — how long each status stays fresh.
 #[derive(Debug, Clone)]
 pub struct CacheValid {
@@ -308,6 +327,12 @@ pub struct CoreConf {
     pub limit_reqs: Arc<Vec<LimitReq>>,
     /// `limit_req_status` — the status returned when a limit rejects.
     pub limit_req_status: u16,
+    pub limit_conns: Arc<Vec<LimitConn>>,
+    /// `limit_conn_status` — the status returned when a limit rejects.
+    pub limit_conn_status: u16,
+    /// `limit_conn_dry_run on` — account the request but never refuse it, so a
+    /// limit can be sized against real traffic before it starts rejecting.
+    pub limit_conn_dry_run: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -978,6 +1003,8 @@ pub struct Http {
     pub limit_req_zones: HashMap<Box<str>, Arc<crate::server::limit_req::Zone>>,
     /// Each zone's key template, kept beside it so a location only names a zone.
     pub limit_req_keys: HashMap<Box<str>, Arc<Template>>,
+    pub limit_conn_zones: HashMap<Box<str>, Arc<crate::server::limit_conn::Zone>>,
+    pub limit_conn_keys: HashMap<Box<str>, Arc<Template>>,
     pub listeners: Vec<Arc<Listener>>,
     pub upstreams: HashMap<Box<str>, Arc<Upstream>>,
     pub maps: Vec<Arc<MapConf>>,

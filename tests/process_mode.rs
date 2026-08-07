@@ -197,3 +197,94 @@ fn a_rate_limit_is_one_limit_across_worker_processes() {
          2 would mean each process kept a private bucket"
     );
 }
+
+/// The same property for `limit_conn`, which needs it more than `limit_req`
+/// does: a rate limit that multiplies by the worker count is merely wrong,
+/// while a *count* kept per process also has to be incremented and decremented
+/// in the same process to stay balanced at all.
+///
+/// The backend parks every request it receives, so all the admitted requests
+/// are genuinely in flight at the same moment. With one shared table exactly
+/// one is admitted; with a table per worker, two would be.
+#[test]
+fn a_connection_limit_is_one_limit_across_worker_processes() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    let backend = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+    let arrived = Arc::new(AtomicUsize::new(0));
+    let refused = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let (a, r) = (arrived.clone(), release.clone());
+        let l = std::net::TcpListener::bind(("127.0.0.1", backend)).unwrap();
+        std::thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                let (a, r) = (a.clone(), r.clone());
+                std::thread::spawn(move || {
+                    let mut c = c;
+                    let mut buf = [0u8; 4096];
+                    if c.read(&mut buf).is_err() {
+                        return;
+                    }
+                    a.fetch_add(1, Ordering::SeqCst);
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    while !r.load(Ordering::SeqCst) && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                    let _ = c.flush();
+                });
+            }
+        });
+    }
+
+    let m = Master::start(
+        "shmconn",
+        &format!(
+            "limit_conn_zone $binary_remote_addr zone=pm:1m;\n\
+             server {{ listen {{PORT}} reuseport;\n\
+                 location / {{ limit_conn pm 1; proxy_pass http://127.0.0.1:{backend}; }} }}"
+        ),
+    );
+    assert_eq!(m.worker_pids().len(), 2);
+
+    const CLIENTS: usize = 24;
+    let port = m.port;
+    let clients: Vec<_> = (0..CLIENTS)
+        .map(|_| {
+            let refused = refused.clone();
+            std::thread::spawn(move || {
+                let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                c.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+                c.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                let mut resp = String::new();
+                let _ = c.read_to_string(&mut resp);
+                let status: u16 =
+                    resp.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                if status != 200 {
+                    refused.fetch_add(1, Ordering::SeqCst);
+                }
+                status
+            })
+        })
+        .collect();
+
+    // Every client has either been refused or is parked at the backend before
+    // anything is released, so the admitted ones really did overlap.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while arrived.load(Ordering::SeqCst) + refused.load(Ordering::SeqCst) < CLIENTS {
+        assert!(Instant::now() < deadline, "clients never settled");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    release.store(true, Ordering::SeqCst);
+
+    let admitted =
+        clients.into_iter().map(|t| t.join().unwrap()).filter(|s| *s == 200).count();
+    assert_eq!(
+        admitted, 1,
+        "limit_conn 1 must admit exactly one concurrent request across BOTH workers; \
+         2 would mean each process kept a private counter"
+    );
+}

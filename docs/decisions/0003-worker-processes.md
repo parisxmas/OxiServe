@@ -82,9 +82,14 @@ it, at the cost nginx pays too — a full zone degrades rather than grows.
   historical: we do use shared memory, for exactly the thing nginx uses it
   for. The measured conclusion of ADR-0002 — nothing on the request path
   talks to a database — is unchanged.
-- Future cross-worker state (`limit_conn`, a stats endpoint, cache-lock
-  globalisation) has a template to follow: fixed-layout atomics in the
-  pre-fork mapping, never an allocator.
+- Future cross-worker state (a stats endpoint, cache-lock globalisation) has a
+  template to follow: fixed-layout atomics in the pre-fork mapping, never an
+  allocator. `limit_conn` was the first to follow it, and sharpened it: a
+  *count* must be incremented and decremented in the same place, so its slot
+  is one atomic word — tag and count together — and every transition is a
+  single CAS. The looser pair-of-words layout `limit_req` uses would let a
+  slot be taken over between the read and the increment, and the eventual
+  decrement would land on another key's count.
 - A worker crash no longer takes the server down: the master respawns it.
   This was previously impossible — a panicking worker thread died silently
   and its cores went idle.

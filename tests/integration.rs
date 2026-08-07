@@ -1070,6 +1070,189 @@ fn limit_req_inherits_from_server_into_locations() {
     assert_eq!(s.get("/a").status, 503, "a location must inherit the server's limit");
 }
 
+// ---- limit_conn -----------------------------------------------------------
+
+/// A backend that parks every request until the test lets it answer.
+///
+/// `limit_conn` counts requests *in flight*, so proving anything about it needs
+/// a request that is genuinely still being processed while the next one
+/// arrives. Holding the upstream is the only way to make that deterministic —
+/// timing two client threads against each other is not.
+fn parked_backend() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::Arc;
+
+    let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+    let arrived = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(AtomicBool::new(false));
+    let (a, r) = (arrived.clone(), release.clone());
+    let l = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            let (a, r) = (a.clone(), r.clone());
+            std::thread::spawn(move || {
+                let mut c = c;
+                let mut buf = [0u8; 4096];
+                if c.read(&mut buf).is_err() {
+                    return;
+                }
+                a.fetch_add(1, Ordering::SeqCst);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !r.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                let _ = c.flush();
+            });
+        }
+    });
+    (port, arrived, release)
+}
+
+fn limit_conn_conf(backend: u16, http_extra: &str, loc_extra: &str) -> String {
+    format!("{BASE}
+    limit_conn_zone $binary_remote_addr zone=perip:1m;
+    {http_extra}
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        location /slow {{
+            {loc_extra}
+            proxy_pass http://127.0.0.1:{backend};
+        }}
+    }}
+}}")
+}
+
+/// Blocks until `arrived` reaches `n`, so the test never races the backend.
+fn wait_for(arrived: &std::sync::atomic::AtomicUsize, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while arrived.load(Ordering::SeqCst) < n {
+        assert!(Instant::now() < deadline, "backend never saw {n} request(s)");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn limit_conn_refuses_a_second_concurrent_request() {
+    let (backend, arrived, release) = parked_backend();
+    let s = Server::start(
+        "limitconn",
+        &limit_conn_conf(backend, "", "limit_conn perip 1;"),
+        &[],
+    );
+
+    let port = s.port;
+    let first = std::thread::spawn(move || {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        c.write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        read_response(&mut c).status
+    });
+
+    // Only once the backend has the first request is it certainly in flight.
+    wait_for(&arrived, 1);
+    assert_eq!(s.get("/slow").status, 503, "the second concurrent request must be refused");
+    assert_eq!(arrived.load(Ordering::SeqCst), 1, "the refused request must not reach the backend");
+
+    release.store(true, Ordering::SeqCst);
+    assert_eq!(first.join().unwrap(), 200, "the request that held the slot must still be served");
+
+    // And with the slot given back, the next request goes through.
+    assert_eq!(s.get("/slow").status, 200, "the slot must be released when the request ends");
+}
+
+#[test]
+fn limit_conn_status_is_configurable() {
+    let (backend, arrived, release) = parked_backend();
+    let s = Server::start(
+        "limitconnstatus",
+        &limit_conn_conf(backend, "limit_conn_status 429;", "limit_conn perip 1;"),
+        &[],
+    );
+
+    let port = s.port;
+    let first = std::thread::spawn(move || {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        c.write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        read_response(&mut c).status
+    });
+
+    wait_for(&arrived, 1);
+    assert_eq!(s.get("/slow").status, 429, "limit_conn_status must be honoured");
+    release.store(true, Ordering::SeqCst);
+    first.join().unwrap();
+}
+
+#[test]
+fn limit_conn_dry_run_admits_what_it_would_have_refused() {
+    let (backend, arrived, release) = parked_backend();
+    let s = Server::start(
+        "limitconndry",
+        &limit_conn_conf(backend, "limit_conn_dry_run on;", "limit_conn perip 1;"),
+        &[],
+    );
+
+    let port = s.port;
+    let first = std::thread::spawn(move || {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        c.write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        read_response(&mut c).status
+    });
+
+    wait_for(&arrived, 1);
+    let second = std::thread::spawn(move || {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        c.write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        read_response(&mut c).status
+    });
+    wait_for(&arrived, 2);
+
+    release.store(true, Ordering::SeqCst);
+    assert_eq!(first.join().unwrap(), 200);
+    assert_eq!(second.join().unwrap(), 200, "dry run must not reject");
+}
+
+#[test]
+fn limit_conn_does_not_restrict_sequential_requests() {
+    // The counter is per request-in-flight, not per connection: a keep-alive
+    // client making one request after another must never be refused, however
+    // low the limit.
+    let s = Server::start(
+        "limitconnseq",
+        &format!("{BASE}
+    limit_conn_zone $binary_remote_addr zone=seq:1m;
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        limit_conn seq 1;
+        location / {{ return 200 \"ok\"; }}
+    }}
+}}"),
+        &[],
+    );
+    for i in 0..5 {
+        assert_eq!(s.get("/").status, 200, "sequential request {i} must not be limited");
+    }
+}
+
+#[test]
+fn unknown_limit_conn_zone_is_a_config_error() {
+    let dir = std::env::temp_dir().join(format!("oxiserve-badconnzone-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("bad.conf");
+    std::fs::write(
+        &f,
+        "events {} http { server { listen 80; location / { limit_conn nope 1; } } }",
+    )
+    .unwrap();
+    let err = oxiserve::config::load(&f, dir).unwrap_err().to_string();
+    assert!(err.contains("unknown limit_conn zone"), "got: {err}");
+}
+
 // ---- upstream health, pooling and least_conn (ADR-0001 items 1-3) ---------
 
 /// A backend that can be killed mid-test, to prove a dead peer is taken out.

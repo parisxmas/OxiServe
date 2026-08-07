@@ -25,7 +25,7 @@ oxiserve: listening on 0.0.0.0:80
 ## Status
 
 This is an early but genuinely working server, not a demo. It serves real
-traffic for the feature set below, with 154 tests (128 unit + 26 end-to-end
+traffic for the feature set below, with 484 tests (316 unit + 168 end-to-end
 over real sockets). It is **not yet a drop-in nginx replacement** —
 see [Not implemented](#not-implemented) for exactly what is missing, and run
 `oxiserve -t` against your own config to get a precise list for *your* setup.
@@ -68,6 +68,13 @@ milli-requests so `30r/m` is exact. In-process and sharded: no detectable throug
 run-to-run noise). Verified under load on Linux — `rate=50r/s burst=10` over
 5 seconds admitted 263 requests and rejected 460,495, against 260 predicted.
 
+**Concurrency limiting** — `limit_conn_zone` / `limit_conn` /
+`limit_conn_status` / `limit_conn_dry_run`. As in nginx this counts *requests
+in flight*, not connections, so an idle keep-alive connection costs nothing;
+the count is taken before any work is done and given back when the response
+has been written, on every exit path. One shared table across worker
+processes, so `limit_conn perip 1` means one, not one per worker.
+
 **Bodies** — `Content-Length` and chunked request bodies are read and decoded
 before routing, `Expect: 100-continue`, `client_max_body_size` enforcement.
 
@@ -77,11 +84,21 @@ ETags, MIME types, `expires`, `add_header`, gzip, `error_page`, `return`,
 `rewrite` (all four flags), `if` (all condition forms), `set`, `map`,
 `limit_except`, `internal`.
 
-**FastCGI** — `fastcgi_pass` (responder role) to an address or `upstream`
-block, `fastcgi_param` with `if_not_empty`, `fastcgi_index`,
-`fastcgi_split_path_info`, timeouts, `fastcgi_keep_conn`,
-`fastcgi_hide_header`. Verified against real php-fpm (PHP 8.5): `$_GET`,
-`$_POST`, `PATH_INFO`, PHP-set status headers, the WordPress-style
+**FastCGI** — `fastcgi_pass` (responder role) over TCP, a Unix socket or an
+`upstream` block, with `fastcgi_param` (including `if_not_empty`),
+`fastcgi_index`, `fastcgi_split_path_info`, `fastcgi_keep_conn`,
+`fastcgi_hide_header`, timeouts, and the CGI `Status:` / bare `Location:`
+rules.
+
+A response is collected whole while it fits `fastcgi_buffers ×
+fastcgi_buffer_size` (64 KB by default), which is what lets it carry a
+`Content-Length`; past that it is forwarded as it arrives and the transfer is
+chunked. `fastcgi_buffering off` forwards from the first byte regardless. An
+application that declares its own `Content-Length` keeps it either way — it is
+the only party that knows the length of something we never hold.
+
+Verified against real php-fpm (PHP 8.5): `$_GET`, `$_POST`, `PATH_INFO`,
+PHP-set status headers, the WordPress-style
 `try_files $uri $uri/ /index.php?$args` front-controller pattern, and
 300 KB responses spanning multiple records.
 
@@ -149,16 +166,6 @@ continues; `401` and `403` are returned to the client as they stand, since they
 are the service's answer and not our error; anything else, including an
 unreachable service, is a `500`. Failing open is the one outcome an
 authorisation check must never have.
-
-**FastCGI** — `fastcgi_pass` over TCP or a Unix socket, with
-`fastcgi_split_path_info`, `fastcgi_index` and the CGI `Status:` / bare
-`Location:` rules. A response is collected whole while it fits
-`fastcgi_buffers × fastcgi_buffer_size` (64 KB by default), which is what lets
-it carry a `Content-Length`; past that it is forwarded as it arrives and the
-transfer is chunked. `fastcgi_buffering off` forwards from the first byte
-regardless. An application that declares its own `Content-Length` keeps it
-either way — it is the only party that knows the length of something we never
-hold.
 
 **Signals** — `-s stop | quit | reload | reopen`, found through the `pid` file
 the configuration names, so a host running two servers signals the right one.
@@ -298,7 +305,6 @@ regex captures `$1`–`$9`.
 - **uwsgi / SCGI / gRPC** — `uwsgi_pass` and friends (FastCGI *is* supported).
 - **`proxy_cache_background_update` / `proxy_cache_revalidate`** — parsed and
   ignored; a refresh is always a full fetch, never a conditional revalidation.
-- **`limit_conn`** connection limiting (`limit_req` is implemented).
 - **`auth_basic`** / `auth_basic_user_file` (`auth_request` is implemented).
 - **`mail`** block; **UDP** inside `stream` (`ssl_preread` is implemented).
 - **Binary upgrade** (`USR2`/`WINCH`) — replacing the executable without
@@ -361,11 +367,15 @@ reads dead even — across three assertion-guarded runs the medians were
 was bandwidth-tied at 1.03×, opened to 1.11×.
 
 Process mode forced one piece of real shared-memory engineering: `limit_req`
-zones now live in a `MAP_SHARED` mapping created before the fork — a
-fixed-size open-addressing table of atomics, no allocator in shared memory —
-because per-process buckets would silently multiply every configured rate by
-the worker count. A test drives the real binary at `1r/m` across both workers
-and asserts exactly one admitted request. A worker that dies is respawned by
+and `limit_conn` zones live in a `MAP_SHARED` mapping created before the fork
+— a fixed-size open-addressing table of atomics, no allocator in shared memory
+— because per-process state would silently multiply every configured limit by
+the worker count. Tests drive the real binary across both workers and assert
+exactly one admitted request, at `1r/m` for the rate and at `limit_conn 1` for
+the concurrency count. `limit_conn` is the stricter of the two: a count has to
+be incremented and decremented in the same table to stay balanced, so its
+slots are a single atomic word each and every transition — claim, increment,
+take over, release — is one compare-and-swap. A worker that dies is respawned by
 the master, and `PR_SET_PDEATHSIG` means even a SIGKILLed master cannot leave
 orphans holding the port.
 
