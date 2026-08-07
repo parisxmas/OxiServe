@@ -12,3 +12,7 @@ fuzz/corpus/
 fuzz/artifacts/
 fuzz/coverage/
 dist/
+
+# Generator output the logo was derived from. The committed artwork is in
+# assets/; these are the multi-megabyte originals, kept locally.
+Gemini_Generated_Image_*.png
