@@ -620,7 +620,34 @@ running the phases with almost no rules loaded — is **~17 µs**; the remaining
 So: turning this on trades roughly 55× of static-file throughput for the rule
 set. That is worth it exactly when a WAF is worth it, and it is a good reason
 to scope `modsecurity on` to the locations that need it rather than the whole
-`http` block.
+`http` block — that is the one lever with real leverage, because a location
+without it pays nothing at all.
+
+### Where the fixed ~17 µs goes
+
+Broken down with `cargo test --release --features modsecurity transaction_cost
+-- --ignored --nocapture`, which times each stage against an engine with no
+rules loaded:
+
+| Stage | Cumulative |
+|---|---:|
+| `msc_new_transaction` + cleanup, zero rules | ~10 µs |
+| + connection, URI, 5 headers | ~15 µs |
+| + all five phases | ~17 µs |
+
+**About 60% of the fixed cost is creating and destroying the transaction**,
+before a single rule exists to evaluate. That happens entirely inside
+libmodsecurity — its constructor generates a unique id and initialises the
+collections every phase writes into — and there is no pooling or reset in the
+C API to avoid it.
+
+The calling side was made allocation-free anyway: addresses format into stack
+buffers, the method and HTTP version are `c""` constants rather than a fresh
+`CString` per request, and the URI is assembled in a per-worker buffer. That is
+about eight heap allocations per request removed, and it changed throughput by
+**nothing measurable** — 89,877 → 90,232 req/s, inside the run-to-run spread.
+It is recorded here because "we removed the allocations and it did not help" is
+the useful result: the floor is the engine's, not the integration's.
 
 Two things the harness does deliberately, because getting them wrong quietly
 inflates the cost. It sends browser-like headers: `wrk`'s bare request has no

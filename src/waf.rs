@@ -257,6 +257,54 @@ fn take_error(err: *const c_char, fallback: impl FnOnce() -> String) -> String {
     msg
 }
 
+/// A nul-terminated string built on the stack.
+///
+/// Every libmodsecurity entry point wants a `const char *`, and the obvious
+/// `CString::new(x.to_string())` is two heap allocations per value — eight per
+/// request across the addresses, method and version. None of those values is
+/// longer than a few dozen bytes, so none of them needs the heap.
+pub struct CBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> CBuf<N> {
+    pub fn new() -> CBuf<N> {
+        CBuf { buf: [0; N], len: 0 }
+    }
+
+    /// `None` if the value did not fit, which the caller treats as "skip this"
+    /// rather than truncating — a half-written address would be worse than an
+    /// absent one, since rules match on it.
+    pub fn as_cstr(&mut self) -> Option<&CStr> {
+        if self.len >= N {
+            return None;
+        }
+        self.buf[self.len] = 0;
+        CStr::from_bytes_with_nul(&self.buf[..=self.len]).ok()
+    }
+}
+
+impl<const N: usize> Default for CBuf<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> std::fmt::Write for CBuf<N> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let end = self.len + s.len();
+        // Leave room for the nul.
+        if end >= N {
+            self.len = N;
+            return Err(std::fmt::Error);
+        }
+        self.buf[self.len..end].copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
 /// One request's worth of rule evaluation.
 ///
 /// Deliberately not `Send`: libmodsecurity does not promise a transaction can
@@ -268,16 +316,21 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub fn connection(&mut self, client: &str, client_port: u16, server: &str, server_port: u16) {
-        let (Ok(c), Ok(s)) = (CString::new(client), CString::new(server)) else {
-            return;
-        };
+    /// Takes `&CStr` rather than `&str` so the caller can build these without
+    /// allocating; see [`CBuf`].
+    pub fn connection(
+        &mut self,
+        client: &CStr,
+        client_port: u16,
+        server: &CStr,
+        server_port: u16,
+    ) {
         unsafe {
             msc_process_connection(
                 self.t,
-                c.as_ptr(),
+                client.as_ptr(),
                 client_port as c_int,
-                s.as_ptr(),
+                server.as_ptr(),
                 server_port as c_int,
             )
         };
@@ -285,13 +338,8 @@ impl Transaction {
 
     /// `uri` must carry the query string: most CRS rules that matter read
     /// `ARGS`, and libmodsecurity parses those out of what it is given here.
-    pub fn uri(&mut self, uri: &str, method: &str, http_version: &str) {
-        let (Ok(u), Ok(m), Ok(v)) =
-            (CString::new(uri), CString::new(method), CString::new(http_version))
-        else {
-            return;
-        };
-        unsafe { msc_process_uri(self.t, u.as_ptr(), m.as_ptr(), v.as_ptr()) };
+    pub fn uri(&mut self, uri: &CStr, method: &CStr, http_version: &CStr) {
+        unsafe { msc_process_uri(self.t, uri.as_ptr(), method.as_ptr(), http_version.as_ptr()) };
     }
 
     pub fn request_header(&mut self, name: &[u8], value: &[u8]) {
@@ -331,11 +379,8 @@ impl Transaction {
         };
     }
 
-    pub fn process_response_headers(&mut self, status: u16, http_version: &str) -> Verdict {
-        let Ok(v) = CString::new(http_version) else {
-            return Verdict::Allow;
-        };
-        unsafe { msc_process_response_headers(self.t, status as c_int, v.as_ptr()) };
+    pub fn process_response_headers(&mut self, status: u16, http_version: &CStr) -> Verdict {
+        unsafe { msc_process_response_headers(self.t, status as c_int, http_version.as_ptr()) };
         self.intervention()
     }
 
@@ -435,8 +480,8 @@ mod tests {
              SecRule ARGS \"@rx attack\" \"id:1,phase:2,deny,status:403\"\n",
         );
         let mut t = e.transaction().unwrap();
-        t.connection("10.0.0.1", 1234, "10.0.0.2", 80);
-        t.uri("/index.html?q=hello", "GET", "1.1");
+        t.connection(c"10.0.0.1", 1234, c"10.0.0.2", 80);
+        t.uri(c"/index.html?q=hello", c"GET", c"1.1");
         t.request_header(b"Host", b"example.com");
         assert_eq!(t.process_request_headers(), Verdict::Allow);
         assert_eq!(t.request_body(b""), Verdict::Allow);
@@ -449,8 +494,8 @@ mod tests {
              SecRule ARGS \"@rx attack\" \"id:1,phase:2,deny,status:403\"\n",
         );
         let mut t = e.transaction().unwrap();
-        t.connection("10.0.0.1", 1234, "10.0.0.2", 80);
-        t.uri("/index.html?q=attack", "GET", "1.1");
+        t.connection(c"10.0.0.1", 1234, c"10.0.0.2", 80);
+        t.uri(c"/index.html?q=attack", c"GET", c"1.1");
         t.request_header(b"Host", b"example.com");
         // The verdict can land in either phase depending on the rule; what
         // matters is that the request does not come out allowed.
@@ -471,8 +516,8 @@ mod tests {
              SecRule ARGS \"@rx attack\" \"id:1,phase:2,deny,status:403\"\n",
         );
         let mut t = e.transaction().unwrap();
-        t.connection("10.0.0.1", 1234, "10.0.0.2", 80);
-        t.uri("/index.html?q=attack", "GET", "1.1");
+        t.connection(c"10.0.0.1", 1234, c"10.0.0.2", 80);
+        t.uri(c"/index.html?q=attack", c"GET", c"1.1");
         t.request_header(b"Host", b"example.com");
         assert_eq!(t.process_request_headers(), Verdict::Allow);
         assert_eq!(t.request_body(b""), Verdict::Allow);
@@ -486,8 +531,8 @@ mod tests {
              SecRule REQUEST_BODY \"@rx attack\" \"id:2,phase:2,deny,status:403\"\n",
         );
         let mut t = e.transaction().unwrap();
-        t.connection("10.0.0.1", 1234, "10.0.0.2", 80);
-        t.uri("/post", "POST", "1.1");
+        t.connection(c"10.0.0.1", 1234, c"10.0.0.2", 80);
+        t.uri(c"/post", c"POST", c"1.1");
         t.request_header(b"Host", b"example.com");
         t.request_header(b"Content-Type", b"application/x-www-form-urlencoded");
         let _ = t.process_request_headers();
@@ -513,13 +558,13 @@ mod tests {
              SecRule RESPONSE_HEADERS:X-Powered-By \"@rx .\" \"id:20,phase:3,deny,status:500\"\n",
         );
         let mut t = e.transaction().unwrap();
-        t.connection("10.0.0.1", 1234, "10.0.0.2", 80);
-        t.uri("/", "GET", "1.1");
+        t.connection(c"10.0.0.1", 1234, c"10.0.0.2", 80);
+        t.uri(c"/", c"GET", c"1.1");
         let _ = t.process_request_headers();
         let _ = t.request_body(b"");
         t.response_header(b"Content-Type", b"text/html");
         t.response_header(b"X-Powered-By", b"PHP/8.1");
-        assert_eq!(t.process_response_headers(200, "1.1"), Verdict::Block { status: 500 });
+        assert_eq!(t.process_response_headers(200, c"1.1"), Verdict::Block { status: 500 });
     }
 
     #[test]
@@ -533,12 +578,12 @@ mod tests {
              SecRule RESPONSE_BODY \"@rx (?i)sql syntax error\" \"id:21,phase:4,deny,status:500\"\n",
         );
         let mut t = e.transaction().unwrap();
-        t.connection("10.0.0.1", 1234, "10.0.0.2", 80);
-        t.uri("/", "GET", "1.1");
+        t.connection(c"10.0.0.1", 1234, c"10.0.0.2", 80);
+        t.uri(c"/", c"GET", c"1.1");
         let _ = t.process_request_headers();
         let _ = t.request_body(b"");
         t.response_header(b"Content-Type", b"text/html");
-        assert_eq!(t.process_response_headers(200, "1.1"), Verdict::Allow);
+        assert_eq!(t.process_response_headers(200, c"1.1"), Verdict::Allow);
         assert_eq!(
             t.response_body(b"SQL syntax error near unexpected token"),
             Verdict::Block { status: 500 }
@@ -554,14 +599,95 @@ mod tests {
              SecRule RESPONSE_BODY \"@rx (?i)sql syntax error\" \"id:22,phase:4,deny,status:500\"\n",
         );
         let mut t = e.transaction().unwrap();
-        t.connection("10.0.0.1", 1234, "10.0.0.2", 80);
-        t.uri("/", "GET", "1.1");
+        t.connection(c"10.0.0.1", 1234, c"10.0.0.2", 80);
+        t.uri(c"/", c"GET", c"1.1");
         assert_eq!(t.process_request_headers(), Verdict::Allow);
         assert_eq!(t.request_body(b""), Verdict::Allow);
         t.response_header(b"Content-Type", b"text/html");
-        assert_eq!(t.process_response_headers(200, "1.1"), Verdict::Allow);
+        assert_eq!(t.process_response_headers(200, c"1.1"), Verdict::Allow);
         assert_eq!(t.response_body(b"an ordinary page"), Verdict::Allow);
         t.logging();
+    }
+
+    /// Where the per-request cost actually goes. Run it explicitly:
+    ///
+    /// ```console
+    /// $ cargo test --release --features modsecurity transaction_cost -- --ignored --nocapture
+    /// ```
+    ///
+    /// Not a normal test — it asserts nothing and its numbers depend on the
+    /// machine. It exists so a change aimed at the fixed cost can be pointed
+    /// at the part that actually carries it.
+    #[test]
+    #[ignore = "profiling aid, not a check"]
+    fn transaction_cost_breakdown() {
+        use std::time::Instant;
+        const N: u32 = 20_000;
+
+        // No rules at all: whatever this costs is the engine's floor, and no
+        // amount of work on the calling side can move it.
+        let bare = engine_with("SecRuleEngine On\n");
+        let headers: Vec<(&[u8], &[u8])> = vec![
+            (b"Host", b"example.com"),
+            (b"Accept", b"text/html,application/xhtml+xml"),
+            (b"User-Agent", b"Mozilla/5.0 Chrome/120"),
+            (b"Accept-Language", b"en-US,en;q=0.9"),
+            (b"Connection", b"keep-alive"),
+        ];
+
+        let stage = |name: &str, f: &dyn Fn()| {
+            f(); // warm
+            let t0 = Instant::now();
+            for _ in 0..N {
+                f();
+            }
+            let us = t0.elapsed().as_secs_f64() * 1e6 / N as f64;
+            println!("{name:<38} {us:8.3} us");
+        };
+
+        stage("new + cleanup", &|| {
+            let _t = bare.transaction().unwrap();
+        });
+        stage("+ connection", &|| {
+            let mut t = bare.transaction().unwrap();
+            t.connection(c"10.0.0.1", 1234, c"10.0.0.2", 80);
+        });
+        stage("+ uri", &|| {
+            let mut t = bare.transaction().unwrap();
+            t.connection(c"10.0.0.1", 1234, c"10.0.0.2", 80);
+            t.uri(c"/index.html?a=1", c"GET", c"1.1");
+        });
+        stage("+ 5 headers", &|| {
+            let mut t = bare.transaction().unwrap();
+            t.connection(c"10.0.0.1", 1234, c"10.0.0.2", 80);
+            t.uri(c"/index.html?a=1", c"GET", c"1.1");
+            for (n, v) in &headers {
+                t.request_header(n, v);
+            }
+        });
+        stage("+ phases 1-2", &|| {
+            let mut t = bare.transaction().unwrap();
+            t.connection(c"10.0.0.1", 1234, c"10.0.0.2", 80);
+            t.uri(c"/index.html?a=1", c"GET", c"1.1");
+            for (n, v) in &headers {
+                t.request_header(n, v);
+            }
+            let _ = t.process_request_headers();
+            let _ = t.request_body(b"");
+        });
+        stage("+ phases 3-5 (full request)", &|| {
+            let mut t = bare.transaction().unwrap();
+            t.connection(c"10.0.0.1", 1234, c"10.0.0.2", 80);
+            t.uri(c"/index.html?a=1", c"GET", c"1.1");
+            for (n, v) in &headers {
+                t.request_header(n, v);
+            }
+            let _ = t.process_request_headers();
+            let _ = t.request_body(b"");
+            t.response_header(b"Content-Type", b"text/html");
+            let _ = t.process_response_headers(200, c"1.1");
+            t.logging();
+        });
     }
 
     #[test]

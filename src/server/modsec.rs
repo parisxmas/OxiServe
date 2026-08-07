@@ -7,18 +7,89 @@
 //! the way out has to reach the blocking threshold, not look like two harmless
 //! halves.
 
+use std::ffi::CStr;
 use std::sync::Arc;
 
 use crate::config::model::CoreConf;
 use crate::http::response::Resp;
 use crate::server::ctx::Ctx;
 use crate::server::reply::{Body, Reply};
-use crate::waf::Verdict;
+use crate::waf::{CBuf, Verdict};
 
 /// The outcome, when the rules had something to say. `None` means carry on.
 pub enum Blocked {
     Status(u16),
     Redirect(Reply),
+}
+
+/// Writes an address into `buf` and returns its port.
+///
+/// A Unix-socket peer has no address; it gets the loopback one, because
+/// leaving `REMOTE_ADDR` empty makes rules that test it behave unpredictably.
+fn write_addr(buf: &mut CBuf<64>, addr: Option<std::net::SocketAddr>) -> u16 {
+    use std::fmt::Write;
+    match addr {
+        Some(a) => {
+            // A formatting failure here means the buffer was too small, which
+            // `as_cstr` then reports as `None`; nothing is truncated silently.
+            let _ = write!(buf, "{}", a.ip());
+            a.port()
+        }
+        None => {
+            let _ = buf.write_str("127.0.0.1");
+            0
+        }
+    }
+}
+
+/// Both are fixed sets, so they can be constants rather than a fresh
+/// `CString` per request.
+fn version_cstr(minor: u8) -> &'static CStr {
+    if minor == 0 {
+        c"1.0"
+    } else {
+        c"1.1"
+    }
+}
+
+fn method_cstr(m: crate::http::Method) -> &'static CStr {
+    use crate::http::Method::*;
+    match m {
+        Get => c"GET",
+        Head => c"HEAD",
+        Post => c"POST",
+        Put => c"PUT",
+        Delete => c"DELETE",
+        Options => c"OPTIONS",
+        Patch => c"PATCH",
+        Connect => c"CONNECT",
+        Trace => c"TRACE",
+        Other => c"UNKNOWN",
+    }
+}
+
+thread_local! {
+    /// Grown once per worker and reused. A URI has no useful bound — a long
+    /// query string is ordinary — so this is the one value that cannot live on
+    /// the stack, and a per-request `format!` was an allocation each time.
+    static URI_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Assembles `path[?args]` as a C string and hands it to `f`.
+fn with_uri_cstr<R>(path: &str, args: &str, f: impl FnOnce(&CStr) -> R) -> Option<R> {
+    URI_BUF.with(|b| {
+        let mut buf = b.borrow_mut();
+        buf.clear();
+        buf.extend_from_slice(path.as_bytes());
+        if !args.is_empty() {
+            buf.push(b'?');
+            buf.extend_from_slice(args.as_bytes());
+        }
+        buf.push(0);
+        // An interior nul would come from a request line that the parser
+        // should already have rejected; skipping is safer than trusting it.
+        CStr::from_bytes_with_nul(&buf).ok().map(f)
+    })
 }
 
 /// Phases 1 and 2: connection, URI, request headers, request body.
@@ -35,26 +106,25 @@ pub fn inspect_request(ctx: &mut Ctx<'_>, core: &CoreConf) -> Option<Blocked> {
     // A Unix-socket client has no address at all. ModSecurity wants
     // *something* for REMOTE_ADDR, and inventing a routable-looking address
     // would be worse than an obviously local one.
-    let (client, client_port) = match ctx.remote {
-        Some(a) => (a.ip().to_string(), a.port()),
-        None => ("127.0.0.1".to_string(), 0),
-    };
-    let (server, server_port) = match ctx.local {
-        Some(a) => (a.ip().to_string(), a.port()),
-        None => ("127.0.0.1".to_string(), 0),
-    };
-    t.connection(&client, client_port, &server, server_port);
+    //
+    // Formatted into stack buffers: an address is at most 45 characters, and
+    // `to_string()` here was two heap allocations per request for a value that
+    // never needed the heap. 64 covers IPv6 with a scope id.
+    let mut client_buf = CBuf::<64>::new();
+    let mut server_buf = CBuf::<64>::new();
+    let client_port = write_addr(&mut client_buf, ctx.remote);
+    let server_port = write_addr(&mut server_buf, ctx.local);
+    // Separate buffers, so the two borrows do not overlap.
+    if let (Some(c), Some(s)) = (client_buf.as_cstr(), server_buf.as_cstr()) {
+        t.connection(c, client_port, s, server_port);
+    }
 
     // The query string has to travel with the path: `ARGS` is what the
     // majority of CRS rules read, and libmodsecurity parses it out of the URI
     // it is handed here rather than from anything passed separately.
-    let uri = if ctx.args.is_empty() {
-        ctx.uri.clone()
-    } else {
-        format!("{}?{}", ctx.uri, ctx.args)
-    };
-    let version = if ctx.req.minor == 0 { "1.0" } else { "1.1" };
-    t.uri(&uri, ctx.req.method.as_str(), version);
+    let version = version_cstr(ctx.req.minor);
+    let method = method_cstr(ctx.req.method);
+    with_uri_cstr(&ctx.uri, &ctx.args, |uri| t.uri(uri, method, version));
 
     for h in &ctx.req.headers {
         t.request_header(&ctx.buf[h.name.clone()], &ctx.buf[h.value.clone()]);
@@ -93,7 +163,7 @@ pub async fn inspect_response(
     for (name, value) in reply.resp.iter() {
         t.response_header(name.as_bytes(), value.as_bytes());
     }
-    let version = if ctx.req.minor == 0 { "1.0" } else { "1.1" };
+    let version = version_cstr(ctx.req.minor);
 
     let mut verdict = t.process_response_headers(reply.resp.status, version);
 
