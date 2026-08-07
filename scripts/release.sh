@@ -53,7 +53,10 @@ build() {
     cp conf/oxiserve.conf "$stage/conf/"
     cp conf/examples/*.conf conf/examples/README.md "$stage/conf/examples/"
 
-    tar -czf "$OUT/$name.tar.gz" -C "$OUT" "$name"
+    # --no-xattrs because bsdtar on macOS otherwise records com.apple.provenance
+    # on every member, and GNU tar on the machine unpacking it prints a warning
+    # per file about the header it does not recognise.
+    tar --no-xattrs -czf "$OUT/$name.tar.gz" -C "$OUT" "$name"
     rm -rf "$stage"
     echo "    $OUT/$name.tar.gz  ($(du -h "$OUT/$name.tar.gz" | cut -f1))"
 }
