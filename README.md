@@ -39,16 +39,16 @@ There is no glibc version to match and nothing to install alongside it, so the
 same file runs on Debian, Ubuntu, RHEL, Alpine or anything else with a kernel
 new enough to matter.
 
-The latest release is **v0.2.37**. `$(uname -m)` picks the right architecture,
+The latest release is **v0.2.38**. `$(uname -m)` picks the right architecture,
 so these run as they are on both x86_64 and aarch64:
 
 ```console
-$ curl -fsSLO https://github.com/parisxmas/OxiServe/releases/download/v0.2.37/oxiserve-0.2.37-linux-$(uname -m).tar.gz
-$ curl -fsSLO https://github.com/parisxmas/OxiServe/releases/download/v0.2.37/SHA256SUMS
+$ curl -fsSLO https://github.com/parisxmas/OxiServe/releases/download/v0.2.38/oxiserve-0.2.38-linux-$(uname -m).tar.gz
+$ curl -fsSLO https://github.com/parisxmas/OxiServe/releases/download/v0.2.38/SHA256SUMS
 $ sha256sum -c --ignore-missing SHA256SUMS
 
-$ tar -xzf oxiserve-0.2.37-linux-$(uname -m).tar.gz
-$ sudo install -m 755 oxiserve-0.2.37-linux-$(uname -m)/oxiserve /usr/local/bin/
+$ tar -xzf oxiserve-0.2.38-linux-$(uname -m).tar.gz
+$ sudo install -m 755 oxiserve-0.2.38-linux-$(uname -m)/oxiserve /usr/local/bin/
 ```
 
 `SHA256SUMS` covers every archive in the release, hence `--ignore-missing` —
@@ -60,7 +60,7 @@ worth running against your real `nginx.conf` before anything else:
 
 ```console
 $ oxiserve -v
-oxiserve version: oxiserve/0.2.37
+oxiserve version: oxiserve/0.2.38
 
 $ oxiserve -t -c /etc/nginx/nginx.conf
 ```
@@ -94,7 +94,8 @@ The tarball also carries `conf/oxiserve.conf` and the four worked examples, so
 there is something to start from if you are not bringing an existing config.
 
 To build the release artifacts yourself rather than downloading them, see
-[Building](#building).
+[Building](#building). What changed in each version is in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Status
 
