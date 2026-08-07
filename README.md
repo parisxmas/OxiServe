@@ -1,4 +1,9 @@
-# OxiServe
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
+    <img src="assets/logo.png" alt="OxiServe" width="520">
+  </picture>
+</p>
 
 An nginx-configuration-compatible web server written in Rust.
 
