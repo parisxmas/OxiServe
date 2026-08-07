@@ -626,6 +626,12 @@ const KNOWN_UNIMPLEMENTED: &[&str] = &[
     "geo", "split_clients", "referer_hash_bucket_size",
 ];
 
+/// Modules whose whole purpose is to reject requests. Losing any module is
+/// worth a warning; losing one of these changes what the server *allows*, so
+/// the message says so outright rather than leaving it to be inferred from
+/// the module's filename.
+const FILTERING_MODULES: &[&str] = &["modsecurity", "coraza", "naxsi", "waf", "lua"];
+
 impl Builder {
     pub fn new(prefix: PathBuf) -> Builder {
         Builder {
@@ -648,6 +654,36 @@ impl Builder {
             "{}: \"{what}\" is accepted but has no effect yet — see docs/decisions/0001-load-balancer-scope.md",
             d.loc()
         );
+        if !self.unsupported.contains(&msg) {
+            self.unsupported.push(msg);
+        }
+    }
+
+    /// `load_module` names a shared object compiled against nginx's internal C
+    /// ABI — `ngx_module_t`, `ngx_http_request_t` and the rest of a layout that
+    /// is not a stable interface anyone else can implement. So this is not
+    /// "unimplemented yet", and saying "yet" would promise something that is
+    /// never going to arrive; the module's capability is simply gone.
+    ///
+    /// Reporting it is the ADR-0001 rule in its sharpest form. Every other
+    /// parse-only directive makes the config claim a feature it lacks. This one
+    /// usually removes a *restriction*: the module is there to reject requests,
+    /// so a config that reads as filtered serves everything instead, and it
+    /// looks healthy while doing it.
+    fn note_binary_module(&mut self, d: &Directive) {
+        let path = &d.args[0];
+        let file = path.rsplit('/').next().unwrap_or(path);
+        let mut msg = format!(
+            "{}: \"load_module {path}\" — OxiServe cannot load nginx binary \
+             modules, so everything {file} provides is absent",
+            d.loc()
+        );
+        let lower = file.to_ascii_lowercase();
+        if FILTERING_MODULES.iter().any(|m| lower.contains(m)) {
+            msg.push_str(
+                "; this one filters requests, so what it would have blocked is now served",
+            );
+        }
         if !self.unsupported.contains(&msg) {
             self.unsupported.push(msg);
         }
@@ -735,7 +771,16 @@ impl Builder {
                     cfg.stream = Some(st);
                 }
                 "mail" => self.note_unsupported(d),
-                "load_module" | "master_process" | "worker_shutdown_timeout"
+                // Validated like nginx does — one argument — so a malformed
+                // line is still caught by `-t` rather than passed over on the
+                // way to the warning.
+                "load_module" => {
+                    want_args(d, 1)?;
+                    self.note_binary_module(d);
+                }
+                // These genuinely have no counterpart worth reporting: they
+                // tune a process model this server does not share.
+                "master_process" | "worker_shutdown_timeout"
                 | "worker_priority" | "working_directory" | "lock_file"
                 | "timer_resolution" | "pcre_jit" | "thread_pool" => {}
                 _ => self.note_unsupported(d),
@@ -2898,6 +2943,69 @@ mod tests {
         )
         .unwrap();
         assert!(clean.unsupported.is_empty(), "{:?}", clean.unsupported);
+    }
+
+    #[test]
+    fn load_module_is_reported_not_swallowed() {
+        // It used to be silently accepted, which is the worst outcome: `-t`
+        // said the config was fine while the module's behaviour was missing.
+        let c = build(
+            "load_module modules/ngx_http_image_filter_module.so; \
+             events {} http { server { listen 80; } }",
+        )
+        .unwrap();
+        let joined = c.unsupported.join("\n");
+        assert!(joined.contains("ngx_http_image_filter_module.so"), "{joined}");
+        assert!(joined.contains("cannot load nginx binary modules"), "{joined}");
+        // Nothing about this is going to be implemented later, so the message
+        // must not read like the "not implemented yet" ones.
+        assert!(!joined.contains("yet"), "{joined}");
+    }
+
+    #[test]
+    fn a_filtering_module_says_what_its_absence_allows() {
+        let c = build(
+            "load_module modules/ngx_http_modsecurity_module.so; \
+             events {} http { server { listen 80; } }",
+        )
+        .unwrap();
+        let joined = c.unsupported.join("\n");
+        assert!(joined.contains("what it would have blocked is now served"), "{joined}");
+
+        // A module that only adds a capability gets the plain message — the
+        // stronger wording has to stay meaningful.
+        let plain = build(
+            "load_module modules/ngx_http_geoip_module.so; \
+             events {} http { server { listen 80; } }",
+        )
+        .unwrap();
+        let joined = plain.unsupported.join("\n");
+        assert!(joined.contains("ngx_http_geoip_module.so"), "{joined}");
+        assert!(!joined.contains("now served"), "{joined}");
+    }
+
+    #[test]
+    fn load_module_takes_exactly_one_argument() {
+        let e = build("load_module; events {} http { server { listen 80; } }").unwrap_err();
+        assert!(e.msg.contains("invalid number of arguments"), "{}", e.msg);
+    }
+
+    #[test]
+    fn a_modsec_config_names_both_the_module_and_its_directives() {
+        // The realistic porting case: the module line *and* the directives it
+        // would have provided both have to show up, or the operator patches
+        // one and assumes the rest carried over.
+        let c = build(
+            "load_module modules/ngx_http_modsecurity_module.so; \
+             events {} http { modsecurity on; \
+             modsecurity_rules_file /etc/nginx/modsec/main.conf; \
+             server { listen 80; } }",
+        )
+        .unwrap();
+        let joined = c.unsupported.join("\n");
+        for want in ["ngx_http_modsecurity_module.so", "modsecurity", "modsecurity_rules_file"] {
+            assert!(joined.contains(want), "{want} must be reported; got:\n{joined}");
+        }
     }
 
     #[test]

@@ -493,7 +493,12 @@ regex captures `$1`–`$9`.
 - **`proxy_cache_background_update` / `proxy_cache_revalidate`** — parsed and
   ignored; a refresh is always a full fetch, never a conditional revalidation.
 - **`auth_basic`** / `auth_basic_user_file` (`auth_request` is implemented).
-- **`mail`** block; **UDP** inside `stream` (`ssl_preread` is implemented).
+- **`mail`** block — SMTP/IMAP/POP3 proxying.
+- **nginx binary modules** — an `.so` is compiled against nginx's internal C
+  ABI, so there is no version of this that gets implemented later: ModSecurity,
+  NAXSI, njs and the rest are absent. `load_module` is *reported* rather than
+  quietly accepted, naming the module, and saying so outright when the missing
+  one was there to filter requests.
 - **Binary upgrade** (`USR2`/`WINCH`) — replacing the executable without
   dropping connections. `-s reload` covers configuration changes.
 - **PCRE-only regex** — lookaround and backreferences are rejected with a clear
