@@ -441,9 +441,25 @@ pub async fn proxy(ctx: &mut Ctx<'_>, loc: &Arc<Location>, pp: &ProxyPass) -> Re
 
     let mut resp = Resp::new();
     resp.status = status;
-    let resp_headers = headers.clone();
+    let mut resp_headers = headers.clone();
     for (n, v) in headers {
         resp.header(&n, &v);
+    }
+
+    // ---- sticky cookie ----------------------------------------------------
+    // Set it only when the client is not already pinned where it landed:
+    // re-sending an identical cookie on every response is bytes on the wire
+    // for no change of state. Added to `resp_headers` too, so a cached copy
+    // carries it — a cache hit still has to pin the client that gets it.
+    if let Some((u, i)) = chosen {
+        if let Some(sc) = &u.sticky {
+            let id = &*u.servers[i].sticky_id;
+            if request_cookie(ctx, &sc.name).as_deref() != Some(id) {
+                let v = sc.set_cookie(id);
+                resp.header("Set-Cookie", &v);
+                resp_headers.push(("Set-Cookie".to_string(), v));
+            }
+        }
     }
 
     let pre = buf[head_len..].to_vec();
@@ -762,6 +778,24 @@ pub fn peer_addr(addr: &str) -> String {
     }
 }
 
+/// Reads one cookie out of the request's `Cookie` header.
+///
+/// Not `ctx`'s `$cookie_*` resolution, which gives up on the whole header the
+/// moment any element has no `=` — a valueless cookie ahead of ours in the
+/// list would silently un-stick the client.
+fn request_cookie(ctx: &Ctx<'_>, name: &str) -> Option<String> {
+    let header = ctx.req.hot_value(ctx.buf, crate::http::request::Hot::Cookie)?;
+    for part in header.split(';') {
+        let part = part.trim();
+        if let Some((k, v)) = part.split_once('=') {
+            if k.trim() == name {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Chooses a peer via the shared health/load state.
 pub fn select_peer(ctx: &Ctx<'_>, up: &Arc<Upstream>) -> Result<usize, u16> {
     select_peer_excluding(ctx, up, &[])
@@ -773,6 +807,15 @@ pub fn select_peer_excluding(
     up: &Arc<Upstream>,
     exclude: &[usize],
 ) -> Result<usize, u16> {
+    // A sticky cookie outranks the balancing method, and only the method:
+    // health, `down` and the already-tried list all still apply, which
+    // `sticky_peer` checks before agreeing.
+    if let Some(sc) = &up.sticky {
+        let cookie = request_cookie(ctx, &sc.name);
+        if let Some(i) = up_state::sticky_peer(up, Instant::now(), cookie.as_deref(), exclude) {
+            return Ok(i);
+        }
+    }
     let hash = match up.method {
         LbMethod::IpHash => {
             let mut h: u64 = 0xcbf29ce484222325;

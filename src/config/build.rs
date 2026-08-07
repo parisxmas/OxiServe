@@ -933,6 +933,7 @@ impl Builder {
         let mut method = LbMethod::RoundRobin;
         let mut keepalive = 0;
         let mut health_check: Option<HealthCheck> = None;
+        let mut sticky: Option<StickyCookie> = None;
 
         for c in d.children() {
             match c.name.as_str() {
@@ -940,6 +941,7 @@ impl Builder {
                     want_args_range(c, 1, 16)?;
                     let mut s = UpstreamServer {
                         addr: c.args[0].as_str().into(),
+                        sticky_id: crate::config::model::sticky_id_for(&c.args[0]),
                         weight: 1,
                         max_fails: 1,
                         fail_timeout: Duration::from_secs(10),
@@ -967,6 +969,48 @@ impl Builder {
                         }
                     }
                     servers.push(s);
+                }
+                "sticky" => {
+                    want_args_range(c, 1, 8)?;
+                    // Only the `cookie` form. `sticky route` and `sticky
+                    // learn` are a different mechanism, not extra parameters
+                    // on this one, so they are refused rather than half-read.
+                    if c.args[0] != "cookie" {
+                        bail!(c, "only \"sticky cookie\" is supported, not \"sticky {}\"", c.args[0]);
+                    }
+                    if c.args.len() < 2 {
+                        bail!(c, "\"sticky cookie\" requires a cookie name");
+                    }
+                    let mut sc = StickyCookie {
+                        name: c.args[1].as_str().into(),
+                        expires: None,
+                        domain: None,
+                        path: None,
+                        httponly: false,
+                        secure: false,
+                        samesite: None,
+                    };
+                    for p in &c.args[2..] {
+                        if let Some(v) = p.strip_prefix("expires=") {
+                            sc.expires = Some(parse_time(v).ok_or_else(|| BuildError {
+                                msg: format!("invalid \"expires\" value \"{v}\" in \"sticky\""),
+                                loc: c.loc(),
+                            })?);
+                        } else if let Some(v) = p.strip_prefix("domain=") {
+                            sc.domain = Some(v.into());
+                        } else if let Some(v) = p.strip_prefix("path=") {
+                            sc.path = Some(v.into());
+                        } else if let Some(v) = p.strip_prefix("samesite=") {
+                            sc.samesite = Some(v.into());
+                        } else if p == "httponly" {
+                            sc.httponly = true;
+                        } else if p == "secure" {
+                            sc.secure = true;
+                        } else {
+                            bail!(c, "invalid parameter \"{p}\" in \"sticky cookie\"");
+                        }
+                    }
+                    sticky = Some(sc);
                 }
                 "least_conn" => method = LbMethod::LeastConn,
                 "ip_hash" => method = LbMethod::IpHash,
@@ -1033,6 +1077,7 @@ impl Builder {
             health,
             origin: std::time::Instant::now(),
             health_check,
+            sticky,
         })
     }
 
@@ -2524,6 +2569,68 @@ mod tests {
         assert_eq!(http.listeners.len(), 2);
         let p80 = http.listeners.iter().find(|l| l.addr.port() == 80).unwrap();
         assert_eq!(p80.servers.len(), 2);
+    }
+
+    #[test]
+    fn sticky_cookie_parses_with_its_attributes() {
+        let c = build(
+            "events {} http { upstream p { sticky cookie srv_id expires=2h domain=.a.com \
+             path=/x httponly secure samesite=strict; server 127.0.0.1:9000; server 127.0.0.1:9001; } \
+             server { listen 80; location / { proxy_pass http://p; } } }",
+        )
+        .unwrap();
+        let http = c.http.unwrap();
+        let up = http.upstreams.get("p").expect("upstream built");
+        let sc = up.sticky.as_ref().expect("sticky configured");
+        assert_eq!(&*sc.name, "srv_id");
+        assert_eq!(sc.expires, Some(Duration::from_secs(7200)));
+        assert_eq!(sc.domain.as_deref(), Some(".a.com"));
+        assert_eq!(sc.path.as_deref(), Some("/x"));
+        assert!(sc.httponly && sc.secure);
+        assert_eq!(sc.samesite.as_deref(), Some("strict"));
+
+        // The balancing method is untouched: sticky layers over it.
+        assert!(matches!(up.method, LbMethod::RoundRobin));
+
+        // Peer ids are opaque, distinct, and stable for a given address.
+        let ids: Vec<&str> = up.servers.iter().map(|s| &*s.sticky_id).collect();
+        assert_ne!(ids[0], ids[1], "two peers must not share an id");
+        for (s, id) in up.servers.iter().zip(&ids) {
+            assert!(!id.contains(&*s.addr), "the id leaks the address: {id}");
+        }
+        assert_eq!(
+            &*up.servers[0].sticky_id,
+            &*crate::config::model::sticky_id_for("127.0.0.1:9000"),
+            "ids must be reproducible, or a reload scatters every session"
+        );
+        assert!(c.unsupported.is_empty(), "{:?}", c.unsupported);
+    }
+
+    #[test]
+    fn sticky_rejects_the_forms_it_does_not_implement() {
+        // `sticky route` and `sticky learn` are a different mechanism, not
+        // parameters of this one; accepting and ignoring them would be the
+        // silent-misbehaviour trap ADR-0001 exists to avoid.
+        let e = build(
+            "events {} http { upstream p { sticky route $cookie_r; server 127.0.0.1:9000; } \
+             server { listen 80; location / { proxy_pass http://p; } } }",
+        )
+        .unwrap_err();
+        assert!(e.msg.contains("only \"sticky cookie\""), "{}", e.msg);
+
+        let e = build(
+            "events {} http { upstream p { sticky cookie; server 127.0.0.1:9000; } \
+             server { listen 80; location / { proxy_pass http://p; } } }",
+        )
+        .unwrap_err();
+        assert!(e.msg.contains("requires a cookie name"), "{}", e.msg);
+
+        let e = build(
+            "events {} http { upstream p { sticky cookie s nonsense=1; server 127.0.0.1:9000; } \
+             server { listen 80; location / { proxy_pass http://p; } } }",
+        )
+        .unwrap_err();
+        assert!(e.msg.contains("invalid parameter"), "{}", e.msg);
     }
 
     #[test]

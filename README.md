@@ -35,7 +35,7 @@ and ignored.
 ## Status
 
 This is an early but genuinely working server, not a demo. It serves real
-traffic for the feature set below, with 530 tests (349 unit + 181 end-to-end
+traffic for the feature set below, with 538 tests (351 unit + 187 end-to-end
 over real sockets). It is **not yet a drop-in nginx replacement** —
 see [Not implemented](#not-implemented) for exactly what is missing, and run
 `oxiserve -t` against your own config to get a precise list for *your* setup.
@@ -152,6 +152,24 @@ passive health checks (`max_fails` / `fail_timeout`, with ejection and
 automatic recovery), `backup` failover, weighted round-robin, real
 `least_conn` (in-flight counts, weight-aware), `ip_hash`, and an upstream
 `keepalive` pool that probes a connection for liveness before reusing it.
+
+**Sticky sessions** — `sticky cookie name [expires=] [domain=] [path=]
+[httponly] [secure] [samesite=]`, using NGINX Plus's spelling so a config
+written for it works unchanged. Unlike `ip_hash` this survives a client whose
+address changes, which is the case that makes address stickiness fail on
+mobile networks and behind rotating NAT.
+
+The pin layers *over* the balancing method rather than replacing it: the
+cookie decides when it is present and names a peer that can still take
+traffic, and `least_conn` or round-robin decides in every other case. A pin to
+a backend that has since been ejected falls through to ordinary balancing and
+the client is re-pinned — honouring it would hand every one of that peer's
+clients an error instead of spreading them over the survivors.
+
+The cookie value is an opaque hash of the peer's address, so it does not
+disclose the backend topology, and it is deterministic rather than seeded, so
+a reload does not scatter every established session. No shared state is
+needed: any worker in any process can decode a cookie the others issued.
 Health is shared across workers; the pool is per worker.
 
 **`auth_request`** — the yes/no is delegated to another service, which is how
@@ -334,8 +352,8 @@ stream {
 }
 ```
 
-> **Still missing for a true HAProxy replacement:** UDP in `stream`,
-> cookie-based sticky sessions, a stats endpoint.
+> **Still missing for a true HAProxy replacement:** UDP in `stream`, a stats
+> endpoint. (Cookie-based sticky sessions shipped in v0.2.32.)
 > Scope and order: [ADR-0001](docs/decisions/0001-load-balancer-scope.md).
 
 **TLS** — rustls, `ssl_certificate` / `ssl_certificate_key`, SNI across servers

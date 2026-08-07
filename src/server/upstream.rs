@@ -155,6 +155,28 @@ pub fn select(up: &Upstream, now: Instant, hash: Option<u64>, rr_cursor: usize) 
     select_excluding(up, now, hash, rr_cursor, &[])
 }
 
+/// The peer a sticky cookie names, if it can still take the request.
+///
+/// Returns `None` — and so falls through to ordinary balancing — when the
+/// cookie is absent, names nothing we recognise, or names a peer that is
+/// administratively down, health-ejected, or already tried and failed in this
+/// request. Honouring a pin to a dead backend would be worse than having no
+/// stickiness at all: every one of that peer's clients would get an error
+/// instead of being spread over the survivors.
+pub fn sticky_peer(
+    up: &Upstream,
+    now: Instant,
+    cookie: Option<&str>,
+    exclude: &[usize],
+) -> Option<usize> {
+    let id = cookie?;
+    up.sticky.as_ref()?;
+    let now_ms = now.saturating_duration_since(up.origin).as_millis() as u64;
+    let i = up.servers.iter().position(|s| &*s.sticky_id == id)?;
+    let ok = !up.servers[i].down && !up.health[i].is_down(now_ms) && !exclude.contains(&i);
+    ok.then_some(i)
+}
+
 /// [`select`], skipping peers already tried for this request.
 ///
 /// `proxy_next_upstream` needs this: retrying is only useful against a peer
@@ -319,6 +341,7 @@ mod tests {
 
     fn peer(addr: &str, weight: u32, backup: bool, down: bool) -> UpstreamServer {
         UpstreamServer {
+            sticky_id: crate::config::model::sticky_id_for(addr),
             addr: addr.into(),
             weight,
             max_fails: 2,
@@ -339,6 +362,7 @@ mod tests {
             health,
             origin: Instant::now(),
             health_check: None,
+            sticky: None,
         }
     }
 
@@ -666,6 +690,7 @@ mod health_check_tests {
         // `server ... down;` means the operator took it out; probing it would
         // be load on a machine nobody asked us to talk to.
         let servers = vec![UpstreamServer {
+            sticky_id: crate::config::model::sticky_id_for("127.0.0.1:1"),
             addr: "127.0.0.1:1".into(),
             weight: 1,
             max_fails: 1,
@@ -682,6 +707,7 @@ mod health_check_tests {
             health: vec![PeerHealth::default()],
             origin: Instant::now(),
             health_check: None,
+            sticky: None,
         });
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(probe_round(&up, &HealthCheck::default()));

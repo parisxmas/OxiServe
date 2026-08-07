@@ -323,3 +323,199 @@ fn an_unknown_next_upstream_parameter_is_a_config_error() {
     let err = oxiserve::config::load(&f, dir).unwrap_err().to_string();
     assert!(err.contains("frobnicate"), "the message should name it: {err}");
 }
+
+// ---- sticky cookie ---------------------------------------------------------
+
+/// Reads a header out of a raw response. `request` throws the head away, so
+/// the sticky tests need their own reader.
+fn head_and_body(raw: &str) -> (Vec<(String, String)>, String) {
+    let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw, ""));
+    let headers = head
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split_once(':'))
+        .map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    (headers, body.to_string())
+}
+
+impl Server {
+    /// A request carrying `cookie`, returning the response's `Set-Cookie` and
+    /// body.
+    fn get_with_cookie(&self, cookie: Option<&str>) -> (Option<String>, String) {
+        let c = match cookie {
+            Some(c) => format!("Cookie: {c}\r\n"),
+            None => String::new(),
+        };
+        let mut s = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+        s.write_all(
+            format!("GET / HTTP/1.1\r\nHost: x\r\n{c}Connection: close\r\n\r\n").as_bytes(),
+        )
+        .unwrap();
+        let mut raw = String::new();
+        let _ = s.read_to_string(&mut raw);
+        let (headers, body) = head_and_body(&raw);
+        let set = headers
+            .iter()
+            .find(|(n, _)| n == "set-cookie")
+            .map(|(_, v)| v.clone());
+        (set, body)
+    }
+}
+
+/// A peer that always answers with `body`, so which one served a request is
+/// visible in the response.
+fn peer_saying(body: &'static str) -> Peer {
+    Peer::with(move |_| Some(ok(body)))
+}
+
+/// Pulls `srv_id=<value>` out of a Set-Cookie line.
+fn cookie_pair(set: &str) -> String {
+    set.split(';').next().unwrap().trim().to_string()
+}
+
+#[test]
+fn sticky_cookie_pins_a_client_to_one_peer() {
+    let a = peer_saying("A");
+    let b = peer_saying("B");
+    let s = Server::start(
+        "sticky",
+        &conf(
+            &format!(
+                "sticky cookie srv_id;\n\
+                 server 127.0.0.1:{};\nserver 127.0.0.1:{};",
+                a.port, b.port
+            ),
+            "",
+        ),
+    );
+
+    // First request: no cookie, so ordinary balancing picks, and the response
+    // tells the client where it landed.
+    let (set, first) = s.get_with_cookie(None);
+    let set = set.expect("a first request must be given a sticky cookie");
+    assert!(set.starts_with("srv_id="), "unexpected cookie: {set}");
+    assert!(set.contains("Path=/"), "a path is required or the cookie is scoped to /: {set}");
+    let pair = cookie_pair(&set);
+
+    // Every subsequent request carrying it goes to the same peer. Without
+    // stickiness these would alternate.
+    for i in 0..8 {
+        let (again, body) = s.get_with_cookie(Some(&pair));
+        assert_eq!(body, first, "request {i} was not pinned");
+        assert!(again.is_none(), "an already-pinned client must not be re-cookied");
+    }
+
+    // And the peer that was not chosen saw nothing after the first request.
+    let (ah, bh) = (a.hits.load(Ordering::SeqCst), b.hits.load(Ordering::SeqCst));
+    assert_eq!(ah + bh, 9, "9 requests total");
+    assert!(ah == 9 || bh == 9, "all of them should have gone to one peer, got {ah}/{bh}");
+}
+
+#[test]
+fn without_the_cookie_the_balancing_method_still_spreads() {
+    // The pin is layered over round-robin, not a replacement for it: a client
+    // that does not send the cookie must still be balanced.
+    let a = peer_saying("A");
+    let b = peer_saying("B");
+    let s = Server::start(
+        "stickyspread",
+        &conf(
+            &format!(
+                "sticky cookie srv_id;\n\
+                 server 127.0.0.1:{};\nserver 127.0.0.1:{};",
+                a.port, b.port
+            ),
+            "",
+        ),
+    );
+    for _ in 0..8 {
+        let _ = s.get_with_cookie(None);
+    }
+    assert!(a.hits.load(Ordering::SeqCst) > 0, "peer A saw nothing");
+    assert!(b.hits.load(Ordering::SeqCst) > 0, "peer B saw nothing");
+}
+
+#[test]
+fn a_pin_to_a_dead_peer_falls_back_instead_of_failing() {
+    // The failure mode that would make stickiness worse than useless: every
+    // client pinned to a backend that has since died getting an error, rather
+    // than being spread over the peers that are still up.
+    let alive = peer_saying("ALIVE");
+    let dead = dead_port();
+    let s = Server::start(
+        "stickydead",
+        &conf(
+            &format!(
+                "sticky cookie srv_id;\n\
+                 server 127.0.0.1:{dead};\nserver 127.0.0.1:{};",
+                alive.port
+            ),
+            "proxy_next_upstream error timeout;",
+        ),
+    );
+
+    // A cookie naming the dead peer. Its id is derived from the address the
+    // same way the config does it, which is what makes this a *pin* and not
+    // just a random string.
+    let dead_id = oxiserve::config::model::sticky_id_for(&format!("127.0.0.1:{dead}"));
+    let (set, body) = s.get_with_cookie(Some(&format!("srv_id={dead_id}")));
+    assert_eq!(body, "ALIVE", "a pin to a dead peer must fall through");
+    // And the client is re-pinned to somewhere that works.
+    let set = set.expect("falling back must issue a corrected cookie");
+    assert_eq!(
+        cookie_pair(&set),
+        format!("srv_id={}", oxiserve::config::model::sticky_id_for(&format!("127.0.0.1:{}", alive.port))),
+        "the new cookie must name the peer that actually answered"
+    );
+}
+
+#[test]
+fn an_unrecognised_cookie_is_ignored_rather_than_trusted() {
+    let a = peer_saying("A");
+    let s = Server::start(
+        "stickyjunk",
+        &conf(&format!("sticky cookie srv_id;\nserver 127.0.0.1:{};", a.port), ""),
+    );
+    let (set, body) = s.get_with_cookie(Some("srv_id=deadbeefdeadbeef"));
+    assert_eq!(body, "A");
+    assert!(set.is_some(), "a junk pin must be replaced with a real one");
+}
+
+#[test]
+fn the_cookie_does_not_disclose_the_backend_address() {
+    let a = peer_saying("A");
+    let s = Server::start(
+        "stickyopaque",
+        &conf(&format!("sticky cookie srv_id;\nserver 127.0.0.1:{};", a.port), ""),
+    );
+    let (set, _) = s.get_with_cookie(None);
+    let set = set.unwrap();
+    assert!(!set.contains("127.0.0.1"), "the address must not be in the cookie: {set}");
+    assert!(!set.contains(&a.port.to_string()), "the port must not be in the cookie: {set}");
+}
+
+#[test]
+fn cookie_attributes_are_rendered() {
+    let a = peer_saying("A");
+    let s = Server::start(
+        "stickyattrs",
+        &conf(
+            &format!(
+                "sticky cookie srv_id expires=1h domain=.example.com path=/app httponly secure samesite=lax;\n\
+                 server 127.0.0.1:{};",
+                a.port
+            ),
+            "",
+        ),
+    );
+    let (set, _) = s.get_with_cookie(None);
+    let set = set.unwrap();
+    assert!(set.contains("Max-Age=3600"), "{set}");
+    assert!(set.contains("Domain=.example.com"), "{set}");
+    assert!(set.contains("Path=/app"), "{set}");
+    assert!(set.contains("SameSite=lax"), "{set}");
+    assert!(set.contains("Secure"), "{set}");
+    assert!(set.contains("HttpOnly"), "{set}");
+}

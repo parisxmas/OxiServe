@@ -30,7 +30,7 @@ What is missing, verified against the source rather than the directive list:
 | **Upstream keepalive** | **Absent.** Every proxied request opens a new TCP connection and sends `Connection: close`. `keepalive N` is parsed and ignored. |
 | **Active health checks** | Absent. |
 | **L4 (`stream` block)** | Absent — reported as "not implemented" by `oxiserve -t`. |
-| **Sticky sessions (cookie)** | Absent (`ip_hash` only). |
+| **Sticky sessions (cookie)** | **Implemented in v0.2.32** — `sticky cookie` (`ip_hash` was the only option before). |
 | **Stats endpoint / runtime API** | Absent. |
 | **Circuit breaking, retry budgets, slow start** | Absent. |
 

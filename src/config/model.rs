@@ -908,6 +908,12 @@ pub enum LbMethod {
 #[derive(Debug, Clone)]
 pub struct UpstreamServer {
     pub addr: Box<str>,
+    /// Opaque identifier this peer is known by in a `sticky cookie`.
+    ///
+    /// A hash of the address rather than the address itself, so the cookie
+    /// does not hand a client the backend topology, and deterministic rather
+    /// than seeded, so a reload does not invalidate every session in flight.
+    pub sticky_id: Box<str>,
     pub weight: u32,
     pub max_fails: u32,
     pub fail_timeout: Duration,
@@ -964,6 +970,71 @@ pub struct Upstream {
     pub origin: std::time::Instant,
     /// `health_check` in this upstream block, if any.
     pub health_check: Option<HealthCheck>,
+    /// `sticky cookie name [expires=] [domain=] [path=] …`
+    pub sticky: Option<StickyCookie>,
+}
+
+/// `sticky cookie` — pin a client to the peer that first served it.
+///
+/// Layered over the balancing method rather than replacing it: the cookie
+/// decides when it is present and names a peer that can still take traffic,
+/// and `least_conn` or round-robin decides in every other case.
+#[derive(Debug, Clone)]
+pub struct StickyCookie {
+    pub name: Box<str>,
+    /// `expires=` — absent means a session cookie, gone when the browser is.
+    pub expires: Option<Duration>,
+    pub domain: Option<Box<str>>,
+    pub path: Option<Box<str>>,
+    pub httponly: bool,
+    pub secure: bool,
+    pub samesite: Option<Box<str>>,
+}
+
+impl StickyCookie {
+    /// Renders the `Set-Cookie` value pinning a client to `id`.
+    pub fn set_cookie(&self, id: &str) -> String {
+        let mut v = format!("{}={}", self.name, id);
+        v.push_str("; Path=");
+        v.push_str(self.path.as_deref().unwrap_or("/"));
+        if let Some(d) = &self.domain {
+            v.push_str("; Domain=");
+            v.push_str(d);
+        }
+        if let Some(e) = self.expires {
+            // Max-Age rather than Expires: no date formatting, no clock skew
+            // between us and the client, and every browser in use supports it.
+            v.push_str("; Max-Age=");
+            v.push_str(&e.as_secs().to_string());
+        }
+        if let Some(s) = &self.samesite {
+            v.push_str("; SameSite=");
+            v.push_str(s);
+        }
+        if self.secure {
+            v.push_str("; Secure");
+        }
+        if self.httponly {
+            v.push_str("; HttpOnly");
+        }
+        v
+    }
+}
+
+/// The identifier a peer is known by in a sticky cookie.
+///
+/// FNV-1a over a domain-separated address. Deterministic on purpose: a
+/// `sticky` value that changed on reload would scatter every established
+/// session across the pool on a routine certificate renewal, which is a worse
+/// failure than the mild disclosure of letting someone who already knows a
+/// backend's `host:port` confirm it.
+pub fn sticky_id_for(addr: &str) -> Box<str> {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in b"oxiserve-sticky\0".iter().chain(addr.as_bytes()) {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}").into_boxed_str()
 }
 
 /// A compiled `map $in $out { ... }`.
