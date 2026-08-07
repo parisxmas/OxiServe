@@ -39,17 +39,16 @@ There is no glibc version to match and nothing to install alongside it, so the
 same file runs on Debian, Ubuntu, RHEL, Alpine or anything else with a kernel
 new enough to matter.
 
-```console
-$ VERSION=0.2.34
-$ ARCH=$(uname -m)          # x86_64 or aarch64
-$ BASE=https://github.com/parisxmas/OxiServe/releases/download/v$VERSION
+The latest release is **v0.2.34**. `$(uname -m)` picks the right architecture,
+so these run as they are on both x86_64 and aarch64:
 
-$ curl -fsSLO $BASE/oxiserve-$VERSION-linux-$ARCH.tar.gz
-$ curl -fsSLO $BASE/SHA256SUMS
+```console
+$ curl -fsSLO https://github.com/parisxmas/OxiServe/releases/download/v0.2.34/oxiserve-0.2.34-linux-$(uname -m).tar.gz
+$ curl -fsSLO https://github.com/parisxmas/OxiServe/releases/download/v0.2.34/SHA256SUMS
 $ sha256sum -c --ignore-missing SHA256SUMS
 
-$ tar -xzf oxiserve-$VERSION-linux-$ARCH.tar.gz
-$ sudo install -m 755 oxiserve-$VERSION-linux-$ARCH/oxiserve /usr/local/bin/
+$ tar -xzf oxiserve-0.2.34-linux-$(uname -m).tar.gz
+$ sudo install -m 755 oxiserve-0.2.34-linux-$(uname -m)/oxiserve /usr/local/bin/
 ```
 
 `SHA256SUMS` covers every archive in the release, hence `--ignore-missing` —
