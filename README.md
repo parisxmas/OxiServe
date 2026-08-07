@@ -32,6 +32,71 @@ gateway — are in [`conf/examples/`](conf/examples/). All four pass `oxiserve -
 with no warnings, so every directive in them is implemented rather than parsed
 and ignored.
 
+## Install on Linux
+
+Releases ship one statically linked binary per architecture, built against musl.
+There is no glibc version to match and nothing to install alongside it, so the
+same file runs on Debian, Ubuntu, RHEL, Alpine or anything else with a kernel
+new enough to matter.
+
+```console
+$ VERSION=0.2.34
+$ ARCH=$(uname -m)          # x86_64 or aarch64
+$ BASE=https://github.com/parisxmas/OxiServe/releases/download/v$VERSION
+
+$ curl -fsSLO $BASE/oxiserve-$VERSION-linux-$ARCH.tar.gz
+$ curl -fsSLO $BASE/SHA256SUMS
+$ sha256sum -c --ignore-missing SHA256SUMS
+
+$ tar -xzf oxiserve-$VERSION-linux-$ARCH.tar.gz
+$ sudo install -m 755 oxiserve-$VERSION-linux-$ARCH/oxiserve /usr/local/bin/
+```
+
+`SHA256SUMS` covers every archive in the release, hence `--ignore-missing` —
+without it the check fails on the architecture you did not download.
+
+Point it at a configuration you already have. `-t` parses and validates without
+binding anything, and names any directive OxiServe does not implement, so it is
+worth running against your real `nginx.conf` before anything else:
+
+```console
+$ oxiserve -v
+oxiserve version: oxiserve/0.2.34
+
+$ oxiserve -t -c /etc/nginx/nginx.conf
+```
+
+Ports below 1024 need either root or the capability on its own, which is the
+better of the two — the worker never needs the rest of what root carries:
+
+```console
+$ sudo setcap cap_net_bind_service=+ep /usr/local/bin/oxiserve
+```
+
+OxiServe never daemonises — it stays in the foreground and leaves the process to
+whatever is supervising it, which is exactly what systemd's default `Type=simple`
+expects, so no `daemon off;` equivalent is needed:
+
+```ini
+[Unit]
+Description=OxiServe
+After=network.target
+
+[Service]
+ExecStartPre=/usr/local/bin/oxiserve -t -c /etc/oxiserve/oxiserve.conf
+ExecStart=/usr/local/bin/oxiserve -c /etc/oxiserve/oxiserve.conf
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The tarball also carries `conf/oxiserve.conf` and the four worked examples, so
+there is something to start from if you are not bringing an existing config.
+
+To build the release artifacts yourself rather than downloading them, see
+[Building](#building).
+
 ## Status
 
 This is an early but genuinely working server, not a demo. It serves real

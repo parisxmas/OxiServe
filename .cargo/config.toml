@@ -1,0 +1,21 @@
+# Cross-compilation to Linux, used by `scripts/release.sh`.
+#
+# musl rather than glibc so a release binary is statically linked and runs on
+# any distribution regardless of its glibc version — the alternative is a
+# separate build per distro release, which is not a thing anyone wants to
+# download. `ring` and `mimalloc` both compile C, so a C cross-toolchain is
+# required and not just a Rust target:
+#
+#   brew tap messense/macos-cross-toolchains
+#   brew install x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+#
+# These sections apply only when `--target` names them, so an ordinary native
+# build is unaffected whether or not the toolchain is installed.
+
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
