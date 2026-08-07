@@ -296,6 +296,15 @@ pub struct CoreConf {
     pub client_max_body_size: u64,
     pub client_header_buffer_size: usize,
     pub large_client_header_buffers: (usize, usize),
+    /// The rule set in force here, shared with every level that inherits it.
+    /// `None` means no rules were loaded for this level — distinct from
+    /// `modsecurity off`, which keeps the rules but stops consulting them.
+    #[cfg(feature = "modsecurity")]
+    pub modsecurity_rules: Option<Arc<crate::waf::Engine>>,
+    /// Whether to enforce them. Rules loaded at `http` with `modsecurity off`
+    /// in one location is the ordinary way to exempt a path.
+    #[cfg(feature = "modsecurity")]
+    pub modsecurity: bool,
     pub server_tokens: ServerTokens,
     pub etag: bool,
     pub msie_padding: bool,

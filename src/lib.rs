@@ -20,3 +20,5 @@ pub mod http2;
 pub mod http3;
 pub mod mime;
 pub mod server;
+#[cfg(feature = "modsecurity")]
+pub mod waf;

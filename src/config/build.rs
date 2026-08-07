@@ -230,6 +230,10 @@ pub fn default_core() -> CoreConf {
         internal: false,
         auth_request: None,
         auth_request_set: Vec::new(),
+        #[cfg(feature = "modsecurity")]
+        modsecurity_rules: None,
+        #[cfg(feature = "modsecurity")]
+        modsecurity: true,
         open_file_cache: OpenFileCache::default(),
         fastcgi: Arc::new(FastCgiConf::default()),
         proxy_cache: ProxyCacheConf::default(),
@@ -299,6 +303,14 @@ struct CoreLayer {
     // directive at all, the inner distinguishes a URI from `off`.
     auth_request: Option<Option<Arc<str>>>,
     auth_request_set: Option<Vec<(Arc<str>, Arc<Template>)>>,
+    /// Built as the rule directives are read, so a level that names none
+    /// inherits its parent's engine rather than paying to parse CRS again.
+    /// Unique until `apply` clones it, which is what makes the `Arc::get_mut`
+    /// in the directive arms sound.
+    #[cfg(feature = "modsecurity")]
+    modsecurity_engine: Option<Arc<crate::waf::Engine>>,
+    #[cfg(feature = "modsecurity")]
+    modsecurity: Option<bool>,
     fcgi_buffering: Option<bool>,
     fcgi_buffer_size: Option<usize>,
     fcgi_buffers: Option<usize>,
@@ -462,6 +474,19 @@ impl CoreLayer {
 
         if let Some(v) = &self.auth_request {
             c.auth_request = v.clone();
+        }
+
+        // A level that names rules replaces the inherited engine outright.
+        // Merging two compiled rule sets is not something libmodsecurity
+        // offers, and pretending otherwise would silently drop one of them.
+        #[cfg(feature = "modsecurity")]
+        {
+            if let Some(e) = &self.modsecurity_engine {
+                c.modsecurity_rules = Some(e.clone());
+            }
+            if let Some(v) = self.modsecurity {
+                c.modsecurity = v;
+            }
         }
         // A level that names any `auth_request_set` replaces the inherited
         // list, the same rule `add_header` follows.
@@ -1647,6 +1672,45 @@ impl Builder {
             "fastcgi_connect_timeout" => c.fcgi_connect_timeout = Some(time_arg(d, 0)?),
             "fastcgi_read_timeout" => c.fcgi_read_timeout = Some(time_arg(d, 0)?),
             "fastcgi_send_timeout" => c.fcgi_send_timeout = Some(time_arg(d, 0)?),
+            // Rules are compiled here, at configuration load, so `-t` fails on
+            // a broken rule file instead of the server starting and finding
+            // out on the first request.
+            #[cfg(feature = "modsecurity")]
+            "modsecurity_rules_file" | "modsecurity_rules" => {
+                want_args(d, 1)?;
+                if c.modsecurity_engine.is_none() {
+                    let e = crate::waf::Engine::new()
+                        .map_err(|m| BuildError { msg: m, loc: d.loc() })?;
+                    c.modsecurity_engine = Some(Arc::new(e));
+                }
+                // Unique until `apply` hands clones to child levels.
+                let engine = Arc::get_mut(c.modsecurity_engine.as_mut().unwrap())
+                    .expect("rule engine is not shared until the level closes");
+                let r = if d.name == "modsecurity_rules" {
+                    engine.add_rules_inline(&d.args[0])
+                } else {
+                    let path = self.abs(&d.args[0]);
+                    engine.add_rules_file(&path.to_string_lossy())
+                };
+                r.map_err(|m| BuildError { msg: m, loc: d.loc() })?;
+            }
+            #[cfg(feature = "modsecurity")]
+            "modsecurity" => c.modsecurity = Some(flag(d)?),
+            // Without the feature these are real directives that this binary
+            // cannot honour. Saying so beats "unknown directive", which reads
+            // like a typo and sends the operator looking in the wrong place.
+            #[cfg(not(feature = "modsecurity"))]
+            "modsecurity" | "modsecurity_rules_file" | "modsecurity_rules" => {
+                let msg = format!(
+                    "{}: \"{}\" needs a build with the \"modsecurity\" feature; \
+                     this binary has no rule engine, so nothing is being inspected",
+                    d.loc(),
+                    d.name
+                );
+                if !self.unsupported.contains(&msg) {
+                    self.unsupported.push(msg);
+                }
+            }
             "auth_request" => {
                 want_args(d, 1)?;
                 c.auth_request = Some(if d.args[0] == "off" {
@@ -2991,6 +3055,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "modsecurity"))]
     fn a_modsec_config_names_both_the_module_and_its_directives() {
         // The realistic porting case: the module line *and* the directives it
         // would have provided both have to show up, or the operator patches
@@ -3006,6 +3071,40 @@ mod tests {
         for want in ["ngx_http_modsecurity_module.so", "modsecurity", "modsecurity_rules_file"] {
             assert!(joined.contains(want), "{want} must be reported; got:\n{joined}");
         }
+    }
+
+    #[test]
+    #[cfg(feature = "modsecurity")]
+    fn with_the_feature_the_directives_work_but_the_module_still_cannot_load() {
+        // The distinction the operator needs: the rules are genuinely running,
+        // and the `.so` is genuinely not — those are separate facts and both
+        // have to be visible.
+        let c = build(
+            "load_module modules/ngx_http_modsecurity_module.so; \
+             events {} http { modsecurity on; \
+             modsecurity_rules 'SecRuleEngine On'; \
+             server { listen 80; } }",
+        )
+        .unwrap();
+        let joined = c.unsupported.join("\n");
+        assert!(joined.contains("ngx_http_modsecurity_module.so"), "{joined}");
+        // The directives are handled now, so they must not be reported.
+        assert!(!joined.contains("unknown directive \"modsecurity\""), "{joined}");
+        let http = c.http.unwrap();
+        assert!(http.servers[0].core.modsecurity_rules.is_some(), "rules must be compiled");
+    }
+
+    #[test]
+    #[cfg(feature = "modsecurity")]
+    fn a_broken_rules_file_fails_the_config_test() {
+        // Rules compile at load, so `-t` is the thing that catches a bad file
+        // rather than the first request after a restart.
+        let e = build(
+            "events {} http { modsecurity_rules 'ThisIsNotADirective x'; \
+             server { listen 80; } }",
+        )
+        .unwrap_err();
+        assert!(!e.msg.is_empty(), "the parser's reason has to survive");
     }
 
     #[test]

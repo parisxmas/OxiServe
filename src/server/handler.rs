@@ -255,6 +255,19 @@ async fn dispatch(ctx: &mut Ctx<'_>, loc: &Arc<Location>, internal: bool) -> Ste
         }
     }
 
+    // The rule engine runs before authorisation: a request CRS rejects should
+    // not reach the auth service at all, and only on the real client request —
+    // an internal redirect is the same request and inspecting it twice would
+    // double-count in the audit log.
+    #[cfg(feature = "modsecurity")]
+    if !internal {
+        match super::modsec::inspect(ctx, &loc.core) {
+            Some(super::modsec::Blocked::Status(code)) => return Step::Fail(code),
+            Some(super::modsec::Blocked::Redirect(reply)) => return Step::Done(reply),
+            None => {}
+        }
+    }
+
     // Authorisation runs before any content work — that is the whole point of
     // delegating it — but after `limit_except`, so a method that is not
     // allowed here is refused without bothering the auth service.

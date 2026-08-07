@@ -39,16 +39,16 @@ There is no glibc version to match and nothing to install alongside it, so the
 same file runs on Debian, Ubuntu, RHEL, Alpine or anything else with a kernel
 new enough to matter.
 
-The latest release is **v0.2.34**. `$(uname -m)` picks the right architecture,
+The latest release is **v0.2.36**. `$(uname -m)` picks the right architecture,
 so these run as they are on both x86_64 and aarch64:
 
 ```console
-$ curl -fsSLO https://github.com/parisxmas/OxiServe/releases/download/v0.2.34/oxiserve-0.2.34-linux-$(uname -m).tar.gz
-$ curl -fsSLO https://github.com/parisxmas/OxiServe/releases/download/v0.2.34/SHA256SUMS
+$ curl -fsSLO https://github.com/parisxmas/OxiServe/releases/download/v0.2.36/oxiserve-0.2.36-linux-$(uname -m).tar.gz
+$ curl -fsSLO https://github.com/parisxmas/OxiServe/releases/download/v0.2.36/SHA256SUMS
 $ sha256sum -c --ignore-missing SHA256SUMS
 
-$ tar -xzf oxiserve-0.2.34-linux-$(uname -m).tar.gz
-$ sudo install -m 755 oxiserve-0.2.34-linux-$(uname -m)/oxiserve /usr/local/bin/
+$ tar -xzf oxiserve-0.2.36-linux-$(uname -m).tar.gz
+$ sudo install -m 755 oxiserve-0.2.36-linux-$(uname -m)/oxiserve /usr/local/bin/
 ```
 
 `SHA256SUMS` covers every archive in the release, hence `--ignore-missing` —
@@ -60,7 +60,7 @@ worth running against your real `nginx.conf` before anything else:
 
 ```console
 $ oxiserve -v
-oxiserve version: oxiserve/0.2.34
+oxiserve version: oxiserve/0.2.36
 
 $ oxiserve -t -c /etc/nginx/nginx.conf
 ```
@@ -99,7 +99,7 @@ To build the release artifacts yourself rather than downloading them, see
 ## Status
 
 This is an early but genuinely working server, not a demo. It serves real
-traffic for the feature set below, with 557 tests (357 unit + 200 end-to-end
+traffic for the feature set below, with 560 tests (360 unit + 200 end-to-end
 over real sockets). It is **not yet a drop-in nginx replacement** —
 see [Not implemented](#not-implemented) for exactly what is missing, and run
 `oxiserve -t` against your own config to get a precise list for *your* setup.
@@ -495,14 +495,86 @@ regex captures `$1`–`$9`.
 - **`auth_basic`** / `auth_basic_user_file` (`auth_request` is implemented).
 - **`mail`** block — SMTP/IMAP/POP3 proxying.
 - **nginx binary modules** — an `.so` is compiled against nginx's internal C
-  ABI, so there is no version of this that gets implemented later: ModSecurity,
-  NAXSI, njs and the rest are absent. `load_module` is *reported* rather than
-  quietly accepted, naming the module, and saying so outright when the missing
-  one was there to filter requests.
+  ABI, so there is no version of this that gets implemented later: NAXSI, njs
+  and the rest are absent. `load_module` is *reported* rather than quietly
+  accepted, naming the module, and saying so outright when the missing one was
+  there to filter requests. ModSecurity is the exception, and it is available
+  properly rather than through a module — see [ModSecurity](#modsecurity-waf).
 - **Binary upgrade** (`USR2`/`WINCH`) — replacing the executable without
   dropping connections. `-s reload` covers configuration changes.
 - **PCRE-only regex** — lookaround and backreferences are rejected with a clear
   error rather than silently mismatching (Rust's `regex` has neither).
+
+## ModSecurity (WAF)
+
+OxiServe runs real ModSecurity rules — the OWASP Core Rule Set included —
+through **libmodsecurity v3**, linked directly.
+
+The reason it is not nginx's ModSecurity *module* is worth stating, because it
+is the same reason every other nginx module is out of reach. A module's `.so`
+is compiled against nginx's internal C ABI and carries a signature of the
+host's compile-time options; nginx refuses to load one whose signature differs
+by a single bit. Hosting one would mean being byte-compatible with one
+particular nginx build. But the rule engine was never the nginx-coupled part —
+libmodsecurity is a standalone library with a plain C API, and nginx's module
+is a thin shim over it. Calling it directly gets the real engine, with nginx
+nowhere in the picture.
+
+It is **off by default**, because it is the one C dependency in the project and
+the released binaries are static musl with none:
+
+```console
+$ cargo build --release --features modsecurity
+```
+
+Configuration follows the nginx connector's directive names, so an existing
+setup ports across:
+
+```nginx
+http {
+    modsecurity on;
+    modsecurity_rules_file /etc/oxiserve/modsec/crs-setup.conf;
+    modsecurity_rules_file /etc/oxiserve/modsec/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf;
+
+    # Inline, for the short things that are not worth a file.
+    modsecurity_rules '
+        SecRuleEngine On
+        SecRequestBodyAccess On
+    ';
+
+    server {
+        listen 80;
+        location /health { modsecurity off; }   # rules stay loaded, not consulted
+    }
+}
+```
+
+`modsecurity on|off` and the rule directives inherit `http` → `server` →
+`location` the way the rest of the configuration does. A level naming its own
+rules replaces the inherited engine rather than merging — libmodsecurity offers
+no way to combine two compiled sets, and pretending otherwise would silently
+drop one.
+
+Rules compile at configuration load, so `oxiserve -t` fails on a bad rules file
+instead of the server starting and discovering it on the first request. A
+blocked request logs which rule blocked it, at `[warn]`, alongside everything
+else.
+
+### What runs, and what does not
+
+Wired: connection, URI, request headers, request body — verified against CRS
+4.7.0, which blocks SQLi, XSS and path traversal here while leaving a benign
+query alone.
+
+**Response-phase rules do not run yet.** A `SecRule RESPONSE_BODY` or
+`RESPONSE_HEADERS` in a loaded file is parsed and never consulted, so the CRS
+rules that catch a backend leaking SQL errors or stack traces are not in force.
+Everything that inspects the *request* is.
+
+One implementation note that is easy to be bitten by: libmodsecurity's rule
+parser is a non-reentrant flex scanner, and two threads calling it at once
+abort the process outright. Configuration load is single-threaded so this is
+not reachable in practice, but the lock is there rather than resting on that.
 
 ## Benchmarks
 

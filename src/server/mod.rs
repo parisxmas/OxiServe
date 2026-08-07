@@ -22,6 +22,8 @@ pub mod handler;
 pub mod limit_conn;
 pub mod limit_req;
 pub mod log;
+#[cfg(feature = "modsecurity")]
+pub mod modsec;
 pub mod msgpack;
 pub mod preread;
 pub mod proxy;

@@ -1,10 +1,16 @@
 [package]
 name = "oxiserve"
-version = "0.2.35"
+version = "0.2.36"
 edition = "2021"
 rust-version = "1.80"
 description = "A high-performance, nginx-config-compatible web server written in Rust"
 license = "Apache-2.0"
+
+[features]
+default = []
+# Links libmodsecurity (C++). Off by default so the released static musl
+# binary keeps having no C dependency at all.
+modsecurity = []
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "signal", "macros", "sync"] }
