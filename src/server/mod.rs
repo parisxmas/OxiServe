@@ -28,8 +28,10 @@ pub mod proxy;
 pub mod quic;
 pub mod reply;
 pub mod shm;
+pub mod stats;
 pub mod stream;
 pub mod transport;
+pub mod udp;
 pub mod upstream;
 
 use std::cell::RefCell;
@@ -189,6 +191,11 @@ impl Generation {
 
         let mut stream_bound: Vec<Option<BoundSocket>> = Vec::new();
         if let Some(sc) = &stream_conf {
+            for l in &sc.udp_listeners {
+                if announce {
+                    eprintln!("oxiserve: stream listening on {} udp (reuseport)", l.addr);
+                }
+            }
             for l in &sc.listeners {
                 if cfg!(target_os = "linux") && l.reuseport {
                     stream_bound.push(None);
@@ -203,6 +210,8 @@ impl Generation {
             }
         }
 
+        // Before any worker exists, so every process shares one set.
+        stats::init();
         let tls = build_tls(&http)?;
         let quic_configs = quic::build_configs(&http)?;
         if announce {
@@ -699,6 +708,28 @@ fn worker(id: usize, inp: WorkerInputs) -> io::Result<()> {
             tasks.push(tokio::task::spawn_local(async move {
                 quic::accept_loop(ep, lconf, http, logs).await;
             }));
+        }
+
+        // UDP stream listeners bind per worker, like the QUIC ones: a
+        // datagram socket has no accept queue to share, and one socket read by
+        // every worker would scatter a session's packets across all of them.
+        if let Some(sc) = stream_conf.clone() {
+            for lconf in sc.udp_listeners.clone() {
+                let sock = match udp::bind(&lconf) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        logs.borrow_mut().error(
+                            LogLevel::Alert,
+                            &format!("udp listen on {} failed: {e}", lconf.addr),
+                        );
+                        continue;
+                    }
+                };
+                let (sc, srv) = (sc.clone(), lconf.server.clone());
+                tasks.push(tokio::task::spawn_local(async move {
+                    udp::serve(sock, sc, srv).await;
+                }));
+            }
         }
 
         for (lconf, sock) in stream_listeners {

@@ -625,3 +625,253 @@ fn routing_on_a_preread_variable_without_enabling_it_is_a_config_error() {
     let err = oxiserve::config::load(&f, dir).unwrap_err().to_string();
     assert!(err.contains("ssl_preread"), "got: {err}");
 }
+
+// ---- UDP -------------------------------------------------------------------
+
+/// A UDP backend that echoes each datagram back with a tag, and counts them.
+fn udp_echo(tag: &'static str) -> (u16, Arc<AtomicUsize>) {
+    use std::net::UdpSocket;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    // Bind on an ephemeral port and report it, so nothing can collide.
+    let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let p = s.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, from)) = s.recv_from(&mut buf) {
+            h.fetch_add(1, Ordering::SeqCst);
+            let mut reply = Vec::from(tag.as_bytes());
+            reply.extend_from_slice(b":");
+            reply.extend_from_slice(&buf[..n]);
+            let _ = s.send_to(&reply, from);
+        }
+    });
+    (p, hits)
+}
+
+/// A backend that answers every datagram twice, for `proxy_responses`.
+fn udp_double() -> u16 {
+    use std::net::UdpSocket;
+    let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let p = s.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, from)) = s.recv_from(&mut buf) {
+            let _ = s.send_to(b"one", from);
+            let _ = s.send_to(&buf[..n], from);
+        }
+    });
+    p
+}
+
+/// Starts a UDP-only stream server.
+///
+/// `Server::start` probes readiness by connecting over TCP, which a datagram
+/// listener never accepts. Readiness here is a datagram that comes back.
+fn udp_server(name: &str, body: &str) -> Server {
+    let p = port();
+    let dir =
+        std::env::temp_dir().join(format!("oxiserve-udp-{}-{name}-{p}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let text = conf(body).replace("{PORT}", &p.to_string()).replace("{DIR}", dir.to_str().unwrap());
+    let cpath = dir.join("oxiserve.conf");
+    std::fs::write(&cpath, text).unwrap();
+    let cfg = oxiserve::config::load(&cpath, dir.clone()).unwrap_or_else(|e| panic!("config: {e}"));
+    std::thread::spawn(move || {
+        let _ = oxiserve::server::run(cfg);
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if udp_exchange(p, b"__ready__", Duration::from_millis(200)).is_some() {
+            return Server { port: p, dir };
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("udp stream server never came up");
+}
+
+/// Sends a datagram to the proxy and waits for one reply.
+fn udp_exchange(port: u16, payload: &[u8], timeout: Duration) -> Option<Vec<u8>> {
+    use std::net::UdpSocket;
+    let c = UdpSocket::bind("127.0.0.1:0").unwrap();
+    c.set_read_timeout(Some(timeout)).unwrap();
+    c.send_to(payload, ("127.0.0.1", port)).unwrap();
+    let mut buf = [0u8; 2048];
+    match c.recv_from(&mut buf) {
+        Ok((n, _)) => Some(buf[..n].to_vec()),
+        Err(_) => None,
+    }
+}
+
+#[test]
+fn udp_datagrams_are_proxied_and_answered() {
+    let (back, hits) = udp_echo("A");
+    let s = udp_server(
+        "udpbasic",
+        &format!(
+            "server {{ listen {{PORT}} udp; proxy_pass 127.0.0.1:{back}; proxy_timeout 2s; }}"
+        ),
+    );
+    let before = hits.load(Ordering::SeqCst);
+    let got = udp_exchange(s.port, b"hello", Duration::from_secs(5));
+    assert_eq!(got.as_deref(), Some(&b"A:hello"[..]), "the reply must come back to the client");
+    assert_eq!(hits.load(Ordering::SeqCst), before + 1);
+}
+
+#[test]
+fn udp_keeps_one_client_on_one_session() {
+    // Several datagrams from the same source are one session, so they reach
+    // the same peer and the client keeps talking to the same backend.
+    let (a, ah) = udp_echo("A");
+    let (b, bh) = udp_echo("B");
+    let s = udp_server(
+        "udpsession",
+        &format!(
+            "upstream pool {{ server 127.0.0.1:{a}; server 127.0.0.1:{b}; }}\n\
+             server {{ listen {{PORT}} udp; proxy_pass pool; proxy_timeout 5s; }}"
+        ),
+    );
+    let (a0, b0) = (ah.load(Ordering::SeqCst), bh.load(Ordering::SeqCst));
+
+    use std::net::UdpSocket;
+    let c = UdpSocket::bind("127.0.0.1:0").unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut tags = Vec::new();
+    for i in 0..6 {
+        c.send_to(format!("m{i}").as_bytes(), ("127.0.0.1", s.port)).unwrap();
+        let mut buf = [0u8; 2048];
+        let (n, _) = c.recv_from(&mut buf).expect("a reply per datagram");
+        tags.push(String::from_utf8_lossy(&buf[..n]).split(':').next().unwrap().to_string());
+    }
+    assert_eq!(tags.len(), 6);
+    assert!(
+        tags.iter().all(|t| t == &tags[0]),
+        "one client must stay on one peer for the life of its session, got {tags:?}"
+    );
+    let (ac, bc) = (ah.load(Ordering::SeqCst) - a0, bh.load(Ordering::SeqCst) - b0);
+    assert_eq!(ac + bc, 6);
+    assert!(ac == 6 || bc == 6, "the session was split across peers: {ac}/{bc}");
+}
+
+#[test]
+fn udp_spreads_separate_clients_across_the_pool() {
+    // The counterpart: a *different* source address is a different session and
+    // gets balanced, or the pool would be pointless.
+    let (a, ah) = udp_echo("A");
+    let (b, bh) = udp_echo("B");
+    let s = udp_server(
+        "udpspread",
+        &format!(
+            "upstream pool {{ server 127.0.0.1:{a}; server 127.0.0.1:{b}; }}\n\
+             server {{ listen {{PORT}} udp; proxy_pass pool; proxy_timeout 2s; }}"
+        ),
+    );
+    // Each exchange uses a fresh ephemeral source port, so each is its own
+    // session.
+    for i in 0..8 {
+        assert!(
+            udp_exchange(s.port, format!("m{i}").as_bytes(), Duration::from_secs(5)).is_some(),
+            "datagram {i} went unanswered"
+        );
+    }
+    assert!(ah.load(Ordering::SeqCst) > 0, "peer A saw nothing");
+    assert!(bh.load(Ordering::SeqCst) > 0, "peer B saw nothing");
+}
+
+#[test]
+fn proxy_responses_ends_the_session_after_the_expected_replies() {
+    // The backend answers twice. With `proxy_responses 1` the client sees the
+    // first and the session closes rather than waiting out proxy_timeout.
+    let back = udp_double();
+    let s = udp_server(
+        "udpresponses",
+        &format!(
+            "server {{ listen {{PORT}} udp; proxy_pass 127.0.0.1:{back};\n\
+               proxy_responses 1; proxy_timeout 30s; }}"
+        ),
+    );
+    let started = Instant::now();
+    let got = udp_exchange(s.port, b"x", Duration::from_secs(5));
+    assert_eq!(got.as_deref(), Some(&b"one"[..]));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the reply must not wait for proxy_timeout"
+    );
+}
+
+#[test]
+fn a_udp_listener_does_not_open_a_tcp_port() {
+    // `listen ... udp` is a datagram socket and nothing else. Binding the same
+    // port on TCP proves nothing is listening there.
+    let (back, _) = udp_echo("A");
+    let s = udp_server(
+        "udponly",
+        &format!("server {{ listen {{PORT}} udp; proxy_pass 127.0.0.1:{back}; proxy_timeout 2s; }}"),
+    );
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", s.port)).is_ok(),
+        "a udp listener must not also hold the TCP port"
+    );
+}
+
+/// Config forms that would otherwise be accepted and quietly do nothing.
+#[test]
+fn udp_misconfigurations_are_refused() {
+    fn load_err(tag: &str, body: &str) -> String {
+        let dir = std::env::temp_dir()
+            .join(format!("oxiserve-udpbad-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join(format!("{tag}.conf"));
+        std::fs::write(&f, format!("events {{}} stream {{ {body} }}")).unwrap();
+        oxiserve::config::load(&f, dir).unwrap_err().to_string()
+    }
+
+    // A datagram has no ClientHello to preread, and accepting this would route
+    // every packet to the map's default.
+    let e = load_err(
+        "preread",
+        "server { listen 19301 udp; ssl_preread on; proxy_pass 127.0.0.1:1; }",
+    );
+    assert!(e.contains("ssl_preread"), "got: {e}");
+
+    // `proxy_responses` counts datagrams; on TCP there are none to count.
+    let e = load_err(
+        "responses",
+        "server { listen 19302; proxy_responses 1; proxy_pass 127.0.0.1:1; }",
+    );
+    assert!(e.contains("proxy_responses"), "got: {e}");
+
+    // There is no such thing as a Unix datagram listener here.
+    let e = load_err(
+        "unix",
+        "server { listen unix:/tmp/x.sock udp; proxy_pass 127.0.0.1:1; }",
+    );
+    assert!(e.contains("unix:"), "got: {e}");
+}
+
+#[test]
+fn tcp_and_udp_can_share_a_port() {
+    // Two sockets, two loops. A DNS-shaped deployment needs both on 53.
+    let (udp_back, _) = udp_echo("U");
+    let tcp_back = Echo::start("T");
+    let s = udp_server(
+        "bothproto",
+        &format!(
+            "server {{ listen {{PORT}} udp; proxy_pass 127.0.0.1:{udp_back}; proxy_timeout 2s; }}\n\
+             server {{ listen {{PORT}}; proxy_pass 127.0.0.1:{}; }}",
+            tcp_back.port
+        ),
+    );
+    assert_eq!(
+        udp_exchange(s.port, b"hi", Duration::from_secs(5)).as_deref(),
+        Some(&b"U:hi"[..]),
+        "the udp side must answer"
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", s.port)).expect("the tcp side must accept");
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    c.write_all(b"hi").unwrap();
+    let mut buf = [0u8; 64];
+    let n = c.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"[T]HI", "the tcp side must reach its own backend");
+}

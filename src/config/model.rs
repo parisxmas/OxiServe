@@ -480,6 +480,12 @@ pub enum Action {
     Proxy(Arc<ProxyPass>),
     /// `fastcgi_pass 127.0.0.1:9000;`
     FastCgi(Arc<FastCgiPass>),
+    /// `stub_status;` — the server's own counters.
+    ///
+    /// `json` is an extension: nginx has no upstream visibility outside its
+    /// commercial build, and a pool you cannot inspect is one you debug by
+    /// guessing. Plain `stub_status;` is byte-for-byte nginx.
+    StubStatus { json: bool },
     /// A location that only exists to hold configuration (e.g. `internal;`).
     None,
 }
@@ -801,6 +807,10 @@ pub struct ListenSpec {
     pub default_server: bool,
     pub ssl: bool,
     pub http2: bool,
+    /// `listen ... udp` — a datagram listener in a `stream` block. Mutually
+    /// exclusive with everything TCP: there is no accept, no connection, and
+    /// no ordering.
+    pub udp: bool,
     /// `listen ... quic` — this address is served over QUIC, on UDP. A `listen`
     /// line is either TCP or UDP, never both, so this partitions the specs
     /// rather than decorating them: `listen 443 ssl; listen 443 quic;` is two
@@ -1123,6 +1133,11 @@ pub struct StreamServer {
     /// is proxied with empty preread variables rather than dropped: a client
     /// that is slow is not a client that is wrong.
     pub preread_timeout: Duration,
+    /// `proxy_responses N` — how many datagrams the backend is expected to
+    /// send back per client datagram, after which the UDP session is finished
+    /// without waiting for the idle timeout. `None` means "however many",
+    /// and the session lives until `proxy_timeout` expires.
+    pub proxy_responses: Option<u64>,
     pub raw_line: u32,
 }
 
@@ -1133,6 +1148,9 @@ pub struct StreamListener {
     pub backlog: i32,
     pub reuseport: bool,
     pub ipv6_only: bool,
+    /// Datagrams rather than connections. UDP listeners live in
+    /// [`StreamConf::udp_listeners`], never in `listeners`.
+    pub udp: bool,
     pub server: Arc<StreamServer>,
 }
 
@@ -1140,6 +1158,9 @@ pub struct StreamListener {
 #[derive(Debug)]
 pub struct StreamConf {
     pub listeners: Vec<Arc<StreamListener>>,
+    /// Datagram listeners, bound per worker with `SO_REUSEPORT`. Kept apart
+    /// from `listeners` because a UDP socket has no accept loop to share.
+    pub udp_listeners: Vec<Arc<StreamListener>>,
     pub upstreams: HashMap<Box<str>, Arc<Upstream>>,
     /// `map` blocks declared inside `stream { }`. Kept separate from the HTTP
     /// ones because the two scopes have different variables available — an

@@ -31,7 +31,7 @@ What is missing, verified against the source rather than the directive list:
 | **Active health checks** | Absent. |
 | **L4 (`stream` block)** | Absent — reported as "not implemented" by `oxiserve -t`. |
 | **Sticky sessions (cookie)** | **Implemented in v0.2.32** — `sticky cookie` (`ip_hash` was the only option before). |
-| **Stats endpoint / runtime API** | Absent. |
+| **Stats endpoint / runtime API** | **Implemented in v0.2.33** — `stub_status`, plus `stub_status json` for per-peer upstream state. |
 | **Circuit breaking, retry budgets, slow start** | Absent. |
 
 The first two entries matter more than their size suggests. They are not

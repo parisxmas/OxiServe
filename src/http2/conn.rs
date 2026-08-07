@@ -173,6 +173,8 @@ pub async fn serve<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + 'static,
 {
+    // Counted for `stub_status` for as long as the h2 connection lives.
+    let _conn = crate::server::stats::ConnGuard::enter();
     let (rd, wr) = tokio::io::split(sock);
     let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
@@ -859,6 +861,7 @@ fn spawn_stream(
         let Reply { resp, body } = reply;
         let (body_bytes, total) = send_response(id, &resp, body, &flow, &sflow, &tx).await;
         crate::server::conn::log_request(&logs, &ctx, &resp, status, body_bytes, total);
+        crate::server::stats::request_done();
     });
 }
 

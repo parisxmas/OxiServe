@@ -290,6 +290,20 @@ async fn dispatch(ctx: &mut Ctx<'_>, loc: &Arc<Location>, internal: bool) -> Ste
             Ok(r) => Step::Done(r),
             Err(c) => Step::Fail(c),
         },
+        Action::StubStatus { json } => {
+            let (body, ctype) = if *json {
+                (crate::server::stats::json_body(ctx.http), "application/json")
+            } else {
+                (crate::server::stats::stub_status_body(), "text/plain")
+            };
+            let mut resp = Resp::new();
+            resp.status = 200;
+            resp.header("Content-Type", ctype);
+            // A status page is a snapshot. Caching one is how a monitoring
+            // dashboard ends up plotting a straight line through an outage.
+            resp.header("Cache-Control", "no-cache, no-store");
+            Step::Done(Reply::new(resp, Body::Bytes(body.into_bytes())))
+        }
         Action::Static => served_to_step(files::serve(ctx, Some(loc)).await),
     }
 }

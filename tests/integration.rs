@@ -2432,3 +2432,151 @@ fn return_without_default_type_is_still_text_plain() {
     );
     assert_eq!(s.get("/").header("content-type"), Some("text/plain"));
 }
+
+// ---- stub_status ------------------------------------------------------------
+
+#[test]
+fn stub_status_reports_nginx_exact_format() {
+    // Monitoring agents parse this with regexes written against nginx's
+    // output, so the layout is the interface — trailing spaces included.
+    let s = Server::start(
+        "stubstatus",
+        &format!("{BASE}
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        location = /status {{ stub_status; }}
+        location / {{ return 200 \"ok\"; }}
+    }}
+}}"),
+        &[],
+    );
+
+    // A few requests so the counters are not all zero.
+    for _ in 0..3 {
+        assert_eq!(s.get("/").status, 200);
+    }
+
+    let r = s.get("/status");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("content-type"), Some("text/plain"));
+    let body = r.body_str();
+    let lines: Vec<&str> = body.split('\n').collect();
+
+    assert!(lines[0].starts_with("Active connections: "), "{body:?}");
+    assert_eq!(lines[1], "server accepts handled requests");
+    assert!(lines[3].starts_with("Reading: "), "{body:?}");
+
+    // The counters line is " accepts handled requests".
+    let nums: Vec<u64> =
+        lines[2].split_whitespace().map(|n| n.parse().unwrap()).collect();
+    assert_eq!(nums.len(), 3, "{body:?}");
+    assert!(nums[0] >= 4, "accepts should count the four connections so far: {body:?}");
+    assert_eq!(nums[0], nums[1], "handled equals accepts with no connection limit");
+    assert!(nums[2] >= 3, "requests should count the three GETs: {body:?}");
+
+    // The status request itself is active while it is being answered.
+    assert!(
+        lines[0].trim_start_matches("Active connections: ").trim().parse::<u64>().unwrap() >= 1,
+        "{body:?}"
+    );
+}
+
+#[test]
+fn stub_status_counters_advance_with_traffic() {
+    // A snapshot proves the format; two snapshots prove the numbers are live
+    // rather than a static string that happens to look right.
+    let s = Server::start(
+        "stubdelta",
+        &format!("{BASE}
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        location = /status {{ stub_status; }}
+        location / {{ return 200 \"ok\"; }}
+    }}
+}}"),
+        &[],
+    );
+    let requests = |body: &str| -> u64 {
+        body.split('\n').nth(2).unwrap().split_whitespace().nth(2).unwrap().parse().unwrap()
+    };
+
+    let before = requests(&s.get("/status").body_str());
+    for _ in 0..5 {
+        s.get("/");
+    }
+    let after = requests(&s.get("/status").body_str());
+    // Five GETs plus the first status request itself.
+    assert!(after >= before + 6, "counters did not advance: {before} -> {after}");
+}
+
+#[test]
+fn stub_status_is_not_cacheable() {
+    // A dashboard plotting a cached status page draws a flat line through an
+    // outage.
+    let s = Server::start(
+        "stubnocache",
+        &format!("{BASE}
+    server {{ listen {{PORT}}; root {{ROOT}}; location = /s {{ stub_status; }} }}
+}}"),
+        &[],
+    );
+    let cc = s.get("/s").header("cache-control").unwrap_or_default().to_string();
+    assert!(cc.contains("no-store"), "got: {cc:?}");
+}
+
+#[test]
+fn stub_status_json_reports_upstream_peer_state() {
+    // The extension: nginx has no upstream visibility outside its commercial
+    // build, and a pool you cannot inspect is one you debug by guessing.
+    let s = Server::start(
+        "stubjson",
+        &format!("{BASE}
+    upstream pool {{
+        server 127.0.0.1:9401;
+        server 127.0.0.1:9402 weight=3;
+        server 127.0.0.1:9403 backup;
+        server 127.0.0.1:9404 down;
+    }}
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        location = /status {{ stub_status json; }}
+        location / {{ proxy_pass http://pool; }}
+    }}
+}}"),
+        &[],
+    );
+
+    let r = s.get("/status");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("content-type"), Some("application/json"));
+    let body = r.body_str();
+
+    assert!(body.contains("\"connections\""), "{body}");
+    assert!(body.contains("\"upstreams\""), "{body}");
+    assert!(body.contains("\"pool\""), "{body}");
+    for p in ["127.0.0.1:9401", "127.0.0.1:9402", "127.0.0.1:9403", "127.0.0.1:9404"] {
+        assert!(body.contains(p), "peer {p} missing from {body}");
+    }
+    // The administratively-disabled peer is reported as such rather than as
+    // merely unhealthy, which is a different operational situation.
+    assert!(body.contains("\"state\": \"down\""), "{body}");
+    assert!(body.contains("\"weight\": 3"), "{body}");
+    assert!(body.contains("\"backup\": true"), "{body}");
+}
+
+#[test]
+fn an_invalid_stub_status_parameter_is_a_config_error() {
+    let dir = std::env::temp_dir().join(format!("oxiserve-stubbad-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("bad.conf");
+    std::fs::write(
+        &f,
+        "events {} http { server { listen 80; location /s { stub_status xml; } } }",
+    )
+    .unwrap();
+    let err = oxiserve::config::load(&f, dir).unwrap_err().to_string();
+    assert!(err.contains("stub_status"), "got: {err}");
+}

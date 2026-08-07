@@ -35,7 +35,7 @@ and ignored.
 ## Status
 
 This is an early but genuinely working server, not a demo. It serves real
-traffic for the feature set below, with 538 tests (351 unit + 187 end-to-end
+traffic for the feature set below, with 557 tests (357 unit + 200 end-to-end
 over real sockets). It is **not yet a drop-in nginx replacement** —
 see [Not implemented](#not-implemented) for exactly what is missing, and run
 `oxiserve -t` against your own config to get a precise list for *your* setup.
@@ -332,6 +332,26 @@ selection, passive health and `least_conn` with the HTTP proxy; `proxy_timeout`
 is an *idle* timeout, so a long-lived session is never severed for being long.
 `listen unix:` works here too.
 
+**UDP** — `listen ... udp;` in a `stream` server proxies datagrams, for DNS,
+syslog, QUIC-behind-a-balancer and anything else that is not a byte stream:
+
+```nginx
+stream {
+    upstream dns { server 10.0.0.1:53; server 10.0.0.2:53; }
+    server { listen 53 udp; proxy_pass dns; proxy_responses 1; proxy_timeout 5s; }
+}
+```
+
+UDP has no connections, so a *session* is invented the way nginx does it: the
+first datagram from a source address starts one, later datagrams from the same
+address join it, and it ends when `proxy_responses` replies have come back or
+`proxy_timeout` passes with nothing happening. Each session gets its own
+socket `connect`ed to the chosen peer, which is what makes replies
+attributable and lets the kernel drop datagrams from anywhere else. A client
+that changes address simply starts a new session — for UDP that is the correct
+outcome, not the limitation it is for QUIC. Upstream selection, weights and
+health are shared with the TCP path, and a port can carry both at once.
+
 **`ssl_preread`** — route TLS on SNI without terminating it. The ClientHello is
 read and *not consumed*: every byte, including the ones inspected, is forwarded,
 so the backend completes the handshake against untouched input and we never hold
@@ -352,12 +372,27 @@ stream {
 }
 ```
 
-> **Still missing for a true HAProxy replacement:** UDP in `stream`, a stats
-> endpoint. (Cookie-based sticky sessions shipped in v0.2.32.)
+> The three items this section used to list as missing for a HAProxy
+> replacement — cookie sticky sessions, UDP in `stream`, and a stats endpoint —
+> all shipped, in v0.2.32 and v0.2.33.
 > Scope and order: [ADR-0001](docs/decisions/0001-load-balancer-scope.md).
 
 **TLS** — rustls, `ssl_certificate` / `ssl_certificate_key`, SNI across servers
 sharing a listener.
+
+**Status** — `stub_status;` in a location, byte-for-byte nginx's format, so
+the monitoring agents that parse it with regexes written against nginx keep
+working. The counters live in the pre-fork `MAP_SHARED` mapping, so they
+report the whole server rather than whichever worker answered — with
+`worker_processes 2` that is the difference between the real number and half
+of it. `Reading` / `Writing` / `Waiting` are moved by the connection state
+machine as it actually changes state rather than estimated.
+
+`stub_status json;` is an extension — nginx has no upstream visibility outside
+its commercial build — adding per-peer state, in-flight counts, weights and
+which peers are `down` versus health-ejected. A pool that cannot be inspected
+is one you debug by guessing, and the data already exists: it is what
+`least_conn` and the health checks are maintaining anyway.
 
 **Logging** — `log_format` with the full variable set, `access_log` with
 `buffer=` / `flush=`, `error_log` with levels, and a structured sink into

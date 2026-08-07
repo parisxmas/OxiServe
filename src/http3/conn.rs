@@ -58,6 +58,8 @@ pub async fn serve(
     local: Option<SocketAddr>,
     conn_id: u64,
 ) {
+    // Counted for `stub_status` for as long as the QUIC connection lives.
+    let _conn = crate::server::stats::ConnGuard::enter();
     // RFC 9114 section 6.2.1: the control stream must be opened first and must
     // carry SETTINGS as its first frame. A peer is entitled to close the
     // connection if it sees anything else, so this happens before we so much
@@ -304,6 +306,7 @@ async fn request(
     let Reply { resp, body: out_body } = reply;
     let (body_bytes, total) = write_response(&mut send, &resp, out_body).await;
     crate::server::conn::log_request(logs, &ctx, &resp, status, body_bytes, total);
+    crate::server::stats::request_done();
     Ok(())
 }
 

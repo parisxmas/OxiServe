@@ -622,7 +622,7 @@ const KNOWN_UNIMPLEMENTED: &[&str] = &[
     "auth_basic", "auth_basic_user_file",
     "ssi", "sub_filter", "sub_filter_types", "addition_before_body",
     "dav_methods", "mp4", "flv", "xslt_stylesheet", "image_filter",
-    "stub_status", "perl", "js_content",
+    "perl", "js_content",
     "geo", "split_clients", "referer_hash_bucket_size",
 ];
 
@@ -1186,6 +1186,7 @@ impl Builder {
                 default_server: false,
                 ssl: false,
                 http2: false,
+                udp: false,
                 quic: false,
                 reuseport: false,
                 backlog: None,
@@ -1278,6 +1279,7 @@ impl Builder {
             default_server: false,
             ssl: false,
             http2: false,
+            udp: false,
             quic: false,
             reuseport: false,
             backlog: None,
@@ -1296,6 +1298,7 @@ impl Builder {
                 // rather than required — nginx reads `listen 443 quic;` the
                 // same way. `http3` is accepted as the spelling some configs
                 // use for the same thing.
+                "udp" => l.udp = true,
                 "quic" | "http3" => {
                     l.quic = true;
                     l.ssl = true;
@@ -1959,6 +1962,17 @@ impl Builder {
             "return" => {
                 want_args_range(d, 1, 2)?;
                 lv.action = Some(parse_return(d)?);
+            }
+            "stub_status" => {
+                want_args_range(d, 0, 1)?;
+                let json = match d.args.first().map(|a| a.as_str()) {
+                    None => false,
+                    Some("json") => true,
+                    Some(other) => {
+                        bail!(d, "invalid parameter \"{other}\" in \"stub_status\", expected \"json\"")
+                    }
+                };
+                lv.action = Some(Action::StubStatus { json });
             }
             "rewrite" => lv.rewrites.push(self.rewrite(d)?),
             "if" => lv.ifs.push(self.if_block(d)?),
@@ -3149,19 +3163,29 @@ impl Builder {
         }
 
         let mut listeners = Vec::new();
+        let mut udp_listeners = Vec::new();
         for s in &servers {
             for l in &s.listens {
-                listeners.push(Arc::new(StreamListener {
+                let sl = Arc::new(StreamListener {
                     addr: l.addr.clone(),
                     backlog: l.backlog.unwrap_or(511),
                     reuseport: l.reuseport,
                     ipv6_only: l.ipv6_only,
+                    udp: l.udp,
                     server: s.clone(),
-                }));
+                });
+                // Two different sockets, two different loops. The same port
+                // can legitimately carry both, which is exactly why they are
+                // not merged by address the way HTTP listeners are.
+                if l.udp {
+                    udp_listeners.push(sl);
+                } else {
+                    listeners.push(sl);
+                }
             }
         }
 
-        Ok(StreamConf { listeners, upstreams, maps })
+        Ok(StreamConf { listeners, udp_listeners, upstreams, maps })
     }
 
     fn stream_server(
@@ -3178,6 +3202,7 @@ impl Builder {
         // nginx's default proxy_timeout is 10 minutes: stream connections are
         // long-lived by nature (databases, message brokers).
         let mut timeout = Duration::from_secs(600);
+        let mut proxy_responses: Option<u64> = None;
 
         for c in d.children() {
             match c.name.as_str() {
@@ -3189,6 +3214,13 @@ impl Builder {
                 }
                 "proxy_connect_timeout" => connect_timeout = time_arg(c, 0)?,
                 "proxy_timeout" => timeout = time_arg(c, 0)?,
+                "proxy_responses" => {
+                    want_args(c, 1)?;
+                    proxy_responses = Some(c.args[0].parse().map_err(|_| BuildError {
+                        msg: format!("invalid \"proxy_responses\" value \"{}\"", c.args[0]),
+                        loc: c.loc(),
+                    })?);
+                }
                 "ssl_preread" => ssl_preread = flag(c)?,
                 "preread_buffer_size" => preread_buffer_size = size_arg(c, 0)? as usize,
                 "preread_timeout" => preread_timeout = time_arg(c, 0)?,
@@ -3209,6 +3241,18 @@ impl Builder {
             if l.ssl {
                 bail!(d, "\"ssl\" on a stream listener is not supported yet");
             }
+            if l.udp && matches!(l.addr, ListenAddr::Unix(_)) {
+                bail!(d, "\"udp\" cannot be used with a unix: listen address");
+            }
+        }
+        // `ssl_preread` reads a TLS ClientHello off a byte stream. A datagram
+        // listener has no stream to read it from, and silently doing nothing
+        // would route every packet to the map's default.
+        if proxy_responses.is_some() && !listens.iter().any(|l| l.udp) {
+            bail!(d, "\"proxy_responses\" applies only to a \"udp\" listener");
+        }
+        if ssl_preread && listens.iter().any(|l| l.udp) {
+            bail!(d, "\"ssl_preread\" cannot be used on a \"udp\" listener");
         }
 
         // Routing on a preread variable without turning preread on would
@@ -3235,6 +3279,7 @@ impl Builder {
             ssl_preread,
             preread_buffer_size,
             preread_timeout,
+            proxy_responses,
             raw_line: d.line,
         })
     }

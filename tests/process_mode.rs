@@ -288,3 +288,49 @@ fn a_connection_limit_is_one_limit_across_worker_processes() {
          2 would mean each process kept a private counter"
     );
 }
+
+/// `stub_status` has to report the whole server, not the worker that happened
+/// to answer.
+///
+/// With per-process counters each worker would see roughly its own share, so
+/// asking for more requests than any one worker could have handled is what
+/// separates a shared block from a private one.
+#[test]
+fn stub_status_counts_every_worker() {
+    const REQUESTS: usize = 40;
+
+    let m = Master::start(
+        "stubshm",
+        "server { listen {PORT} reuseport; root {ROOT};\n\
+             location = /status { stub_status; }\n\
+             location / { return 200 \"ok\"; } }",
+    );
+    assert_eq!(m.worker_pids().len(), 2);
+
+    // Each on a fresh connection, so reuseport spreads them over both workers.
+    for _ in 0..REQUESTS {
+        let (status, _) = m.get("/");
+        assert_eq!(status, 200);
+    }
+
+    let (status, body) = m.get("/status");
+    assert_eq!(status, 200);
+    let counters = body.split('\n').nth(2).unwrap_or_default().to_string();
+    let nums: Vec<u64> = counters
+        .split_whitespace()
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    assert_eq!(nums.len(), 3, "unexpected counters line {counters:?} in {body:?}");
+
+    assert!(
+        nums[2] >= REQUESTS as u64,
+        "requests={} but {REQUESTS} were made across BOTH workers; \
+         a smaller number means each process kept private counters",
+        nums[2]
+    );
+    assert!(
+        nums[0] >= REQUESTS as u64,
+        "accepts={} for {REQUESTS} connections",
+        nums[0]
+    );
+}

@@ -211,6 +211,15 @@ pub async fn serve_with_prefix<S>(
     }
     let mut requests: u64 = 0;
 
+    // `stub_status` counts this connection from here until the function
+    // returns, whichever of the many early returns below gets there.
+    let _conn = crate::server::stats::ConnGuard::enter();
+    // Waiting until the first byte of a request arrives, which is what nginx
+    // means by the state: open but not yet asking for anything.
+    let mut state = crate::server::stats::StateGuard::enter(
+        crate::server::stats::State::Waiting,
+    );
+
     // Defaults come from the listener's default server until a Host is parsed.
     let default_server = &listener.servers[listener.default_server];
 
@@ -230,6 +239,7 @@ pub async fn serve_with_prefix<S>(
         // so a graceful shutdown waits for work in progress and not for
         // connections that are merely open.
         let mut live: Option<crate::server::LiveRequest> = None;
+        state.switch(crate::server::stats::State::Reading);
         let max_head = core.large_client_header_buffers.0 * core.large_client_header_buffers.1;
         let parse = match read_head(&mut sock, st, header_timeout, max_head, &mut live).await {
             Ok(p) => p,
@@ -303,6 +313,7 @@ pub async fn serve_with_prefix<S>(
             requests,
         );
 
+        state.switch(crate::server::stats::State::Writing);
         let mut reply = match body_status {
             Some(code) => handler::error_reply(&ctx, code),
             None => handler::handle(&mut ctx).await,
@@ -346,6 +357,9 @@ pub async fn serve_with_prefix<S>(
             written.body_bytes,
             written.total_bytes,
         );
+        crate::server::stats::request_done();
+        // Back to idle: the response is out and nothing is being asked.
+        state.switch(crate::server::stats::State::Waiting);
 
         if !keep {
             // Returning drops the socket, and `close(2)` sends the FIN on its

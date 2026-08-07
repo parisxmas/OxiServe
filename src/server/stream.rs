@@ -53,36 +53,9 @@ pub async fn serve(
         None
     };
 
-    let vars = StreamVars { conf: &conf, remote, hello: hello.as_ref() };
-
     // ---- pick a peer ------------------------------------------------------
-    let (addr, health) = match &srv.target {
-        ProxyTarget::Addr { host, port } => (format!("{host}:{port}"), None),
-        ProxyTarget::Unix(p) => (format!("unix:{p}"), None),
-        ProxyTarget::Upstream(name) => match pick(&conf, name) {
-            Some(v) => v,
-            None => return,
-        },
-        // `proxy_pass $backend;` — the usual shape once ssl_preread is on.
-        ProxyTarget::Dynamic(t) => {
-            let rendered = t.render(&vars);
-            let rendered = rendered.trim();
-            // An unmatched map with no default renders to nothing. Closing is
-            // the honest outcome: there is no backend, and picking an
-            // arbitrary one would send a client's TLS session to a service it
-            // never asked for.
-            if rendered.is_empty() {
-                return;
-            }
-            match conf.upstreams.get(rendered) {
-                Some(_) => match pick(&conf, rendered) {
-                    Some(v) => v,
-                    None => return,
-                },
-                // Not a group name, so it is an address.
-                None => (peer_addr(rendered), None),
-            }
-        }
+    let Some((addr, health)) = resolve_target(&conf, &srv, remote, hello.as_ref()) else {
+        return;
     };
 
     let _in_flight = health
@@ -208,6 +181,43 @@ fn pick(conf: &StreamConf, name: &str) -> Option<(String, Option<(Arc<Upstream>,
     let cursor = next_cursor(up);
     let idx = up_state::select(up, Instant::now(), None, cursor)?;
     Some((peer_addr(&up.servers[idx].addr), Some((up.clone(), idx))))
+}
+
+/// Resolves `proxy_pass` to a concrete address, plus the peer's health slot
+/// when it came from an upstream group.
+///
+/// Shared with the UDP path: which backend a `stream` server talks to is
+/// decided the same way whether the transport has connections or not, and
+/// duplicating it would let the two drift.
+pub(crate) fn resolve_target(
+    conf: &Arc<StreamConf>,
+    srv: &Arc<StreamServer>,
+    remote: Option<SocketAddr>,
+    hello: Option<&Hello>,
+) -> Option<(String, Option<(Arc<Upstream>, usize)>)> {
+    match &srv.target {
+        ProxyTarget::Addr { host, port } => Some((format!("{host}:{port}"), None)),
+        ProxyTarget::Unix(p) => Some((format!("unix:{p}"), None)),
+        ProxyTarget::Upstream(name) => pick(conf, name),
+        // `proxy_pass $backend;` — the usual shape once ssl_preread is on.
+        ProxyTarget::Dynamic(t) => {
+            let vars = StreamVars { conf, remote, hello };
+            let rendered = t.render(&vars);
+            let rendered = rendered.trim();
+            // An unmatched map with no default renders to nothing. Refusing is
+            // the honest outcome: there is no backend, and picking an
+            // arbitrary one would send a client's session to a service it
+            // never asked for.
+            if rendered.is_empty() {
+                return None;
+            }
+            match conf.upstreams.get(rendered) {
+                Some(_) => pick(conf, rendered),
+                // Not a group name, so it is an address.
+                None => Some((peer_addr(rendered), None)),
+            }
+        }
+    }
 }
 
 /// Reads until the client's TLS ClientHello is complete, or until it is clear
