@@ -2392,3 +2392,43 @@ fn a_named_location_applies_its_own_add_header() {
         "a location that defines add_header replaces the inherited set"
     );
 }
+
+#[test]
+fn return_uses_default_type_rather_than_a_hardcoded_text_plain() {
+    // nginx's `return` hands a null content type to ngx_http_send_response,
+    // which falls back to `default_type`. An API setting
+    // `default_type application/json` expects its returned bodies to say so,
+    // and getting text/plain instead is a parse error at the other end.
+    let s = Server::start(
+        "defaulttype",
+        &format!("{BASE}
+    default_type application/json;
+    server {{
+        listen {{PORT}};
+        root {{ROOT}};
+        location /a {{ return 200 \"{{}}\"; }}
+        location /b {{ default_type text/csv; return 200 \"a,b\"; }}
+    }}
+}}"),
+        &[],
+    );
+
+    assert_eq!(s.get("/a").header("content-type"), Some("application/json"),
+               "the http-level default_type must apply");
+    assert_eq!(s.get("/b").header("content-type"), Some("text/csv"),
+               "a location overrides it");
+}
+
+#[test]
+fn return_without_default_type_is_still_text_plain() {
+    // The nginx built-in default, so a config that never mentions
+    // default_type sees no change from honouring it.
+    let s = Server::start(
+        "defaulttypenone",
+        &format!("{BASE}
+    server {{ listen {{PORT}}; root {{ROOT}}; location / {{ return 200 \"ok\"; }} }}
+}}"),
+        &[],
+    );
+    assert_eq!(s.get("/").header("content-type"), Some("text/plain"));
+}

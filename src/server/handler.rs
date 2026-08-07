@@ -693,7 +693,14 @@ fn return_reply(ctx: &Ctx<'_>, code: u16, body: Option<Arc<crate::config::vars::
     match text {
         Some(t) => {
             if !resp.has("content-type") {
-                resp.header("Content-Type", "text/plain");
+                // `default_type`, not a hardcoded `text/plain`. nginx's
+                // `return` hands a null content type to
+                // `ngx_http_send_response`, which falls back to the same
+                // directive, and an API that sets `default_type
+                // application/json` expects its `return`ed bodies to say so.
+                // The default is already `text/plain`, so a config that never
+                // sets it is unaffected.
+                resp.header("Content-Type", &matched_core(ctx).default_type);
             }
             Reply::new(resp, Body::Bytes(t.into_bytes()))
         }

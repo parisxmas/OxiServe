@@ -27,10 +27,15 @@ $ oxiserve -c /etc/nginx/nginx.conf
 oxiserve: listening on 0.0.0.0:80
 ```
 
+Four worked examples — a TLS site, a reverse proxy, a load balancer and an API
+gateway — are in [`conf/examples/`](conf/examples/). All four pass `oxiserve -t`
+with no warnings, so every directive in them is implemented rather than parsed
+and ignored.
+
 ## Status
 
 This is an early but genuinely working server, not a demo. It serves real
-traffic for the feature set below, with 528 tests (349 unit + 179 end-to-end
+traffic for the feature set below, with 530 tests (349 unit + 181 end-to-end
 over real sockets). It is **not yet a drop-in nginx replacement** —
 see [Not implemented](#not-implemented) for exactly what is missing, and run
 `oxiserve -t` against your own config to get a precise list for *your* setup.
