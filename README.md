@@ -595,6 +595,40 @@ parser is a non-reentrant flex scanner, and two threads calling it at once
 abort the process outright. Configuration load is single-threaded so this is
 not reachable in practice, but the lock is there rather than resting on that.
 
+### What it costs
+
+Measured on the Linux box, 1 KiB file, two workers pinned to cores 0–1 with the
+load generator on 2–5, median of 5 rounds. Reproduce with
+[`bench/modsec-cost.sh`](bench/modsec-cost.sh).
+
+| Configuration | req/s | CPU µs/req | vs plain |
+|---|---:|---:|---:|
+| plain (default build) | 386,107 | 5.18 | — |
+| built with the feature, no rules | 367,844 | 5.44 | within noise |
+| two hand-written rules | 89,877 | 22.25 | **−77%** |
+| OWASP CRS 4.7.0 | 7,001 | 285.65 | **−98.2%** |
+| CRS + response body | 6,581 | 303.91 | **−98.3%** |
+
+The percentage is the wrong number to carry away, because it is a statement
+about how fast the baseline is: a request that took 5.18 µs now takes 285 µs.
+The transferable figure is the **~280 µs of CPU that CRS costs per request**,
+which is the price of evaluating several hundred rules and is paid by anything
+running them. The fixed cost of the engine itself — opening a transaction and
+running the phases with almost no rules loaded — is **~17 µs**; the remaining
+~263 µs is CRS. Phase 4 adds ~18 µs on a 1 KiB body.
+
+So: turning this on trades roughly 55× of static-file throughput for the rule
+set. That is worth it exactly when a WAF is worth it, and it is a good reason
+to scope `modsecurity on` to the locations that need it rather than the whole
+`http` block.
+
+Two things the harness does deliberately, because getting them wrong quietly
+inflates the cost. It sends browser-like headers: `wrk`'s bare request has no
+`Accept` or `User-Agent` and a numeric `Host`, which trips CRS 920300, 920320
+and 920350 on *every* request and would measure the logging path instead of
+the inspection path. And it checks for non-2xx responses, since a run where
+CRS blocked the fixture is not the question being asked.
+
 ## Benchmarks
 
 ```console
